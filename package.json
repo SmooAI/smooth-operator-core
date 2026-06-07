@@ -1,16 +1,16 @@
 {
-    "name": "@smooai/agent-monorepo",
+    "name": "@smooai/smooth-operator-monorepo",
     "version": "0.0.0",
     "private": true,
-    "description": "Rust-native AI agent framework — checkpointing, tool system, LLM client. Shared across Big Smooth and the smooai platform.",
+    "description": "Polyglot AI agent orchestration core — agents, workflows, tools, checkpointing, memory, HITL, cost. The engine behind smooth-agent and lom.smoo.ai.",
     "license": "MIT",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/SmooAI/agent.git"
+        "url": "git+https://github.com/SmooAI/smooth-operator.git"
     },
-    "homepage": "https://github.com/SmooAI/agent",
+    "homepage": "https://github.com/SmooAI/smooth-operator",
     "bugs": {
-        "url": "https://github.com/SmooAI/agent/issues"
+        "url": "https://github.com/SmooAI/smooth-operator/issues"
     },
     "type": "module",
     "scripts": {

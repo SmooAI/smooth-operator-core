@@ -23,8 +23,8 @@
 //!     available skills
 //!   - DOES NOT handle invocation, runtime integration, or
 //!     security policy mapping — those land separately as
-//!     `skill_use` tool (th-e0f812) and Wonk pre-grants
-//!     (th-515a13).
+//!     the `skill_use` tool and host policy enforcement
+//!     pre-grants.
 
 use std::collections::HashSet;
 use std::fs;
@@ -33,19 +33,19 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// A skill's effective scope. `Sandbox` (default) means the skill
-/// runs inside the microVM; `Host` means it bypasses the sandbox
-/// and runs in Big Smooth's process directly (for scp, Photos.app,
+/// runs inside the sandbox; `Host` means it bypasses the sandbox
+/// and runs in the supervisor's process directly (for scp, Photos.app,
 /// AWS SSO interactive flows, etc.). Network alone is NEVER a
-/// reason for `Host` — see pearl th-515a13 for the
-/// wonk-proxy-through-host design.
+/// reason for `Host` — host policy enforcement proxies network
+/// through the host instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SkillScope {
-    /// Runs inside the microVM with Wonk policy enforcement.
+    /// Runs inside the sandbox with host policy enforcement.
     #[default]
     Sandbox,
-    /// Runs in Big Smooth's process on the host. Same security
-    /// envelope as Big Smooth itself.
+    /// Runs in the supervisor's process on the host. Same security
+    /// envelope as the supervisor itself.
     Host,
 }
 
@@ -99,7 +99,7 @@ pub struct Skill {
     /// Effective scope (sandbox / host).
     #[serde(default)]
     pub scope: SkillScope,
-    /// Hostnames the skill needs Wonk to allow. Becomes a pre-grant
+    /// Hostnames the skill needs host policy enforcement to allow. Becomes a pre-grant
     /// at dispatch time (no user prompt) — declaring a host here is
     /// an explicit declaration of intent.
     #[serde(default)]

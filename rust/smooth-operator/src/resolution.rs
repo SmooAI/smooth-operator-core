@@ -1,4 +1,4 @@
-//! Alias resolution for LiteLLM-backed gateways (e.g. llm.smoo.ai).
+//! Alias resolution for LiteLLM-backed gateways.
 //!
 //! A typical Smooth setup points every routing slot at a `smooth-*`
 //! semantic alias (`smooth-coding`, `smooth-thinking`, …). The gateway
@@ -126,8 +126,8 @@ mod tests {
 
     #[test]
     fn build_url_strips_v1_suffix() {
-        assert_eq!(build_model_info_url("https://llm.smoo.ai/v1"), "https://llm.smoo.ai/model/info");
-        assert_eq!(build_model_info_url("https://llm.smoo.ai/v1/"), "https://llm.smoo.ai/model/info");
+        assert_eq!(build_model_info_url("https://gateway.example.com/v1"), "https://gateway.example.com/model/info");
+        assert_eq!(build_model_info_url("https://gateway.example.com/v1/"), "https://gateway.example.com/model/info");
         assert_eq!(build_model_info_url("https://example.com"), "https://example.com/model/info");
         assert_eq!(build_model_info_url("https://example.com/"), "https://example.com/model/info");
     }

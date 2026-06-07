@@ -27,7 +27,13 @@ impl Default for RetryPolicy {
             max_retries: 3,
             base_delay_ms: 1000,
             max_delay_ms: 60_000,
-            retry_on_status: vec![429, 500, 502, 503],
+            // Cloudflare 5xx codes (520-527) are transient and benefit
+            // from retry — bench observed an LLM API error 524 (origin
+            // timeout) wreck a mid-conversation turn on
+            // cleanup-node-modules-orphans. Adding 504 (gateway
+            // timeout) too — that's a Cloudflare-class timeout from
+            // any upstream proxy. Pearl `th-80a39e` follow-up.
+            retry_on_status: vec![429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527],
         }
     }
 }
@@ -49,7 +55,7 @@ pub enum ApiFormat {
 }
 
 /// Configuration for the LLM client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LlmConfig {
     pub api_url: String,
     pub api_key: String,
@@ -58,6 +64,22 @@ pub struct LlmConfig {
     pub temperature: f32,
     pub retry_policy: RetryPolicy,
     pub api_format: ApiFormat,
+}
+
+// Manual Debug impl so the API key never lands in logs, panic messages, or
+// error chains. Everything else is printed verbatim.
+impl std::fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("api_url", &self.api_url)
+            .field("api_key", &"***redacted***")
+            .field("model", &self.model)
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("retry_policy", &self.retry_policy)
+            .field("api_format", &self.api_format)
+            .finish()
+    }
 }
 
 impl LlmConfig {
@@ -842,23 +864,63 @@ impl LlmClient {
             .ok_or_else(|| anyhow::anyhow!("serialized request is not a JSON object"))?
             .insert("stream".into(), serde_json::Value::Bool(true));
 
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.config.api_key)
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| {
-                // Walk the error chain to get the root cause
-                let mut chain = vec![format!("{e}")];
-                let mut source: &dyn std::error::Error = &e;
-                while let Some(s) = source.source() {
-                    chain.push(format!("{s}"));
-                    source = s;
+        // Pearl `th-3b30b0` (was th-b30b00 in earlier filing — id
+        // truncated): retry transient reqwest errors at the request-
+        // send level. The bench observed "error sending request for
+        // url … → connection closed before message completed" on
+        // llm.smoo.ai mid-session. That's a reqwest::Error::request()
+        // / is_timeout() / is_connect() failure that the original
+        // code propagated immediately via `?`. With retry, the same
+        // call survives a brief upstream blip.
+        //
+        // Streaming requests are NOT idempotent in general (a partial
+        // response could have been emitted). We retry only when the
+        // initial `.send().await` itself fails — i.e. before any
+        // bytes have been read from the stream. Once the response
+        // headers are in (status known), we drop into the existing
+        // status-code retry path.
+        let resp = {
+            const MAX_SEND_RETRIES: u32 = 3;
+            let mut last_err: Option<anyhow::Error> = None;
+            let mut sent_resp = None;
+            for attempt in 0..=MAX_SEND_RETRIES {
+                match self.client.post(&url).bearer_auth(&self.config.api_key).json(&request_body).send().await {
+                    Ok(r) => {
+                        sent_resp = Some(r);
+                        break;
+                    }
+                    Err(e) => {
+                        let is_transient = e.is_timeout() || e.is_connect() || e.is_request();
+                        let chain = {
+                            let mut chain = vec![format!("{e}")];
+                            let mut source: &dyn std::error::Error = &e;
+                            while let Some(s) = source.source() {
+                                chain.push(format!("{s}"));
+                                source = s;
+                            }
+                            chain.join(" → ")
+                        };
+                        last_err = Some(anyhow::anyhow!("HTTP request failed: {chain}"));
+                        if !is_transient || attempt == MAX_SEND_RETRIES {
+                            break;
+                        }
+                        let backoff_ms = 200_u64 * (1_u64 << attempt); // 200, 400, 800
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            max = MAX_SEND_RETRIES + 1,
+                            backoff_ms,
+                            error = %chain,
+                            "chat_stream send failed transient — retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
                 }
-                anyhow::anyhow!("HTTP request failed: {}", chain.join(" → "))
-            })?;
+            }
+            match sent_resp {
+                Some(r) => r,
+                None => return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("HTTP request failed: no error captured"))),
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -2086,13 +2148,13 @@ pub fn canonical_tool_arguments_json(value: &serde_json::Value) -> String {
 /// `cache_control` markers. We send them when:
 ///   - the model id looks Claude-ish (`claude-`, `sonnet`, `opus`, `haiku`),
 ///     OR
-///   - the model is one of our LiteLLM gateway aliases (`smooth-coding-claude`,
-///     `smooth-thinking`, etc. that route to Claude), OR
-///   - the api_base looks like our LiteLLM gateway (`llm.smoo.ai`, `litellm`)
-///     or anthropic.* directly.
+///   - the model is one of the known semantic gateway aliases (`smooth-coding`,
+///     `smooth-thinking`, etc.) that route to Claude, AND
+///   - the api_base looks like a LiteLLM-style gateway or `anthropic.*`
+///     directly.
 ///
 /// We deliberately do NOT send cache_control to bare OpenAI / Gemini /
-/// Groq endpoints — they 400 on unknown extension fields. The LiteLLM
+/// Groq endpoints — they 400 on unknown extension fields. A LiteLLM
 /// gateway's `cache_control_injection_points` config is what actually
 /// passes the markers through to Anthropic; without that gateway-side
 /// change this code is a no-op.
@@ -2100,16 +2162,17 @@ fn supports_anthropic_cache_control(model: &str, api_url: &str) -> bool {
     let model_lower = model.to_ascii_lowercase();
     let url_lower = api_url.to_ascii_lowercase();
     let model_looks_claude = model_lower.contains("claude") || model_lower.contains("sonnet") || model_lower.contains("opus") || model_lower.contains("haiku");
-    // Smooth's LiteLLM aliases that we know route to Claude. The
-    // generic `smooth-` prefix alone isn't enough — `smooth-fast`
-    // routes to Groq/Llama, which would 400 on cache_control.
-    let model_is_smooth_claude_alias = model_lower.starts_with("smooth-coding")
+    // Known semantic gateway aliases that route to Claude. The generic
+    // `smooth-` prefix alone isn't enough — `smooth-fast` routes to a
+    // Groq/Llama model, which would 400 on cache_control.
+    let model_is_claude_alias = model_lower.starts_with("smooth-coding")
         || model_lower.starts_with("smooth-thinking")
         || model_lower.starts_with("smooth-planning")
         || model_lower.starts_with("smooth-reviewing");
-    let url_is_litellm = url_lower.contains("litellm") || url_lower.contains("llm.smoo.ai");
+    // Generic LiteLLM-style gateway heuristic — no hardcoded private host.
+    let url_is_litellm = url_lower.contains("litellm") || url_lower.contains("gateway");
     let url_is_anthropic = url_lower.contains("anthropic.");
-    (model_looks_claude || model_is_smooth_claude_alias) && (url_is_litellm || url_is_anthropic)
+    (model_looks_claude || model_is_claude_alias) && (url_is_litellm || url_is_anthropic)
 }
 
 /// Attach `cache_control: ephemeral` to the strategic prefix boundaries
@@ -3100,7 +3163,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         assert_eq!(policy.max_retries, 3);
         assert_eq!(policy.base_delay_ms, 1000);
         assert_eq!(policy.max_delay_ms, 60_000);
-        assert_eq!(policy.retry_on_status, vec![429, 500, 502, 503]);
+        assert_eq!(policy.retry_on_status, vec![429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527]);
     }
 
     #[test]
@@ -3436,10 +3499,10 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
     #[test]
     fn cache_control_gate_recognizes_claude_routes() {
-        // Claude model id + LiteLLM url → cache it.
-        assert!(supports_anthropic_cache_control("claude-sonnet-4-20250514", "https://llm.smoo.ai/v1"));
-        // Smooth-coding alias + LiteLLM url → cache it.
-        assert!(supports_anthropic_cache_control("smooth-coding-claude", "https://llm.smoo.ai/v1"));
+        // Claude model id + LiteLLM gateway url → cache it.
+        assert!(supports_anthropic_cache_control("claude-sonnet-4-20250514", "https://litellm.example.com/v1"));
+        // Smooth-coding alias + gateway url → cache it.
+        assert!(supports_anthropic_cache_control("smooth-coding-claude", "https://gateway.example.com/v1"));
         // Direct Anthropic API + Claude id → cache it.
         assert!(supports_anthropic_cache_control("claude-opus-4", "https://api.anthropic.com/v1"));
         // GPT model on OpenAI → no cache control (would 400).
@@ -3447,10 +3510,10 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         // Gemini-compat → no cache control.
         assert!(!supports_anthropic_cache_control("gemini-1.5-pro", "https://generativelanguage.googleapis.com"));
         // Claude id but bare OpenAI url (someone mis-configured) — still
-        // gated off because the wire isn't LiteLLM/Anthropic.
+        // gated off because the wire isn't a LiteLLM gateway/Anthropic.
         assert!(!supports_anthropic_cache_control("claude-3-sonnet", "https://api.openai.com/v1"));
-        // smooth-fast routes to Groq/Llama via LiteLLM — must NOT be cached.
-        assert!(!supports_anthropic_cache_control("smooth-fast", "https://llm.smoo.ai/v1"));
+        // smooth-fast routes to Groq/Llama via the gateway — must NOT be cached.
+        assert!(!supports_anthropic_cache_control("smooth-fast", "https://gateway.example.com/v1"));
     }
 
     #[test]

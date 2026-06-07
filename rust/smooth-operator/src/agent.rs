@@ -4,8 +4,22 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+#[cfg(feature = "bigsmooth")]
 use crate::bigsmooth_client::{BigSmoothReporter, ControlEvent, ReporterEvent};
 use crate::checkpoint::{Checkpoint, CheckpointEvent, CheckpointStore, CheckpointStrategy};
+
+// When the optional `bigsmooth` control-plane integration is compiled out, the
+// agent loop still constructs `ReporterEvent::*` values at its reporting call
+// sites. Provide a minimal stand-in enum so those sites compile unchanged; the
+// events are dropped by the no-op `report_to_bigsmooth` stub.
+#[cfg(not(feature = "bigsmooth"))]
+#[allow(dead_code)]
+enum ReporterEvent {
+    ToolCallStart { tool_name: String, arguments: String },
+    ToolCallComplete { tool_name: String, result: String, is_error: bool, duration_ms: u64 },
+    TaskComplete { iterations: u32, cost_usd: f64 },
+    TaskError { message: String },
+}
 use crate::cost::{CostBudget, CostTracker, ModelPricing};
 use crate::human::{HumanRequest, HumanResponse};
 use crate::knowledge::KnowledgeBase;
@@ -14,6 +28,7 @@ use futures_util::StreamExt;
 
 use crate::conversation::{CompactionStrategy, Conversation, Message, ReactiveCompaction, Role};
 use crate::llm::{accumulate_stream_events, LlmClient, LlmConfig, StreamEvent};
+use crate::llm_provider::LlmProvider;
 use crate::tool::{Tool, ToolRegistry, ToolSchema};
 
 /// Reminder injected as a system message on the final iteration of the agent
@@ -26,6 +41,30 @@ Do not start new tool chains. Respond with text only:\n\
 2. Summarize what has been accomplished so far.\n\
 3. List any remaining tasks that were not completed.\n\
 4. Recommend what should be done next (a follow-up dispatch, a manual step, a question for the user).";
+
+/// Verify-tests-before-done system-prompt rule. Appended by
+/// [`AgentConfig::with_verify_tests_before_done`]. The anchor lets the
+/// builder detect a prior append and avoid double-stacking the rule.
+/// Pearl th-operator-verify-rule (sub-pearl of th-VERIFY-PHASE).
+pub const VERIFY_TESTS_RULE_ANCHOR: &str = "[verify-tests-before-done:v1]";
+
+/// Body of the verify-tests rule. Kept narrow on purpose: don't try to
+/// override the agent's normal completion logic, just gate the
+/// terminal "I'm done" message on having actually seen passing tests.
+/// The agent is free to skip the test run if the task genuinely
+/// doesn't have tests — the rule is "if tests exist, you must run
+/// them," not "you must run tests even when there are none."
+pub const VERIFY_TESTS_RULE: &str = "[verify-tests-before-done:v1] \
+This task is being scored against a test suite. You MUST NOT produce a final response (or stop iterating) until you have:\n\
+1. Run the project's test command at least once. The typical commands are:\n\
+   - Python: `pytest -q` (or `python3 -m pytest -q`)\n\
+   - Rust: `cargo test` (with `-- --include-ignored` if the workspace uses ignored tests)\n\
+   - JS / TS: `npm test` or `pnpm test`\n\
+   - Go: `go test ./...`\n\
+   Pick the one that matches the project files you can see.\n\
+2. Seen all tests pass.\n\n\
+If tests are failing after a run, your ONLY valid next action is to fix the failures and re-run the test command. Do NOT summarize. Do NOT declare done. Do NOT say things like \"the implementation should work\" or \"all tests should pass now\" — re-run the tests and quote the actual output.\n\n\
+The test-runner output (exit code + summary line) is the authoritative completion signal. Your own assessment of correctness is not.\n";
 
 /// Configuration for an agent.
 #[allow(missing_debug_implementations)]
@@ -43,7 +82,8 @@ pub struct AgentConfig {
     pub budget: Option<CostBudget>,
     pub human_tx: Option<UnboundedSender<HumanRequest>>,
     pub human_rx: Option<Arc<tokio::sync::Mutex<UnboundedReceiver<HumanResponse>>>>,
-    /// Optional reporter for communicating back to Big Smooth from inside a sandbox.
+    /// Optional reporter for communicating back to the supervisor from inside a sandbox.
+    #[cfg(feature = "bigsmooth")]
     pub reporter: Option<Arc<tokio::sync::Mutex<BigSmoothReporter>>>,
     /// Optional injection channel — out-of-band messages (mailbox: `[CHAT:USER]`,
     /// `[STEERING:GUIDANCE]`, `[ANSWER:*]`) drained at the top of each iteration
@@ -98,6 +138,7 @@ impl AgentConfig {
             budget: None,
             human_tx: None,
             human_rx: None,
+            #[cfg(feature = "bigsmooth")]
             reporter: None,
             chat_rx: None,
             prior_messages: Vec::new(),
@@ -124,6 +165,35 @@ impl AgentConfig {
 
     pub fn with_max_iterations(mut self, max: u32) -> Self {
         self.max_iterations = max;
+        self
+    }
+
+    /// Append a "no final response until tests pass" rule to the
+    /// system prompt. Stopgap for the full VERIFY phase (the
+    /// architectural fix). Targets the failure mode surfaced by the
+    /// 2026-05-29 coach matrix: deepseek/kimi/claude all stopped at
+    /// 2-3 iterations with partial solutions (11/16, 18/20, 8/10)
+    /// because the model decided it was done — not because the
+    /// iteration cap was hit. glm-5.1 won by iterating 16 times
+    /// naturally on the same task. The driver-side coach probe
+    /// ("did you run the tests?") fires too late — the agent has
+    /// already emitted Completed by the time the driver gets a turn.
+    /// This rule applies the same intent INSIDE the agent loop where
+    /// it actually fires.
+    ///
+    /// Opt-in so general `th code` sessions stay snappy (default off);
+    /// bench dispatch turns it on. Idempotent: calling twice still
+    /// appends only one copy of the rule.
+    #[must_use]
+    pub fn with_verify_tests_before_done(mut self, enabled: bool) -> Self {
+        if !enabled || self.system_prompt.contains(VERIFY_TESTS_RULE_ANCHOR) {
+            return self;
+        }
+        if !self.system_prompt.is_empty() && !self.system_prompt.ends_with('\n') {
+            self.system_prompt.push('\n');
+        }
+        self.system_prompt.push('\n');
+        self.system_prompt.push_str(VERIFY_TESTS_RULE);
         self
     }
 
@@ -163,7 +233,8 @@ impl AgentConfig {
         self
     }
 
-    /// Set a `BigSmoothReporter` for reporting progress back to Big Smooth.
+    /// Set a `BigSmoothReporter` for reporting progress back to the supervisor.
+    #[cfg(feature = "bigsmooth")]
     pub fn with_reporter(mut self, reporter: Arc<tokio::sync::Mutex<BigSmoothReporter>>) -> Self {
         self.reporter = Some(reporter);
         self
@@ -450,6 +521,11 @@ pub struct Agent {
     /// `Mutex<Option<String>>` so both `run` and `run_streaming`
     /// (which take `&self`) can update it. Pearl th-a10c2d.
     last_resolved_model: std::sync::Mutex<Option<String>>,
+    /// Optional override for the LLM call surface. When `None` (production
+    /// default), each run builds a real [`LlmClient`] from `config.llm`. Tests
+    /// inject a [`MockLlmClient`](crate::llm_provider::MockLlmClient) here to
+    /// drive the loop deterministically without a live model.
+    llm_provider: Option<Arc<dyn LlmProvider>>,
 }
 
 impl Agent {
@@ -463,7 +539,18 @@ impl Agent {
             reactive_compaction: std::sync::Mutex::new(ReactiveCompaction::new()),
             cost_tracker: Arc::new(Mutex::new(CostTracker::default())),
             last_resolved_model: std::sync::Mutex::new(None),
+            llm_provider: None,
         }
+    }
+
+    /// Inject a custom [`LlmProvider`] (e.g. a
+    /// [`MockLlmClient`](crate::llm_provider::MockLlmClient) in tests). When set,
+    /// `run` / `run_with_channel` use it instead of building an [`LlmClient`]
+    /// from `config.llm`.
+    #[must_use]
+    pub fn with_llm_provider(mut self, provider: Arc<dyn LlmProvider>) -> Self {
+        self.llm_provider = Some(provider);
+        self
     }
 
     pub fn with_checkpoint_store(mut self, store: Arc<dyn CheckpointStore>) -> Self {
@@ -553,7 +640,10 @@ impl Agent {
 
         self.emit(AgentEvent::Started { agent_id: self.id.clone() });
 
-        let llm = LlmClient::new(self.config.llm.clone());
+        let llm: Arc<dyn LlmProvider> = match &self.llm_provider {
+            Some(provider) => Arc::clone(provider),
+            None => Arc::new(LlmClient::new(self.config.llm.clone())),
+        };
 
         for iteration in 1..=self.config.max_iterations {
             // Recompute schemas every iteration so tools promoted
@@ -574,18 +664,19 @@ impl Agent {
                 conversation.push(Message::system(MAX_STEPS_REMINDER));
             }
 
-            // Check for steering commands from Big Smooth
+            // Check for steering commands from the supervisor
+            #[cfg(feature = "bigsmooth")]
             if let Some(control) = self.check_steering() {
                 match control {
                     ControlEvent::Cancel => {
-                        tracing::info!("Received cancel from Big Smooth");
+                        tracing::info!("Received cancel from the supervisor");
                         self.report_to_bigsmooth(ReporterEvent::TaskError {
-                            message: "Cancelled by Big Smooth".into(),
+                            message: "Cancelled by the supervisor".into(),
                         });
                         return Ok(conversation);
                     }
                     ControlEvent::Steer { action, message } => {
-                        tracing::info!(action, ?message, "Received steering command from Big Smooth");
+                        tracing::info!(action, ?message, "Received steering command from the supervisor");
                         // Inject steering as a system message
                         let steer_msg = format!("[STEERING: {action}] {}", message.unwrap_or_default());
                         conversation.push(Message::system(steer_msg));
@@ -834,7 +925,10 @@ impl Agent {
 
         let _ = tx.send(AgentEvent::Started { agent_id: self.id.clone() });
 
-        let llm = LlmClient::new(self.config.llm.clone());
+        let llm: Arc<dyn LlmProvider> = match &self.llm_provider {
+            Some(provider) => Arc::clone(provider),
+            None => Arc::new(LlmClient::new(self.config.llm.clone())),
+        };
 
         for iteration in 1..=self.config.max_iterations {
             // Recompute schemas every iteration so tools promoted
@@ -1237,20 +1331,29 @@ impl Agent {
         })
     }
 
-    /// Report an event to Big Smooth via the reporter (if configured). Fire-and-forget.
+    /// Report an event to the supervisor via the reporter (if configured). Fire-and-forget.
+    #[cfg(feature = "bigsmooth")]
     fn report_to_bigsmooth(&self, event: ReporterEvent) {
         if let Some(reporter) = &self.config.reporter {
             let reporter = Arc::clone(reporter);
             tokio::spawn(async move {
                 let guard = reporter.lock().await;
                 if let Err(e) = guard.report(event).await {
-                    tracing::warn!(error = %e, "failed to report to Big Smooth");
+                    tracing::warn!(error = %e, "failed to report to the supervisor");
                 }
             });
         }
     }
 
-    /// Check for steering commands from Big Smooth. Returns Some(ControlEvent) if one is pending.
+    /// No-op stub when the optional `bigsmooth` control-plane integration is
+    /// disabled. Accepts the same `ReporterEvent` so call sites compile
+    /// unchanged; the event is simply dropped.
+    #[cfg(not(feature = "bigsmooth"))]
+    #[allow(clippy::unused_self)]
+    fn report_to_bigsmooth(&self, _event: ReporterEvent) {}
+
+    /// Check for steering commands from the supervisor. Returns Some(ControlEvent) if one is pending.
+    #[cfg(feature = "bigsmooth")]
     fn check_steering(&self) -> Option<ControlEvent> {
         if let Some(reporter) = &self.config.reporter {
             // Use try_lock to avoid blocking the agent loop
@@ -1306,10 +1409,102 @@ mod tests {
         AgentConfig::new("test-agent", "You are a test agent", LlmConfig::openrouter("fake-key"))
     }
 
+    #[tokio::test]
+    async fn run_drives_the_loop_via_injected_llm_provider() {
+        use crate::llm_provider::MockLlmClient;
+
+        let mock = MockLlmClient::new();
+        mock.push_text("the answer is 42");
+        let agent = Agent::new(test_config(), ToolRegistry::new()).with_llm_provider(Arc::new(mock.clone()));
+
+        let convo = agent.run("what is the answer?").await.expect("run completes");
+
+        // A text response with no tool calls ends the loop after one LLM call,
+        // and the assistant turn is the mock's scripted content.
+        assert_eq!(convo.last_assistant_content(), Some("the answer is 42"));
+        assert_eq!(mock.call_count(), 1);
+        // The user's message reached the model.
+        let calls = mock.calls();
+        assert!(calls[0].messages.iter().any(|m| m.content.contains("what is the answer?")));
+    }
+
     #[test]
     fn agent_config_builder() {
         let config = test_config().with_max_iterations(10).with_checkpoint_strategy(CheckpointStrategy::Never);
         assert_eq!(config.max_iterations, 10);
+    }
+
+    // ----- pearl th-operator-verify-rule: with_verify_tests_before_done -----
+
+    #[test]
+    fn verify_rule_off_by_default_in_new_config() {
+        let cfg = test_config();
+        assert!(!cfg.system_prompt.contains(VERIFY_TESTS_RULE_ANCHOR));
+    }
+
+    #[test]
+    fn verify_rule_appended_when_enabled() {
+        let cfg = test_config().with_verify_tests_before_done(true);
+        assert!(
+            cfg.system_prompt.contains(VERIFY_TESTS_RULE_ANCHOR),
+            "system_prompt should contain the verify-rule anchor when enabled: {}",
+            cfg.system_prompt
+        );
+        // Body keywords — bench-runner names must be present so the
+        // model can pick the right test command from the workspace
+        // shape without us having to wire a workspace-shape detector
+        // in Rust.
+        assert!(cfg.system_prompt.contains("pytest -q"));
+        assert!(cfg.system_prompt.contains("cargo test"));
+        assert!(cfg.system_prompt.contains("npm test"));
+        assert!(cfg.system_prompt.contains("go test"));
+        // Headline rule
+        assert!(cfg.system_prompt.to_lowercase().contains("must not produce a final response"));
+    }
+
+    #[test]
+    fn verify_rule_skipped_when_disabled() {
+        let cfg = test_config().with_verify_tests_before_done(false);
+        assert!(!cfg.system_prompt.contains(VERIFY_TESTS_RULE_ANCHOR));
+    }
+
+    #[test]
+    fn verify_rule_preserves_original_system_prompt() {
+        let original = "You are a test agent";
+        let cfg = test_config().with_verify_tests_before_done(true);
+        assert!(
+            cfg.system_prompt.starts_with(original),
+            "original system_prompt must lead, rule appended after: {}",
+            cfg.system_prompt
+        );
+    }
+
+    #[test]
+    fn verify_rule_is_idempotent_on_double_apply() {
+        // Calling twice must not stack — otherwise repeated dispatcher
+        // configurations could double-tax the context with the rule.
+        let cfg = test_config().with_verify_tests_before_done(true).with_verify_tests_before_done(true);
+        let anchor_count = cfg.system_prompt.matches(VERIFY_TESTS_RULE_ANCHOR).count();
+        assert_eq!(anchor_count, 1, "anchor must appear exactly once after double-apply: {}", cfg.system_prompt);
+    }
+
+    #[test]
+    fn verify_rule_handles_trailing_newline_in_original_prompt() {
+        let mut cfg = AgentConfig::new("test-agent", "You are a test agent\n", LlmConfig::openrouter("fake-key")).with_verify_tests_before_done(true);
+        // Should NOT double up the newline.
+        assert!(!cfg.system_prompt.contains("\n\n\n"));
+        assert!(cfg.system_prompt.contains(VERIFY_TESTS_RULE_ANCHOR));
+        // sanity: drain the value to confirm we didn't move ownership
+        cfg.system_prompt.clear();
+    }
+
+    #[test]
+    fn verify_rule_handles_empty_system_prompt() {
+        // Defensive: if someone constructs AgentConfig with an empty
+        // system prompt, the rule should still apply cleanly.
+        let cfg = AgentConfig::new("test-agent", "", LlmConfig::openrouter("fake-key")).with_verify_tests_before_done(true);
+        assert!(cfg.system_prompt.contains(VERIFY_TESTS_RULE_ANCHOR));
+        assert!(cfg.system_prompt.starts_with('\n') || cfg.system_prompt.starts_with("[verify-tests"));
     }
 
     #[test]
@@ -1665,6 +1860,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "bigsmooth")]
     #[test]
     fn agent_config_with_reporter_builder() {
         let reporter = Arc::new(tokio::sync::Mutex::new(BigSmoothReporter::new()));

@@ -1,0 +1,52 @@
+[package]
+name = "smooai-smooth-operator"
+version = "0.13.7"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/SmooAI/smooth-operator"
+description = "Polyglot AI agent orchestration core — agents, workflows, tools, checkpointing, memory, HITL, cost."
+readme = "README.md"
+keywords = ["ai", "agent", "llm", "tool-use", "orchestration"]
+categories = ["api-bindings", "asynchronous"]
+
+[lib]
+name = "smooth_operator"
+
+[features]
+default = []
+sqlite = ["rusqlite"]
+# SMOODEV-1468: durable Postgres-backed checkpoint store.
+postgres = ["dep:postgres", "dep:r2d2", "dep:r2d2_postgres"]
+# Opt-in BigSmooth control-plane reporting (internal SmooAI orchestration host).
+bigsmooth = []
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots", "charset", "http2", "hickory-dns"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.12"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+anyhow = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+bytes = "1"
+futures-core = "0.3"
+futures-util = "0.3"
+tokio-tungstenite = "0.26"
+dirs-next = "2"
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+postgres = { version = "0.19", optional = true }
+r2d2 = { version = "0.8", optional = true }
+r2d2_postgres = { version = "0.18", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+# SMOODEV-1468: spin up a throwaway Postgres for the checkpoint-store integration test.
+testcontainers = "0.24"
+testcontainers-modules = { version = "0.12", features = ["postgres"] }

@@ -1,12 +1,13 @@
-//! # smooai-agent
+//! # Smooth Operator
 //!
 //! Rust-native AI agent framework with built-in checkpointing, tool system,
-//! and LLM client. Shared across Big Smooth and the SmooAI platform.
+//! and LLM client. AI agent framework for Smooth operator microVMs.
 //!
 //! Inspired by LangGraph, CrewAI, and Agno — purpose-built for orchestrated
 //! agent workloads with security-first design.
 
 pub mod agent;
+#[cfg(feature = "bigsmooth")]
 pub mod bigsmooth_client;
 pub mod cast;
 pub mod checkpoint;
@@ -17,6 +18,7 @@ pub mod cost;
 pub mod human;
 pub mod knowledge;
 pub mod llm;
+pub mod llm_provider;
 pub mod memory;
 pub mod providers;
 pub mod quirks;
@@ -28,6 +30,7 @@ pub mod workflow;
 pub mod ws_resilience;
 
 pub use agent::{Agent, AgentConfig, AgentEvent, DelegationHandle, DelegationTool, SubAgentConfig};
+#[cfg(feature = "bigsmooth")]
 pub use bigsmooth_client::{BigSmoothReporter, ControlEvent, ReporterEvent};
 pub use cast::{Cast, Clearance, DispatchResult, DispatchSubagentTool, LlmConfigFactory, OperatorRole, PermissionHook, RoleKind};
 pub use checkpoint::{Checkpoint, CheckpointStore, MemoryCheckpointStore};

@@ -1,8 +1,8 @@
-# @smooai/agent
+# smooth-operator
 
-**Rust-native AI agent framework** — checkpointing, tool system, LLM client. Shared across [Big Smooth](https://github.com/SmooAI/smooth) and the smooai platform.
+**Polyglot AI agent orchestration core** — agents, workflows, tools, checkpointing, memory, human-in-the-loop, and cost tracking. The engine behind [smooth-agent](https://github.com/SmooAI/smooth-agent) and [lom.smoo.ai](https://lom.smoo.ai).
 
-Inspired by LangGraph, CrewAI, and Agno — purpose-built for orchestrated agent workloads with security-first design.
+Inspired by LangGraph, CrewAI, and Agno — purpose-built for orchestrated agent workloads with a security-first design. The **Rust** implementation is the source of truth; TypeScript, Go, C#/.NET, and Python bindings mirror its surface.
 
 ## Repository layout
 
@@ -10,12 +10,13 @@ This is a multi-language SmooAI package. Each language has its own subdirectory:
 
 | Directory | Language | Status |
 | --------- | -------- | ------ |
-| [`rust/`](./rust) | Rust (primary) | Active — crate `smooai-agent` |
+| [`rust/`](./rust) | Rust (reference) | Active — crate `smooai-smooth-operator` |
+| [`typescript/`](./typescript) | TypeScript | Planned |
 | [`go/`](./go) | Go | Planned |
+| [`dotnet/`](./dotnet) | C# / .NET | Planned (first-class target) |
 | [`python/`](./python) | Python | Planned |
-| [`dotnet/`](./dotnet) | C# / .NET | Planned |
 
-The Rust implementation is the source of truth; bindings in other languages will mirror its surface.
+Bindings follow a **protocol-first** strategy (a stable wire spec each language implements natively), with in-process FFI (napi-rs, PyO3/uniffi) layered on where embedding the engine pays off. See [smooth-agent's architecture](https://github.com/SmooAI/smooth-agent/blob/main/docs/ARCHITECTURE.md) for the rationale.
 
 ## Rust quick start
 
@@ -23,11 +24,11 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smooai-agent = { git = "https://github.com/SmooAI/agent.git", branch = "main" }
+smooai-smooth-operator = { git = "https://github.com/SmooAI/smooth-operator.git", branch = "main" }
 ```
 
 ```rust
-use smooai_agent::{Agent, AgentConfig, LlmConfig, Tool, ToolRegistry, ToolSchema};
+use smooth_operator::{Agent, AgentConfig, LlmConfig, Tool, ToolRegistry, ToolSchema};
 use async_trait::async_trait;
 
 struct GetWeather;
@@ -78,13 +79,23 @@ async fn main() -> anyhow::Result<()> {
 
 ## Features
 
-- **LLM Client** — OpenAI-compatible and Anthropic API support with streaming, retry policies, and rate limit handling
-- **Tool System** — Trait-based tools with pre/post hooks for surveillance, secret detection, and prompt injection guards
-- **Agent Loop** — Observe-think-act cycle with configurable iteration limits, parallel tool execution, and cost budgets
-- **Checkpointing** — Pluggable checkpoint stores for session resume and fault tolerance (in-memory + sqlite via `sqlite` feature)
-- **Conversation Management** — Token-aware context window with compaction strategies
-- **Memory & Knowledge** — Trait-based memory and knowledge base integration
-- **Cost Tracking** — Per-model pricing, token budgets, and budget enforcement
+- **LLM Client** — OpenAI-compatible and Anthropic API support with streaming, retry policies, and rate-limit handling
+- **Workflows** — `Workflow<S>` / `WorkflowBuilder<S>` graph engine (a LangGraph analog) with conditional edges
+- **Tool System** — trait-based tools with pre/post hooks for surveillance, secret detection, and prompt-injection guards
+- **Agent Loop** — observe-think-act cycle with configurable iteration limits, parallel tool execution, and cost budgets
+- **Checkpointing** — pluggable checkpoint stores for session resume and fault tolerance (in-memory, file, SQLite via `sqlite`, Postgres via `postgres`)
+- **Conversation Management** — token-aware context window with compaction strategies
+- **Memory & Knowledge** — trait-based memory and knowledge-base integration (RAG seam)
+- **Human-in-the-Loop** — confirmation hooks and human-input channels for gated tool calls
+- **Cost Tracking** — per-model pricing, token budgets, and budget enforcement
+
+## Cargo features
+
+| Feature | Effect |
+| ------- | ------ |
+| `sqlite` | SQLite checkpoint store (`rusqlite`, bundled) |
+| `postgres` | Postgres checkpoint store (r2d2 pool) |
+| `bigsmooth` | Optional supervisor/reporter integration (off by default) |
 
 ## License
 
@@ -92,5 +103,7 @@ MIT — see [LICENSE](./LICENSE).
 
 ## Links
 
+- [smooth-agent](https://github.com/SmooAI/smooth-agent) — the Onyx-like agent service built on this core
+- [lom.smoo.ai](https://lom.smoo.ai) — run it hosted
 - [smoo.ai](https://smoo.ai) — the product
 - [github.com/SmooAI](https://github.com/SmooAI) — other open-source packages
