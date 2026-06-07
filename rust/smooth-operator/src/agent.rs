@@ -15,10 +15,23 @@ use crate::checkpoint::{Checkpoint, CheckpointEvent, CheckpointStore, Checkpoint
 #[cfg(not(feature = "bigsmooth"))]
 #[allow(dead_code)]
 enum ReporterEvent {
-    ToolCallStart { tool_name: String, arguments: String },
-    ToolCallComplete { tool_name: String, result: String, is_error: bool, duration_ms: u64 },
-    TaskComplete { iterations: u32, cost_usd: f64 },
-    TaskError { message: String },
+    ToolCallStart {
+        tool_name: String,
+        arguments: String,
+    },
+    ToolCallComplete {
+        tool_name: String,
+        result: String,
+        is_error: bool,
+        duration_ms: u64,
+    },
+    TaskComplete {
+        iterations: u32,
+        cost_usd: f64,
+    },
+    TaskError {
+        message: String,
+    },
 }
 use crate::cost::{CostBudget, CostTracker, ModelPricing};
 use crate::human::{HumanRequest, HumanResponse};
