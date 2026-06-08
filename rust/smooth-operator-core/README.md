@@ -1,4 +1,4 @@
-# smooth-operator
+# smooth-operator-core
 
 Rust-native AI agent framework with built-in checkpointing, tool system, and LLM client. Purpose-built for orchestrated agent workloads with security-first design.
 
@@ -15,7 +15,7 @@ Rust-native AI agent framework with built-in checkpointing, tool system, and LLM
 ## Quick Start
 
 ```rust
-use smooth_operator::{Agent, AgentConfig, LlmConfig, Tool, ToolRegistry, ToolSchema};
+use smooth_operator_core::{Agent, AgentConfig, LlmConfig, Tool, ToolRegistry, ToolSchema};
 use async_trait::async_trait;
 
 // Define a tool
@@ -79,4 +79,4 @@ MIT
 ## Links
 
 - [GitHub](https://github.com/SmooAI/smooth)
-- [crates.io](https://crates.io/crates/smooth-operator)
+- [crates.io](https://crates.io/crates/smooth-operator-core)

@@ -127,8 +127,8 @@ struct MockState {
 /// to an `Agent` and the original held by the test see the same script + recordings.
 ///
 /// ```
-/// use smooth_operator::llm_provider::{LlmProvider, MockLlmClient};
-/// use smooth_operator::conversation::Message;
+/// use smooth_operator_core::llm_provider::{LlmProvider, MockLlmClient};
+/// use smooth_operator_core::conversation::Message;
 ///
 /// let rt = tokio::runtime::Runtime::new().unwrap();
 /// rt.block_on(async {

@@ -1,4 +1,4 @@
-# smooth-operator
+# smooth-operator-core
 
 **Polyglot AI agent orchestration core** — agents, workflows, tools, checkpointing, memory, human-in-the-loop, and cost tracking. The engine behind [smooth-agent](https://github.com/SmooAI/smooth-agent) and [lom.smoo.ai](https://lom.smoo.ai).
 
@@ -10,7 +10,7 @@ This is a multi-language SmooAI package. Each language has its own subdirectory:
 
 | Directory | Language | Status |
 | --------- | -------- | ------ |
-| [`rust/`](./rust) | Rust (reference) | Active — crate `smooai-smooth-operator` |
+| [`rust/`](./rust) | Rust (reference) | Active — crate `smooai-smooth-operator-core` |
 | [`typescript/`](./typescript) | TypeScript | Planned |
 | [`go/`](./go) | Go | Planned |
 | [`dotnet/`](./dotnet) | C# / .NET | Planned (first-class target) |
@@ -24,11 +24,11 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smooai-smooth-operator = { git = "https://github.com/SmooAI/smooth-operator.git", branch = "main" }
+smooai-smooth-operator-core = { git = "https://github.com/SmooAI/smooth-operator-core.git", branch = "main" }
 ```
 
 ```rust
-use smooth_operator::{Agent, AgentConfig, LlmConfig, Tool, ToolRegistry, ToolSchema};
+use smooth_operator_core::{Agent, AgentConfig, LlmConfig, Tool, ToolRegistry, ToolSchema};
 use async_trait::async_trait;
 
 struct GetWeather;

@@ -1,16 +1,16 @@
 [package]
-name = "smooai-smooth-operator"
+name = "smooai-smooth-operator-core"
 version = "0.13.7"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/SmooAI/smooth-operator"
+repository = "https://github.com/SmooAI/smooth-operator-core"
 description = "Polyglot AI agent orchestration core — agents, workflows, tools, checkpointing, memory, HITL, cost."
 readme = "README.md"
 keywords = ["ai", "agent", "llm", "tool-use", "orchestration"]
 categories = ["api-bindings", "asynchronous"]
 
 [lib]
-name = "smooth_operator"
+name = "smooth_operator_core"
 
 [features]
 default = []
