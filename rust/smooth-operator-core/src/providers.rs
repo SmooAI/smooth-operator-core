@@ -590,9 +590,9 @@ impl ProviderRegistry {
     }
 
     /// Deserialize a registry from the same JSON shape `save_to_file`
-    /// produces. Used when a parent process (Big Smooth) passes the
-    /// full routing config to a child (the sandboxed runner) via an
-    /// env var instead of writing it to disk.
+    /// produces. Used when a parent process passes the full routing
+    /// config to a child process via an env var instead of writing it
+    /// to disk.
     ///
     /// # Errors
     ///

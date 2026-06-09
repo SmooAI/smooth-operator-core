@@ -8,10 +8,10 @@
 //! side.
 //!
 //! This module ships the three *shadow* utility roles (`tagger`,
-//! `presser`, `recapper`), the four *lead* roles (`fixer`,
-//! `mapper`, `oracle`, `heckler`), and the two *sidekick* roles
-//! (`scout`, `runner`) that lead roles can dispatch work to via the
-//! `send_sidekick` tool (see [`dispatch`]).
+//! `presser`, `recapper`), the two *lead* roles (`mapper`,
+//! `heckler`), and the two *sidekick* roles (`scout`, `runner`) that
+//! lead roles can dispatch work to via the `send_sidekick` tool (see
+//! [`dispatch`]).
 
 use std::collections::HashMap;
 
@@ -26,7 +26,7 @@ pub use dispatch::{DispatchResult, DispatchSubagentTool, LlmConfigFactory};
 /// How an operator role is surfaced to users.
 ///
 /// - [`RoleKind::Lead`] — top-level roles the user can choose via
-///   `--agent` or slash command (e.g. `fixer`, `mapper`).
+///   `--agent` or slash command (e.g. `mapper`, `heckler`).
 /// - [`RoleKind::Sidekick`] — dispatchable from other roles via a
 ///   `task`-style tool (e.g. `scout`, `runner`).
 /// - [`RoleKind::Shadow`] — internal utility roles the runtime calls
@@ -93,7 +93,7 @@ impl Clearance {
 /// users customize prompts and routing per role in one place.
 #[derive(Debug, Clone)]
 pub struct OperatorRole {
-    /// Unique role name (e.g. `"tagger"`, `"fixer"`, `"scout"`).
+    /// Unique role name (e.g. `"tagger"`, `"mapper"`, `"scout"`).
     pub name: String,
     pub kind: RoleKind,
     /// Which routing slot this role defaults to when no
@@ -124,8 +124,8 @@ pub struct Cast {
 impl Cast {
     /// Build a cast populated with the built-in roles. Includes the
     /// three shadow utility roles (`tagger`, `presser`, `recapper`),
-    /// the four lead roles (`fixer`, `mapper`, `oracle`, `heckler`),
-    /// and the two sidekick roles (`scout`, `runner`).
+    /// the two lead roles (`mapper`, `heckler`), and the two sidekick
+    /// roles (`scout`, `runner`).
     pub fn builtin() -> Self {
         let mut cast = Self::default();
         for role in builtin_roles() {
@@ -177,16 +177,12 @@ impl Cast {
 const TAGGER_PROMPT: &str = include_str!("prompts/tagger.txt");
 const PRESSER_PROMPT: &str = include_str!("prompts/presser.txt");
 const RECAPPER_PROMPT: &str = include_str!("prompts/recapper.txt");
-const INTENT_CLASSIFIER_PROMPT: &str = include_str!("prompts/intent_classifier.txt");
-const CHIEF_PROMPT: &str = include_str!("prompts/chief.txt");
-pub const FIXER_PROMPT: &str = include_str!("prompts/fixer.txt");
 const MAPPER_PROMPT: &str = include_str!("prompts/mapper.txt");
-const ORACLE_PROMPT: &str = include_str!("prompts/oracle.txt");
 const HECKLER_PROMPT: &str = include_str!("prompts/heckler.txt");
 const SCOUT_PROMPT: &str = include_str!("prompts/scout.txt");
 const RUNNER_PROMPT: &str = include_str!("prompts/runner.txt");
 
-/// Read-only tool set used by `mapper`, `oracle`, and `heckler`. Anything
+/// Read-only tool set used by `mapper` and `heckler`. Anything
 /// not in this list is denied. The allowlist is more defensible than
 /// a deny-list: when a new mutating tool gets registered (edit_file,
 /// write_file, apply_patch, bash, bg_run, http_fetch …) the reasoning
@@ -211,7 +207,7 @@ fn read_only_tools() -> Vec<String> {
 
 /// Tools that the `mapper` role is allowed to call on top of
 /// [`read_only_tools`]. Mapper is still read-only w.r.t. the workspace
-/// but may inspect structure more broadly — same set as oracle/heckler
+/// but may inspect structure more broadly — same set as `heckler`
 /// today, kept as its own helper so future tweaks don't accidentally
 /// leak edit capability.
 fn mapper_tools() -> Vec<String> {
@@ -271,58 +267,8 @@ fn builtin_roles() -> Vec<OperatorRole> {
             steps: None,
             hidden: true,
         },
-        // `intent_classifier` is the chat TUI's auto-router: given a
-        // single user message, emit literal "WORK" or "QUESTION" so
-        // the dispatcher knows whether to run under fixer (coding
-        // workflow) or oracle (read-only Q&A). Routes through the
-        // Fast slot so it adds milliseconds, not seconds.
-        OperatorRole {
-            name: "intent_classifier".into(),
-            kind: RoleKind::Shadow,
-            slot: Activity::Fast,
-            model_override: None,
-            prompt: INTENT_CLASSIFIER_PROMPT.trim().to_string(),
-            permissions: Clearance::deny_all(),
-            steps: None,
-            hidden: true,
-        },
-        // `chief` is the Chief of Staff router (pearl th-c677f7).
-        // Replaces the heuristic-ladder in smooth-code/src/intent.rs
-        // for the routing decision: chief reads the user message and
-        // emits `DISPATCH: <role>` naming one of the lead/sidekick
-        // roles. Routes through the Fast slot so adding it costs
-        // milliseconds, not seconds. Falls back to the heuristic
-        // ladder when chief is unavailable (no providers, gateway
-        // down) so dispatch never hangs.
-        OperatorRole {
-            name: "chief".into(),
-            kind: RoleKind::Shadow,
-            slot: Activity::Fast,
-            model_override: None,
-            prompt: CHIEF_PROMPT.trim().to_string(),
-            permissions: Clearance::deny_all(),
-            steps: None,
-            hidden: true,
-        },
         // ─── Lead roles ────────────────────────────────────────
         //
-        // `fixer` is the default `th` experience: full tool access,
-        // Coding-slot routing. Its prompt is the same text that used
-        // to live inline in `coding_workflow.rs` as
-        // `CODING_SYSTEM_PROMPT` — factoring it here means the
-        // coding workflow now looks up the prompt + slot by name
-        // instead of hard-coding both, and users can override it
-        // from a single place in a future pearl.
-        OperatorRole {
-            name: "fixer".into(),
-            kind: RoleKind::Lead,
-            slot: Activity::Coding,
-            model_override: None,
-            prompt: FIXER_PROMPT.trim().to_string(),
-            permissions: Clearance::default(),
-            steps: None,
-            hidden: false,
-        },
         // `mapper` decomposes without modifying. Allow-list of
         // read-only inspection tools; edit/write/patch/bash are
         // denied so even a confused model can't ship code under the
@@ -343,29 +289,8 @@ fn builtin_roles() -> Vec<OperatorRole> {
             steps: None,
             hidden: false,
         },
-        // `oracle` is pure reasoning — no bash, no mutation.
-        OperatorRole {
-            name: "oracle".into(),
-            kind: RoleKind::Lead,
-            slot: Activity::Reasoning,
-            model_override: None,
-            prompt: ORACLE_PROMPT.trim().to_string(),
-            permissions: Clearance {
-                allow_tools: read_only_tools(),
-                deny_tools: vec![
-                    "edit_file".into(),
-                    "write_file".into(),
-                    "apply_patch".into(),
-                    "bash".into(),
-                    "bg_run".into(),
-                    "http_fetch".into(),
-                ],
-            },
-            steps: None,
-            hidden: false,
-        },
-        // `heckler` is adversarial critique — read-only, same shape
-        // as oracle but routed through the Reviewing slot.
+        // `heckler` is adversarial critique — read-only, routed
+        // through the Reviewing slot.
         OperatorRole {
             name: "heckler".into(),
             kind: RoleKind::Lead,
@@ -512,7 +437,7 @@ mod tests {
     #[test]
     fn builtin_registers_shadow_roles() {
         let cast = Cast::builtin();
-        for name in ["tagger", "presser", "recapper", "intent_classifier"] {
+        for name in ["tagger", "presser", "recapper"] {
             let role = cast.get(name).unwrap_or_else(|| panic!("{name} not registered"));
             assert!(role.hidden, "{name} should be hidden");
             assert_eq!(role.kind, RoleKind::Shadow);
@@ -520,9 +445,9 @@ mod tests {
     }
 
     #[test]
-    fn builtin_registers_four_lead_roles() {
+    fn builtin_registers_lead_roles() {
         let cast = Cast::builtin();
-        for name in ["fixer", "mapper", "oracle", "heckler"] {
+        for name in ["mapper", "heckler"] {
             let role = cast.get(name).unwrap_or_else(|| panic!("{name} not registered"));
             assert!(!role.hidden, "{name} should not be hidden");
             assert_eq!(role.kind, RoleKind::Lead);
@@ -532,23 +457,8 @@ mod tests {
     #[test]
     fn lead_roles_route_to_expected_slots() {
         let cast = Cast::builtin();
-        assert_eq!(cast.get("fixer").unwrap().slot, Activity::Coding);
         assert_eq!(cast.get("mapper").unwrap().slot, Activity::Reasoning);
-        assert_eq!(cast.get("oracle").unwrap().slot, Activity::Reasoning);
         assert_eq!(cast.get("heckler").unwrap().slot, Activity::Reviewing);
-    }
-
-    #[test]
-    fn fixer_role_has_full_tool_access() {
-        let cast = Cast::builtin();
-        let fixer = cast.get("fixer").unwrap();
-        // Default Clearance is empty allow + empty deny = anything goes.
-        assert!(fixer.permissions.allows("read_file"));
-        assert!(fixer.permissions.allows("write_file"));
-        assert!(fixer.permissions.allows("edit_file"));
-        assert!(fixer.permissions.allows("apply_patch"));
-        assert!(fixer.permissions.allows("bash"));
-        assert!(!fixer.permissions.is_deny_all());
     }
 
     #[test]
@@ -561,17 +471,6 @@ mod tests {
         assert!(!mapper.permissions.allows("edit_file"), "mapper must not edit");
         assert!(!mapper.permissions.allows("write_file"), "mapper must not write");
         assert!(!mapper.permissions.allows("apply_patch"), "mapper must not patch");
-    }
-
-    #[test]
-    fn oracle_role_is_fully_read_only() {
-        let cast = Cast::builtin();
-        let oracle = cast.get("oracle").unwrap();
-        assert!(oracle.permissions.allows("read_file"));
-        assert!(!oracle.permissions.allows("bash"), "oracle must not shell");
-        assert!(!oracle.permissions.allows("edit_file"));
-        assert!(!oracle.permissions.allows("write_file"));
-        assert!(!oracle.permissions.allows("http_fetch"));
     }
 
     #[test]
@@ -588,17 +487,9 @@ mod tests {
     fn lead_role_prompts_are_loaded_from_files() {
         let cast = Cast::builtin();
 
-        let fixer = cast.get("fixer").unwrap();
-        assert!(fixer.prompt.contains("coding agent"), "fixer prompt: {}", fixer.prompt);
-        assert!(fixer.prompt.contains("## Test Results"));
-
         let mapper = cast.get("mapper").unwrap();
         assert!(mapper.prompt.contains("planning agent"));
         assert!(mapper.prompt.contains("do not modify"));
-
-        let oracle = cast.get("oracle").unwrap();
-        assert!(oracle.prompt.contains("reasoning"));
-        assert!(oracle.prompt.contains("do not modify code"));
 
         let heckler = cast.get("heckler").unwrap();
         assert!(heckler.prompt.to_lowercase().contains("review"));
@@ -608,7 +499,7 @@ mod tests {
     #[test]
     fn shadow_roles_deny_all_tools() {
         let cast = Cast::builtin();
-        for name in ["tagger", "presser", "recapper", "intent_classifier"] {
+        for name in ["tagger", "presser", "recapper"] {
             let role = cast.get(name).unwrap();
             assert!(role.permissions.is_deny_all(), "{name} should deny all tools");
             assert!(!role.permissions.allows("read"), "{name} allowed read");
@@ -653,10 +544,10 @@ mod tests {
     fn list_visible_excludes_shadow_utility_roles() {
         let cast = Cast::builtin();
         let visible: Vec<_> = cast.list_visible().map(|a| a.name.clone()).collect();
-        // Four lead roles + two sidekicks are visible; tagger/
+        // Two lead roles + two sidekicks are visible; tagger/
         // presser/recapper are hidden.
-        assert_eq!(visible.len(), 6, "expected 6 visible roles, got {visible:?}");
-        for name in ["fixer", "mapper", "oracle", "heckler", "scout", "runner"] {
+        assert_eq!(visible.len(), 4, "expected 4 visible roles, got {visible:?}");
+        for name in ["mapper", "heckler", "scout", "runner"] {
             assert!(visible.iter().any(|v| v == name), "{name} missing from visible list");
         }
     }
@@ -721,11 +612,12 @@ mod tests {
     }
 
     #[test]
-    fn permission_hook_allows_everything_for_fixer_role() {
+    fn permission_hook_allows_everything_for_full_access_role() {
         use crate::tool::ToolCall;
         let cast = Cast::builtin();
-        let fixer = cast.get("fixer").unwrap();
-        let hook = PermissionHook::new(fixer);
+        // `runner` is the built-in full-tool-access role.
+        let runner = cast.get("runner").unwrap();
+        let hook = PermissionHook::new(runner);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         for tool in ["read_file", "write_file", "edit_file", "apply_patch", "bash", "grep"] {
             let call = ToolCall {
@@ -735,7 +627,7 @@ mod tests {
             };
             runtime
                 .block_on(hook.pre_call(&call))
-                .unwrap_or_else(|e| panic!("fixer should allow {tool}: {e}"));
+                .unwrap_or_else(|e| panic!("runner should allow {tool}: {e}"));
         }
     }
 

@@ -2017,14 +2017,14 @@ fn content_has_pseudo_tool_xml(content: &str) -> bool {
 /// 1. Canonical wrapper — JSON body inside `<tool_call>…</tool_call>`:
 ///    ```text
 ///    <tool_call>
-///    {"name": "host_tool", "arguments": {"tool": "curl", "args": [...]}}
+///    {"name": "run_command", "arguments": {"tool": "curl", "args": [...]}}
 ///    </tool_call>
 ///    ```
 ///
 /// 2. Malformed inline — name in opening tag, args as `<parameter=K> V`
 ///    chunks, closed by `</tool_call>`:
 ///    ```text
-///    <function=host_tool> <parameter=tool> curl <parameter=args> ["-I", "https://x.com"] </tool_call>
+///    <function=run_command> <parameter=tool> curl <parameter=args> ["-I", "https://x.com"] </tool_call>
 ///    ```
 ///    Each `<parameter=K> V` element becomes one key in arguments; the
 ///    value is the text from after the `>` to the start of the next
@@ -3408,11 +3408,11 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
     #[test]
     fn parse_canonical_qwen_tool_call() {
         let content = r#"<tool_call>
-{"name": "host_tool", "arguments": {"tool": "curl", "args": ["-I", "https://x.com"]}}
+{"name": "run_command", "arguments": {"tool": "curl", "args": ["-I", "https://x.com"]}}
 </tool_call>"#;
         let calls = super::parse_pseudo_tool_xml(content);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "host_tool");
+        assert_eq!(calls[0].name, "run_command");
         assert_eq!(calls[0].arguments["tool"], "curl");
         assert_eq!(calls[0].arguments["args"][0], "-I");
     }
@@ -3420,13 +3420,13 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
     #[test]
     fn parse_malformed_function_parameter_form() {
         // Exact shape from user repro 2026-05-12.
-        let content = r#"<function=host_tool> <parameter=tool> curl <parameter=args> ["-I", "https://smoo-hub.com"]   </tool_call>"#;
+        let content = r#"<function=run_command> <parameter=tool> curl <parameter=args> ["-I", "https://example.com"]   </tool_call>"#;
         let calls = super::parse_pseudo_tool_xml(content);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "host_tool");
+        assert_eq!(calls[0].name, "run_command");
         assert_eq!(calls[0].arguments["tool"], "curl");
         assert_eq!(calls[0].arguments["args"][0], "-I");
-        assert_eq!(calls[0].arguments["args"][1], "https://smoo-hub.com");
+        assert_eq!(calls[0].arguments["args"][1], "https://example.com");
     }
 
     #[test]

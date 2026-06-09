@@ -1,17 +1,14 @@
 //! # Smooth Operator
 //!
-//! Rust-native AI agent framework with built-in checkpointing, tool system,
-//! and LLM client. AI agent framework for Smooth operator microVMs.
+//! An embeddable, polyglot AI agent engine with built-in checkpointing, tool
+//! system, and LLM client.
 //!
 //! Inspired by LangGraph, CrewAI, and Agno — purpose-built for orchestrated
 //! agent workloads with security-first design.
 
 pub mod agent;
-#[cfg(feature = "bigsmooth")]
-pub mod bigsmooth_client;
 pub mod cast;
 pub mod checkpoint;
-pub mod coding_workflow;
 pub mod context;
 pub mod conversation;
 pub mod cost;
@@ -23,15 +20,12 @@ pub mod memory;
 pub mod providers;
 pub mod quirks;
 pub mod resolution;
-pub mod skills;
 pub mod tool;
 pub mod tool_search;
 pub mod workflow;
 pub mod ws_resilience;
 
 pub use agent::{Agent, AgentConfig, AgentEvent, DelegationHandle, DelegationTool, SubAgentConfig};
-#[cfg(feature = "bigsmooth")]
-pub use bigsmooth_client::{BigSmoothReporter, ControlEvent, ReporterEvent};
 pub use cast::{Cast, Clearance, DispatchResult, DispatchSubagentTool, LlmConfigFactory, OperatorRole, PermissionHook, RoleKind};
 pub use checkpoint::{Checkpoint, CheckpointStore, MemoryCheckpointStore};
 pub use conversation::{CompactionResult, CompactionStrategy, Conversation, Message, Role};

@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
-  <img src="https://img.shields.io/badge/tests-408%20passing-brightgreen.svg" alt="408 tests passing" />
+  <img src="https://img.shields.io/badge/tests-337%20passing-brightgreen.svg" alt="337 tests passing" />
   <img src="https://img.shields.io/badge/rust-reference%20impl-orange.svg" alt="Rust reference implementation" />
   <img src="https://img.shields.io/badge/agents-workflows%20%7C%20tools%20%7C%20HITL-7c3aed.svg" alt="agents · workflows · tools · HITL" />
   <a href="https://lom.smoo.ai"><img src="https://img.shields.io/badge/hosted-lom.smoo.ai-black.svg" alt="lom.smoo.ai" /></a>
@@ -19,7 +19,7 @@
 
 `smooai-smooth-operator-core` is the agent runtime that powers the [**smooth-operator**](https://github.com/SmooAI/smooth-operator) service and [**lom.smoo.ai**](https://lom.smoo.ai). It gives you the moving parts of a serious agent framework — an observe→think→act loop, a typed tool system, a graph workflow engine, pluggable checkpoint stores, memory, RAG, human-in-the-loop gates, and per-model cost budgets — as a single, embeddable Rust crate.
 
-Inspired by LangGraph, CrewAI, and Agno, with one hard difference: **it's the engine, not a notebook demo.** Every surface is covered by **408 fast, offline unit tests** built on a deterministic `MockLlmClient`, so the loop is verified — not vibe-coded.
+Inspired by LangGraph, CrewAI, and Agno, with one hard difference: **it's the engine, not a notebook demo.** Every surface is covered by **337 fast, offline unit tests** built on a deterministic `MockLlmClient`, so the loop is verified — not vibe-coded.
 
 > The Rust implementation is the source of truth. TypeScript, Go, C#/.NET, and Python bindings mirror its surface (protocol-first; see [Repository layout](#repository-layout)).
 
@@ -168,7 +168,7 @@ let agent = Agent::new(config, registry).with_checkpoint_store(checkpoints);
 | **Humans in the loop** | `ConfirmationHook` + human channels for gated tool calls |
 | **Spend control** | per-model `ModelPricing`, `CostBudget`, `CostTracker` with hard enforcement |
 | **Offline, deterministic tests** | `LlmProvider` trait + `MockLlmClient` — script responses, assert on requests, no network |
-| To **embed it anywhere** | one crate, `provided.al2023`-friendly, runs in a Lambda or a microVM |
+| To **embed it anywhere** | one crate, `provided.al2023`-friendly, runs in a Lambda, a container, or any host process |
 
 It's the runtime the smooth-operator service actually ships on — not a reference design.
 
@@ -261,7 +261,7 @@ flowchart TD
     J["LLM-as-judge evals<br/>(multi-turn quality, scored 0–5)"]
     E["Live E2E<br/>(real gateway, real WS, streamed answer)"]
     C["Conformance / integration<br/>(SQLite + Postgres checkpoint stores, testcontainers)"]
-    U["408 unit tests<br/>(MockLlmClient — deterministic, offline, fast)"]
+    U["337 unit tests<br/>(MockLlmClient — deterministic, offline, fast)"]
 
     J --> E --> C --> U
 
@@ -280,7 +280,7 @@ Run them:
 
 ```bash
 cd rust/smooth-operator-core
-cargo test                                   # 408 unit tests, offline
+cargo test                                   # 337 unit tests, offline
 cargo test --features sqlite,postgres        # + checkpoint-store conformance
 cargo clippy --all-targets -- -D warnings
 ```
@@ -293,7 +293,6 @@ cargo clippy --all-targets -- -D warnings
 | --- | --- |
 | `sqlite` | SQLite checkpoint store (`rusqlite`, bundled) |
 | `postgres` | Postgres checkpoint store (r2d2 pool) |
-| `bigsmooth` | Optional supervisor/reporter integration (off by default) |
 
 ---
 
