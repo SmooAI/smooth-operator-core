@@ -42,3 +42,10 @@ jobs:
             - name: Build (release)
               working-directory: rust
               run: cargo build --workspace --release
+
+            # Catch crates.io packaging breakage (missing readme, bad metadata,
+            # stray path/git deps, dirty-tree issues) before a real publish.
+            # The actual publish lives in publish-crate.yml.
+            - name: Publish dry-run (crates.io packaging)
+              working-directory: rust
+              run: cargo publish --dry-run -p smooai-smooth-operator-core --locked
