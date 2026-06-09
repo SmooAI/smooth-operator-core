@@ -37,7 +37,7 @@ anyhow = "1"
 serde_json = "1"
 ```
 
-Or:
+Or, once published to crates.io _(publish pending — use the git dep above today)_:
 
 ```bash
 cargo add smooai-smooth-operator-core
@@ -46,7 +46,7 @@ cargo add smooai-smooth-operator-core
 A complete agent — one tool, one LLM, one `run()` — in about 40 lines:
 
 ```rust
-use smooth_operator_core::{Agent, AgentConfig, LlmConfig, Tool, ToolRegistry, ToolSchema};
+use smooth_operator_core::{Agent, AgentConfig, LlmConfig, Role, Tool, ToolRegistry, ToolSchema};
 use async_trait::async_trait;
 
 struct GetWeather;
@@ -73,12 +73,11 @@ impl Tool for GetWeather {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let llm = LlmConfig {
-        api_url: "https://api.openai.com/v1".into(),
-        api_key: std::env::var("OPENAI_API_KEY")?,
-        model: "gpt-4o".into(),
-        ..Default::default()
-    };
+    // OpenAI-compatible by default — `openrouter()` is a convenience preset.
+    // Point `api_url` at OpenAI, an Anthropic-compatible endpoint, or your
+    // own gateway (e.g. `https://llm.smoo.ai/v1`).
+    let llm = LlmConfig::openrouter(std::env::var("OPENROUTER_API_KEY")?)
+        .with_model("openai/gpt-4o");
 
     let config = AgentConfig::new("assistant", "You are a helpful assistant.", llm)
         .with_max_iterations(10)
@@ -87,17 +86,18 @@ async fn main() -> anyhow::Result<()> {
     let mut registry = ToolRegistry::new();
     registry.register(GetWeather);
 
-    let mut agent = Agent::new(config, registry);
-    let events = agent.run("What's the weather in Tokyo?").await?;
+    let agent = Agent::new(config, registry);
+    let conversation = agent.run("What's the weather in Tokyo?").await?;
 
-    for event in events {
-        println!("{event:?}");
+    // The final answer is the last assistant message in the returned conversation.
+    if let Some(answer) = conversation.messages.iter().rev().find(|m| m.role == Role::Assistant) {
+        println!("{}", answer.content);
     }
     Ok(())
 }
 ```
 
-> Note: the LLM client is **OpenAI-compatible**. Point `api_url` at OpenAI, an Anthropic-compatible endpoint, or your own gateway (e.g. `https://llm.smoo.ai/v1`). The agent emits a typed `AgentEvent` stream — token deltas, tool calls, tool results, and the final answer.
+> Note: the LLM client is **OpenAI-compatible**. Point `api_url` at OpenAI, an Anthropic-compatible endpoint, or your own gateway (e.g. `https://llm.smoo.ai/v1`). `run()` returns the full `Conversation`; for live token deltas / tool-call / tool-result events, use `run_with_channel(msg, tx)` and consume the `AgentEvent` stream off the receiver.
 
 ---
 
@@ -106,31 +106,50 @@ async fn main() -> anyhow::Result<()> {
 The agent loop is the front door. Underneath, you can compose **stateful workflows**, gate dangerous tool calls behind a **human confirmation hook**, **checkpoint** every step for resume, and cap spend with a **cost budget** — all from the same crate.
 
 ```rust
+use std::sync::Arc;
+use std::time::Duration;
 use smooth_operator_core::{
-    AgentConfig, Agent, ToolRegistry,
-    CheckpointStore, MemoryCheckpointStore,
-    ConfirmationHook, human_channel,
-    CostBudget, CostTracker, ModelPricing,
+    Agent, AgentConfig, LlmConfig, ToolRegistry,
+    MemoryCheckpointStore,
+    ConfirmationHook, human_channel, HumanResponse,
+    CostBudget,
 };
 
+let llm = LlmConfig::openrouter(std::env::var("OPENROUTER_API_KEY")?);
+let mut registry = ToolRegistry::new();
+
 // 1. Persist progress so a crashed turn resumes instead of restarting.
-let checkpoints: MemoryCheckpointStore = MemoryCheckpointStore::default();
-// (Swap in the `sqlite` or `postgres` store for durable, multi-process resume.)
+//    (Swap in the `sqlite` or `postgres` store for durable, multi-process resume.)
+let checkpoints = Arc::new(MemoryCheckpointStore::default());
 
-// 2. Cap spend per session — the loop refuses to exceed the budget.
-let budget = CostBudget::usd(0.50);
-let tracker = CostTracker::new(budget)
-    .with_pricing("gpt-4o", ModelPricing::per_million(5.0, 15.0));
+// 2. Cap spend per session — `CostTracker::check_budget` refuses to exceed it.
+let budget = CostBudget { max_cost_usd: Some(0.50), max_tokens: None };
 
-// 3. Gate write/irreversible tools behind a human "yes".
-let (hook, mut requests) = human_channel();
-let confirm = ConfirmationHook::new(hook);
+// 3. Gate write/irreversible tools behind a human "yes". The hook fires for
+//    any tool whose name contains one of these substrings.
+let channels = human_channel();
+let confirm = ConfirmationHook::new(
+    vec!["delete_".into(), "send_".into()],
+    channels.request_tx,
+    channels.response_rx,
+    Duration::from_secs(300),
+);
+registry.add_hook(confirm);
+
+// The UI side drives the human loop: read each request, answer it.
+let mut requests = channels.request_rx;
+let responses = channels.response_tx;
 tokio::spawn(async move {
     while let Some(req) = requests.recv().await {
         // Surface `req` to a human (Slack, dashboard, CLI) and answer.
-        req.approve(); // or req.reject("not allowed")
+        let _ = responses.send(HumanResponse::Approved);
+        // or: HumanResponse::Denied { reason: "not allowed".into() }
     }
 });
+
+let config = AgentConfig::new("assistant", "You are a careful assistant.", llm)
+    .with_budget(budget);
+let agent = Agent::new(config, registry).with_checkpoint_store(checkpoints);
 ```
 
 `CheckpointStore`, `CostTracker`, and `ConfirmationHook` are **traits + ready-made impls**: start with the in-memory versions, then swap to SQLite/Postgres and a real approval surface without touching your agent code.

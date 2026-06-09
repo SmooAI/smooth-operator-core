@@ -41,6 +41,6 @@ pub use knowledge::{Document, DocumentType, InMemoryKnowledge, KnowledgeBase, Kn
 pub use llm::{accumulate_stream_events, LlmClient, LlmConfig, LlmResponse, StreamEvent};
 pub use memory::{InMemoryMemory, Memory, MemoryEntry, MemoryType};
 pub use providers::{Activity, ModelRouting, ModelSlot, ProviderConfig, ProviderRegistry};
-pub use tool::{Tool, ToolCall, ToolRegistry, ToolResult};
+pub use tool::{Tool, ToolCall, ToolRegistry, ToolResult, ToolSchema};
 pub use workflow::{EdgeTarget, FnNode, Node, State, Workflow, WorkflowBuilder};
 pub use ws_resilience::{ConnectionManager, ConnectionState, MessageBuffer, ResiliencyConfig};
