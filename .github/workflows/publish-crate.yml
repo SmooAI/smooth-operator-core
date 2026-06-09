@@ -1,0 +1,67 @@
+# Publish `smooai-smooth-operator-core` to crates.io.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# THIS WORKFLOW IS THE ONLY PLACE THIS CRATE IS PUBLISHED.
+#
+#   • Publishing to crates.io is IRREVERSIBLE — there is no delete, only
+#     `cargo yank` (which hides a version but cannot reuse the version number).
+#   • BUMP THE VERSION in rust/smooth-operator-core/Cargo.toml BEFORE publishing.
+#     crates.io rejects re-uploading a version that already exists.
+#
+# How to publish:
+#   1. Manual (primary path): Actions → "Publish Crate" → Run workflow.
+#      Defaults to a DRY RUN (uploads nothing). To actually publish, set the
+#      `dry_run` input to `false` — a deliberate, explicit opt-in.
+#   2. Tag: push a tag matching `core-v*` (e.g. `core-v0.14.0`). The tag path
+#      always publishes for real.
+#
+# Auth: uses the org-level secret SMOOAI_CARGO_REGISTRY_TOKEN, exposed to cargo
+# as CARGO_REGISTRY_TOKEN.
+# ─────────────────────────────────────────────────────────────────────────────
+name: Publish Crate
+
+on:
+    workflow_dispatch:
+        inputs:
+            dry_run:
+                description: 'Dry run (package + validate but do NOT upload). Set to false to actually publish.'
+                type: boolean
+                default: true
+    push:
+        tags:
+            - 'core-v*'
+
+# Never let two publishes race against each other.
+concurrency:
+    group: publish-crate
+    cancel-in-progress: false
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    publish:
+        name: Publish smooai-smooth-operator-core to crates.io
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Cache cargo
+              uses: Swatinem/rust-cache@v2
+              with:
+                  workspaces: rust
+
+            # On manual runs `dry_run` defaults to true, so a bare "Run workflow"
+            # click uploads NOTHING. Tag pushes have no input, so `inputs.dry_run`
+            # is false/empty there and the crate publishes for real.
+            - name: Publish (cargo publish)
+              working-directory: rust
+              env:
+                  CARGO_REGISTRY_TOKEN: ${{ secrets.SMOOAI_CARGO_REGISTRY_TOKEN }}
+              run: |
+                  cargo publish ${{ inputs.dry_run && '--dry-run' || '' }} -p smooai-smooth-operator-core --locked
