@@ -4,35 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-#[cfg(feature = "bigsmooth")]
-use crate::bigsmooth_client::{BigSmoothReporter, ControlEvent, ReporterEvent};
 use crate::checkpoint::{Checkpoint, CheckpointEvent, CheckpointStore, CheckpointStrategy};
-
-// When the optional `bigsmooth` control-plane integration is compiled out, the
-// agent loop still constructs `ReporterEvent::*` values at its reporting call
-// sites. Provide a minimal stand-in enum so those sites compile unchanged; the
-// events are dropped by the no-op `report_to_bigsmooth` stub.
-#[cfg(not(feature = "bigsmooth"))]
-#[allow(dead_code)]
-enum ReporterEvent {
-    ToolCallStart {
-        tool_name: String,
-        arguments: String,
-    },
-    ToolCallComplete {
-        tool_name: String,
-        result: String,
-        is_error: bool,
-        duration_ms: u64,
-    },
-    TaskComplete {
-        iterations: u32,
-        cost_usd: f64,
-    },
-    TaskError {
-        message: String,
-    },
-}
 use crate::cost::{CostBudget, CostTracker, ModelPricing};
 use crate::human::{HumanRequest, HumanResponse};
 use crate::knowledge::KnowledgeBase;
@@ -95,22 +67,17 @@ pub struct AgentConfig {
     pub budget: Option<CostBudget>,
     pub human_tx: Option<UnboundedSender<HumanRequest>>,
     pub human_rx: Option<Arc<tokio::sync::Mutex<UnboundedReceiver<HumanResponse>>>>,
-    /// Optional reporter for communicating back to the supervisor from inside a sandbox.
-    #[cfg(feature = "bigsmooth")]
-    pub reporter: Option<Arc<tokio::sync::Mutex<BigSmoothReporter>>>,
     /// Optional injection channel — out-of-band messages (mailbox: `[CHAT:USER]`,
     /// `[STEERING:GUIDANCE]`, `[ANSWER:*]`) drained at the top of each iteration
-    /// and pushed into the conversation as user-turns. Wired by
-    /// `smooth-operator-runner` when `SMOOTH_PEARL_ID` is set so the lead
-    /// (Big Smooth) can talk to a running teammate without restarting the agent.
+    /// and pushed into the conversation as user-turns. Lets a host process talk
+    /// to a running agent without restarting its loop.
     pub chat_rx: Option<Arc<tokio::sync::Mutex<UnboundedReceiver<InjectedMessage>>>>,
     /// Pre-existing conversation messages to seed the agent's
-    /// `Conversation` with before the current user message. Used by
-    /// the runner to inject prior chat-session turns from the calling
-    /// TUI so the agent has continuity across dispatches (pearl
-    /// th-422b93). Each entry pushes as a native role-tagged
+    /// `Conversation` with before the current user message. Lets a
+    /// host inject prior chat-session turns so the agent has continuity
+    /// across dispatches. Each entry pushes as a native role-tagged
     /// `Message`; tool calls / tool results are not preserved at
-    /// this layer (TUI sends prose only — that's a future extension).
+    /// this layer (prose only — that's a future extension).
     pub prior_messages: Vec<Message>,
 }
 
@@ -151,8 +118,6 @@ impl AgentConfig {
             budget: None,
             human_tx: None,
             human_rx: None,
-            #[cfg(feature = "bigsmooth")]
-            reporter: None,
             chat_rx: None,
             prior_messages: Vec::new(),
         }
@@ -245,13 +210,6 @@ impl AgentConfig {
         self.human_rx = Some(rx);
         self
     }
-
-    /// Set a `BigSmoothReporter` for reporting progress back to the supervisor.
-    #[cfg(feature = "bigsmooth")]
-    pub fn with_reporter(mut self, reporter: Arc<tokio::sync::Mutex<BigSmoothReporter>>) -> Self {
-        self.reporter = Some(reporter);
-        self
-    }
 }
 
 /// Events emitted during agent execution.
@@ -320,40 +278,36 @@ pub enum AgentEvent {
         /// Sourced from `usage.prompt_tokens_details.cached_tokens` on
         /// each LLM response — non-zero only when the upstream supports
         /// Anthropic prompt caching AND the LiteLLM gateway has
-        /// `cache_control_injection_points` configured. Surfaced in
-        /// Big Smooth's `[METRICS]` line so a session's cache-hit ratio
-        /// is observable. Default 0 for older runner builds.
-        /// Pearl th-litellm-caching-client.
+        /// `cache_control_injection_points` configured. Lets a host
+        /// surface a session's cache-hit ratio. Default 0 for older
+        /// consumer builds.
         #[serde(default)]
         cached_tokens: u64,
     },
-    /// Emitted by `coding_workflow` each time the orchestrator enters
-    /// a new phase (ASSESS / PLAN / EXECUTE / VERIFY / REVIEW / FINALIZE).
+    /// Emitted by a multi-phase orchestrator each time it enters a new
+    /// phase. The engine itself never emits this — it's a hook for
+    /// consumers that drive the agent through their own phased loop and
+    /// want a structured progress signal.
     ///
-    /// TUIs listen for this to update the status bar (phase name +
-    /// routing alias + resolved upstream model + rotating thesaurus
-    /// phrase). Serialization-compatible with older runners that
-    /// don't emit it: clients just skip unknown AgentEvent variants.
+    /// Clients listen for this to update a status bar (phase name +
+    /// routing alias + resolved upstream model). Serialization-compatible
+    /// with consumers that don't emit it: clients just skip unknown
+    /// `AgentEvent` variants.
     PhaseStart {
-        /// Canonical phase name: `"ASSESS"`, `"PLAN"`, `"EXECUTE"`,
-        /// `"VERIFY"`, `"REVIEW"`, `"FINALIZE"`. Uppercase so it
+        /// Caller-defined phase name. Conventionally uppercase so it
         /// doubles as a display label.
         phase: String,
-        /// Routing alias the phase dispatches through
-        /// (`smooth-thinking`, `smooth-planning`, …). Already
+        /// Routing alias the phase dispatches through. Already
         /// resolved from the `Activity` slot so callers don't need
         /// access to the `ProviderRegistry`.
         alias: String,
-        /// The concrete upstream model the gateway is serving this
-        /// phase through, if known. `None` when we haven't seen a
-        /// response yet (this phase's first turn) — clients display
-        /// just the alias until a response arrives.
+        /// The concrete upstream model serving this phase, if known.
+        /// `None` when no response has arrived yet (this phase's first
+        /// turn) — clients display just the alias until one does.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         upstream: Option<String>,
-        /// 1-indexed iteration of the OUTER workflow loop. Execute/
-        /// Verify/Review/Execute counts as iterations 1, 1, 1, 2,
-        /// 2, 2, … — lets the TUI show "iteration 3 of 5" style
-        /// progress.
+        /// 1-indexed iteration of the caller's outer loop. Lets a
+        /// client show "iteration 3 of 5" style progress.
         iteration: u32,
     },
     MaxIterationsReached {
@@ -677,27 +631,6 @@ impl Agent {
                 conversation.push(Message::system(MAX_STEPS_REMINDER));
             }
 
-            // Check for steering commands from the supervisor
-            #[cfg(feature = "bigsmooth")]
-            if let Some(control) = self.check_steering() {
-                match control {
-                    ControlEvent::Cancel => {
-                        tracing::info!("Received cancel from the supervisor");
-                        self.report_to_bigsmooth(ReporterEvent::TaskError {
-                            message: "Cancelled by the supervisor".into(),
-                        });
-                        return Ok(conversation);
-                    }
-                    ControlEvent::Steer { action, message } => {
-                        tracing::info!(action, ?message, "Received steering command from the supervisor");
-                        // Inject steering as a system message
-                        let steer_msg = format!("[STEERING: {action}] {}", message.unwrap_or_default());
-                        conversation.push(Message::system(steer_msg));
-                    }
-                    _ => {}
-                }
-            }
-
             // Compact if approaching context limit
             if conversation.needs_compaction() {
                 let result = conversation.compact(&self.config.compaction_strategy, None);
@@ -815,24 +748,15 @@ impl Agent {
                     completion_tokens,
                     cached_tokens,
                 });
-                self.report_to_bigsmooth(ReporterEvent::TaskComplete {
-                    iterations: iteration,
-                    cost_usd: cost,
-                });
                 return Ok(conversation);
             }
 
             if self.config.parallel_tools {
                 for tool_call in &response.tool_calls {
-                    let args_json = tool_call.arguments.to_string();
                     self.emit(AgentEvent::ToolCallStart {
                         iteration,
                         tool_name: tool_call.name.clone(),
-                        arguments: args_json.clone(),
-                    });
-                    self.report_to_bigsmooth(ReporterEvent::ToolCallStart {
-                        tool_name: tool_call.name.clone(),
-                        arguments: args_json,
+                        arguments: tool_call.arguments.to_string(),
                     });
                 }
 
@@ -847,26 +771,15 @@ impl Agent {
                         result: result_preview.clone(),
                         duration_ms: 0,
                     });
-                    self.report_to_bigsmooth(ReporterEvent::ToolCallComplete {
-                        tool_name: tool_call.name.clone(),
-                        result: result_preview,
-                        is_error: result.is_error,
-                        duration_ms: 0,
-                    });
                     conversation.push(Message::tool_result_named(&tool_call.id, &tool_call.name, &result.content));
                     self.maybe_checkpoint(&conversation, iteration, CheckpointEvent::ToolCallComplete);
                 }
             } else {
                 for tool_call in &response.tool_calls {
-                    let args_json = tool_call.arguments.to_string();
                     self.emit(AgentEvent::ToolCallStart {
                         iteration,
                         tool_name: tool_call.name.clone(),
-                        arguments: args_json.clone(),
-                    });
-                    self.report_to_bigsmooth(ReporterEvent::ToolCallStart {
-                        tool_name: tool_call.name.clone(),
-                        arguments: args_json,
+                        arguments: tool_call.arguments.to_string(),
                     });
 
                     let start = std::time::Instant::now();
@@ -879,12 +792,6 @@ impl Agent {
                         tool_name: tool_call.name.clone(),
                         is_error: result.is_error,
                         result: result_preview.clone(),
-                        duration_ms,
-                    });
-                    self.report_to_bigsmooth(ReporterEvent::ToolCallComplete {
-                        tool_name: tool_call.name.clone(),
-                        result: result_preview,
-                        is_error: result.is_error,
                         duration_ms,
                     });
 
@@ -1342,39 +1249,6 @@ impl Agent {
             alias: alias.clone(),
             upstream: upstream.to_string(),
         })
-    }
-
-    /// Report an event to the supervisor via the reporter (if configured). Fire-and-forget.
-    #[cfg(feature = "bigsmooth")]
-    fn report_to_bigsmooth(&self, event: ReporterEvent) {
-        if let Some(reporter) = &self.config.reporter {
-            let reporter = Arc::clone(reporter);
-            tokio::spawn(async move {
-                let guard = reporter.lock().await;
-                if let Err(e) = guard.report(event).await {
-                    tracing::warn!(error = %e, "failed to report to the supervisor");
-                }
-            });
-        }
-    }
-
-    /// No-op stub when the optional `bigsmooth` control-plane integration is
-    /// disabled. Accepts the same `ReporterEvent` so call sites compile
-    /// unchanged; the event is simply dropped.
-    #[cfg(not(feature = "bigsmooth"))]
-    #[allow(clippy::unused_self)]
-    fn report_to_bigsmooth(&self, _event: ReporterEvent) {}
-
-    /// Check for steering commands from the supervisor. Returns Some(ControlEvent) if one is pending.
-    #[cfg(feature = "bigsmooth")]
-    fn check_steering(&self) -> Option<ControlEvent> {
-        if let Some(reporter) = &self.config.reporter {
-            // Use try_lock to avoid blocking the agent loop
-            if let Ok(mut guard) = reporter.try_lock() {
-                return guard.try_recv_control();
-            }
-        }
-        None
     }
 
     /// Drain any pending injected messages from the mailbox channel and push
@@ -1871,18 +1745,6 @@ mod tests {
             assert_eq!(cid, &child_id);
             assert_eq!(task, "test task");
         }
-    }
-
-    #[cfg(feature = "bigsmooth")]
-    #[test]
-    fn agent_config_with_reporter_builder() {
-        let reporter = Arc::new(tokio::sync::Mutex::new(BigSmoothReporter::new()));
-        let config = test_config().with_reporter(reporter);
-        assert!(config.reporter.is_some());
-
-        // Default should be None
-        let config2 = test_config();
-        assert!(config2.reporter.is_none());
     }
 
     #[test]

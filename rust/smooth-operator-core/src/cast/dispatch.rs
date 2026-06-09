@@ -1,6 +1,6 @@
 //! # `send_sidekick` tool
 //!
-//! The tool a lead role (`fixer` / `runner`) calls to hand a
+//! The tool a lead role (e.g. `runner`) calls to hand a
 //! self-contained task to one of the registered sidekicks
 //! ([`RoleKind::Sidekick`]). The sidekick runs in its own [`Agent`]
 //! loop with a fresh conversation, a filtered [`ToolRegistry`] scoped
@@ -16,12 +16,11 @@
 //! The dispatch tool needs access to [`Agent`], [`ToolRegistry`],
 //! [`LlmConfig`], and [`Cast`], which all live in
 //! `smooth-operator`. Keeping the tool here — instead of in
-//! `smooth-operator-runner` — means the runner just registers it
+//! a downstream consumer — means a caller just registers it
 //! alongside any other tool when the active lead role is
-//! dispatchable (`fixer` or `runner`), and other callers
-//! (benchmarks, the coding workflow, host-side eval harnesses) can
-//! reuse the exact same dispatch surface without pulling in the
-//! runner.
+//! dispatchable (e.g. `runner`), and other callers (benchmarks,
+//! workflows, eval harnesses) can reuse the exact same dispatch
+//! surface.
 
 use std::sync::Arc;
 
@@ -429,7 +428,7 @@ mod tests {
         assert!(names.contains(&"scout"), "schema enum missing scout: {names:?}");
         assert!(names.contains(&"runner"), "schema enum missing runner: {names:?}");
         // Lead/shadow roles must not appear.
-        for bad in ["fixer", "mapper", "oracle", "heckler", "tagger", "presser", "recapper"] {
+        for bad in ["mapper", "heckler", "tagger", "presser", "recapper"] {
             assert!(!names.contains(&bad), "schema enum must not contain non-sidekick '{bad}': {names:?}");
         }
     }
@@ -449,19 +448,19 @@ mod tests {
 
     #[tokio::test]
     async fn lead_role_name_returns_error() {
-        // 'fixer' is a Lead, not a Sidekick — dispatching to it
+        // 'mapper' is a Lead, not a Sidekick — dispatching to it
         // must be blocked with the same "not a dispatchable
-        // sidekick" error, NOT fall through to spawning a `fixer`
+        // sidekick" error, NOT fall through to spawning a `mapper`
         // agent loop.
         let cast = Arc::new(Cast::builtin());
         let tool = DispatchSubagentTool::new(Arc::clone(&cast), ToolRegistry::new(), test_llm_factory());
         let err = tool
-            .execute(json!({"agent": "fixer", "prompt": "do something"}))
+            .execute(json!({"agent": "mapper", "prompt": "do something"}))
             .await
             .expect_err("lead role dispatch must error");
         let msg = err.to_string();
         assert!(msg.contains("not a dispatchable sidekick"), "unexpected error: {msg}");
-        assert!(msg.contains("fixer"), "error should name the bad agent: {msg}");
+        assert!(msg.contains("mapper"), "error should name the bad agent: {msg}");
     }
 
     #[tokio::test]
