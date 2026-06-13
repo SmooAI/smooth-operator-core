@@ -1,21 +1,32 @@
 <p align="center">
-  <img src="./assets/smooth-logo.svg" alt="Smooth" width="360" />
+  <a href="https://smoo.ai"><img src="./assets/smooth-logo.svg" alt="Smooth" width="360" /></a>
+</p>
+
+<h1 align="center">smooth-operator-core</h1>
+
+<p align="center">
+  <strong>The Rust engine for orchestrated AI agents — built test-first, not vibe-coded.</strong>
 </p>
 
 <p align="center">
-  <strong>The Rust engine for orchestrated AI agents.</strong><br/>
-  Agents, workflows, tools, checkpointing, memory, human-in-the-loop, and cost tracking — built test-first, in Rust.
+  <img src="https://img.shields.io/badge/Smoo_AI-platform-00A6A6?style=flat-square" alt="Smoo AI">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-F49F0A?style=flat-square" alt="license"></a>
+  <img src="https://img.shields.io/badge/Rust-reference%20impl-FF6B6C?style=flat-square" alt="Rust reference implementation">
+  <img src="https://img.shields.io/badge/tests-337%20passing-00A6A6?style=flat-square" alt="337 tests passing">
+  <a href="https://lom.smoo.ai"><img src="https://img.shields.io/badge/hosted-lom.smoo.ai-020618?style=flat-square" alt="lom.smoo.ai"></a>
 </p>
 
 <p align="center">
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
-  <img src="https://img.shields.io/badge/tests-337%20passing-brightgreen.svg" alt="337 tests passing" />
-  <img src="https://img.shields.io/badge/rust-reference%20impl-orange.svg" alt="Rust reference implementation" />
-  <img src="https://img.shields.io/badge/agents-workflows%20%7C%20tools%20%7C%20HITL-7c3aed.svg" alt="agents · workflows · tools · HITL" />
-  <a href="https://lom.smoo.ai"><img src="https://img.shields.io/badge/hosted-lom.smoo.ai-black.svg" alt="lom.smoo.ai" /></a>
+  <a href="#why-this">Features</a> ·
+  <a href="#quickstart">Install</a> ·
+  <a href="#quickstart">Usage</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#part-of-smoo-ai">Platform</a>
 </p>
 
 ---
+
+> The agent runtime behind the [smooth-operator](https://github.com/SmooAI/smooth-operator) service and [lom.smoo.ai](https://lom.smoo.ai). Agents, workflows, tools, checkpointing, memory, human-in-the-loop, and per-model cost budgets — as a single embeddable Rust crate. It's the engine, not a notebook demo.
 
 `smooai-smooth-operator-core` is the agent runtime that powers the [**smooth-operator**](https://github.com/SmooAI/smooth-operator) service and [**lom.smoo.ai**](https://lom.smoo.ai). It gives you the moving parts of a serious agent framework — an observe→think→act loop, a typed tool system, a graph workflow engine, pluggable checkpoint stores, memory, RAG, human-in-the-loop gates, and per-model cost budgets — as a single, embeddable Rust crate.
 
@@ -327,6 +338,20 @@ Bindings follow a **protocol-first** strategy (a stable wire spec each language 
 - [chat-widget](https://github.com/SmooAI/chat-widget) — the embeddable widget that talks to it
 - [smoo.ai](https://smoo.ai) — the product · [github.com/SmooAI](https://github.com/SmooAI) — more open source
 
+## Part of Smoo AI
+
+`smooth-operator-core` is part of the [Smoo AI](https://smoo.ai) platform — an AI-powered business platform with AI built into every product. It pairs with [smooth-operator](https://github.com/SmooAI/smooth-operator) (the agent service), [@smooai/chat-widget](https://github.com/SmooAI/chat-widget) (the embeddable UI), and infrastructure packages like [@smooai/config](https://github.com/SmooAI/config) and [@smooai/logger](https://github.com/SmooAI/logger).
+
+## Contributing
+
+Issues and PRs welcome. Keep the engine test-first: every change ships with the offline `MockLlmClient` coverage that proves the loop still holds.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
+---
+
+<p align="center">
+  Built by <a href="https://smoo.ai"><strong>Smoo AI</strong></a> — AI built into every product.
+</p>
