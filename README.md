@@ -1,27 +1,20 @@
 <p align="center">
-  <a href="https://smoo.ai"><img src="./assets/smooth-logo.svg" alt="Smooth" width="360" /></a>
-</p>
-
-<h1 align="center">smooth-operator-core</h1>
-
-<p align="center">
-  <strong>The Rust engine for orchestrated AI agents — built test-first, not vibe-coded.</strong>
+  <a href="https://smoo.ai"><img src=".github/banner.png" alt="smooth-operator-core — The Rust engine for orchestrated AI agents" width="100%" /></a>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Smoo_AI-platform-00A6A6?style=flat-square" alt="Smoo AI">
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-F49F0A?style=flat-square" alt="license"></a>
+  <a href="https://smoo.ai/th"><img src="https://img.shields.io/badge/Smoo_AI-platform-00A6A6?style=for-the-badge&labelColor=020618" alt="Smoo AI"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-F49F0A?style=for-the-badge&labelColor=020618" alt="license"></a>
+  <a href="https://lom.smoo.ai"><img src="https://img.shields.io/badge/hosted-lom.smoo.ai-FF6B6C?style=for-the-badge&labelColor=020618" alt="lom.smoo.ai"></a>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/Rust-reference%20impl-FF6B6C?style=flat-square" alt="Rust reference implementation">
   <img src="https://img.shields.io/badge/tests-337%20passing-00A6A6?style=flat-square" alt="337 tests passing">
-  <a href="https://lom.smoo.ai"><img src="https://img.shields.io/badge/hosted-lom.smoo.ai-020618?style=flat-square" alt="lom.smoo.ai"></a>
 </p>
 
 <p align="center">
-  <a href="#why-this">Features</a> ·
-  <a href="#quickstart">Install</a> ·
-  <a href="#quickstart">Usage</a> ·
-  <a href="#architecture">Architecture</a> ·
-  <a href="#part-of-smoo-ai">Platform</a>
+  <a href="#why-this"><b>Features</b></a> &nbsp;·&nbsp; <a href="#quickstart"><b>Install</b></a> &nbsp;·&nbsp; <a href="#quickstart"><b>Usage</b></a> &nbsp;·&nbsp; <a href="#architecture"><b>Architecture</b></a> &nbsp;·&nbsp; <a href="#part-of-smoo-ai"><b>Platform</b></a>
 </p>
 
 ---
@@ -190,18 +183,26 @@ It's the runtime the smooth-operator service actually ships on — not a referen
 ### The agent loop
 
 ```mermaid
+%%{init: {'theme':'base','themeVariables':{
+  'background':'#020618','primaryColor':'#0b1426','primaryTextColor':'#e6edf6','primaryBorderColor':'#2b3a52',
+  'lineColor':'#7c8aa0','secondaryColor':'#0b1426','tertiaryColor':'#0b1426','fontFamily':'ui-sans-serif, system-ui, sans-serif',
+  'clusterBkg':'#0b1426','clusterBorder':'#22304a'}}}%%
 flowchart TD
-    U[User input] --> OBS[Observe: build context window]
+    U[User input] --> OBS[Observe: context window]
     OBS --> THINK[Think: LlmProvider.chat]
-    THINK -->|text answer| DONE[Emit final AgentEvent]
-    THINK -->|tool calls| GATE{"HITL<br/>ConfirmationHook?"}
-    GATE -->|approved| ACT[Act: ToolRegistry.execute]
+    THINK -->|text answer| DONE[Final AgentEvent]
+    THINK -->|tool calls| GATE{HITL gate?}
+    GATE -->|approved| ACT[Act: execute tools]
     GATE -->|rejected| THINK
-    ACT --> COST[CostTracker: charge + enforce budget]
-    COST --> CP[CheckpointStore: persist step]
-    CP --> MEM[Memory + KnowledgeBase update]
-    MEM -->|iterations < max| OBS
+    ACT --> COST[Charge + enforce budget]
+    COST --> CP[Checkpoint step]
+    CP --> MEM[Update memory + knowledge]
+    MEM -->|under max| OBS
     MEM -->|max reached| DONE
+    classDef warm fill:#f49f0a,stroke:#ff6b6c,color:#1a0f00;
+    classDef teal fill:#00a6a6,stroke:#00c2c2,color:#011;
+    class THINK warm
+    class DONE teal
 ```
 
 Every edge above is a swappable trait: `LlmProvider`, `Tool`/`ToolRegistry`, `ConfirmationHook`, `CostTracker`, `CheckpointStore`, `Memory`, `KnowledgeBase`.
@@ -209,30 +210,25 @@ Every edge above is a swappable trait: `LlmProvider`, `Tool`/`ToolRegistry`, `Co
 ### How the service consumes the engine
 
 ```mermaid
+%%{init: {'theme':'base','themeVariables':{
+  'background':'#020618','primaryColor':'#0b1426','primaryTextColor':'#e6edf6','primaryBorderColor':'#2b3a52',
+  'lineColor':'#7c8aa0','secondaryColor':'#0b1426','tertiaryColor':'#0b1426','fontFamily':'ui-sans-serif, system-ui, sans-serif',
+  'clusterBkg':'#0b1426','clusterBorder':'#22304a'}}}%%
 flowchart LR
-    subgraph core["smooai-smooth-operator-core (this crate)"]
-        AG[Agent loop]
-        WF[Workflow engine]
-        TL[Tool registry]
-        CP[Checkpoint stores]
-        KB[Knowledge / Memory]
-    end
-
-    subgraph svc["smooth-operator service"]
-        WS[WebSocket API]
-        RT[KnowledgeChatRuntime]
-    end
-
     WID[chat-widget / clients] -->|WS protocol| WS
-    WS --> RT
+    subgraph svc["smooth-operator service (thin)"]
+        WS[WebSocket API] --> RT[ChatRuntime]
+    end
     RT -->|drives| AG
-    AG --> WF
-    AG --> TL
-    AG --> CP
-    AG --> KB
-    AG -->|streamed tokens| WS
-    WS -->|answer| WID
+    subgraph core["this crate"]
+        AG[Agent loop]
+    end
     AG -.->|OpenAI-compatible| GW[(LLM gateway)]
+    AG -->|streamed answer| WID
+    classDef warm fill:#f49f0a,stroke:#ff6b6c,color:#1a0f00;
+    classDef teal fill:#00a6a6,stroke:#00c2c2,color:#011;
+    class AG warm
+    class GW teal
 ```
 
 The service is thin: it terminates the WebSocket protocol and hands turns to the engine. All the agent intelligence lives here.
@@ -268,18 +264,22 @@ async fn agent_uses_the_tool_then_answers() {
 ### The test pyramid
 
 ```mermaid
+%%{init: {'theme':'base','themeVariables':{
+  'background':'#020618','primaryColor':'#0b1426','primaryTextColor':'#e6edf6','primaryBorderColor':'#2b3a52',
+  'lineColor':'#7c8aa0','secondaryColor':'#0b1426','tertiaryColor':'#0b1426','fontFamily':'ui-sans-serif, system-ui, sans-serif',
+  'clusterBkg':'#0b1426','clusterBorder':'#22304a'}}}%%
 flowchart TD
-    J["LLM-as-judge evals<br/>(multi-turn quality, scored 0–5)"]
-    E["Live E2E<br/>(real gateway, real WS, streamed answer)"]
-    C["Conformance / integration<br/>(SQLite + Postgres checkpoint stores, testcontainers)"]
-    U["337 unit tests<br/>(MockLlmClient — deterministic, offline, fast)"]
+    J["LLM-as-judge evals — multi-turn quality, 0–5"]
+    E["Live E2E — real gateway + WS, streamed answer"]
+    C["Conformance — SQLite + Postgres stores, testcontainers"]
+    U["337 unit tests — MockLlmClient, offline, fast"]
 
     J --> E --> C --> U
 
-    style U fill:#1f7a3d,stroke:#0d3,color:#fff
-    style C fill:#2563eb,stroke:#08f,color:#fff
-    style E fill:#7c3aed,stroke:#a0f,color:#fff
-    style J fill:#b45309,stroke:#f90,color:#fff
+    classDef warm fill:#f49f0a,stroke:#ff6b6c,color:#1a0f00;
+    classDef teal fill:#00a6a6,stroke:#00c2c2,color:#011;
+    class J warm
+    class U teal
 ```
 
 - **Unit (408):** the bulk. Loop control, tool dispatch, workflow edges, compaction, cost enforcement, HITL gating, checkpoint round-trips — all against `MockLlmClient`.
@@ -340,7 +340,11 @@ Bindings follow a **protocol-first** strategy (a stable wire spec each language 
 
 ## Part of Smoo AI
 
-`smooth-operator-core` is part of the [Smoo AI](https://smoo.ai) platform — an AI-powered business platform with AI built into every product. It pairs with [smooth-operator](https://github.com/SmooAI/smooth-operator) (the agent service), [@smooai/chat-widget](https://github.com/SmooAI/chat-widget) (the embeddable UI), and infrastructure packages like [@smooai/config](https://github.com/SmooAI/config) and [@smooai/logger](https://github.com/SmooAI/logger).
+`smooth-operator-core` is built and open-sourced by **[Smoo AI](https://smoo.ai)** — the AI-powered business platform with AI built into every product: CRM, customer support, campaigns, field service, observability, and developer tools.
+
+- 🚀 **Smooth on the platform** — [smoo.ai/th](https://smoo.ai/th)
+- 🧰 **More open source from Smoo AI** — [smoo.ai/open-source](https://smoo.ai/open-source)
+- 🧩 **Sibling repos** — [smooth-operator](https://github.com/SmooAI/smooth-operator) (the agent service), [@smooai/chat-widget](https://github.com/SmooAI/chat-widget) (the embeddable UI), [@smooai/config](https://github.com/SmooAI/config), [@smooai/logger](https://github.com/SmooAI/logger)
 
 ## Contributing
 
