@@ -20,7 +20,7 @@ use futures_core::Stream;
 use futures_util::stream::{self, StreamExt};
 
 use crate::conversation::Message;
-use crate::llm::{LlmClient, LlmResponse, StreamEvent, Usage};
+use crate::llm::{LlmClient, LlmResponse, ResponseFormat, StreamEvent, Usage};
 use crate::tool::{ToolCall, ToolSchema};
 
 /// Boxed stream of streaming chat events — mirrors the return type of
@@ -37,6 +37,14 @@ pub trait LlmProvider: Send + Sync {
 
     /// Streaming completion. Yields incremental [`StreamEvent`]s.
     async fn chat_stream(&self, messages: &[&Message], tools: &[ToolSchema]) -> anyhow::Result<LlmEventStream>;
+
+    /// Non-streaming completion constrained to a JSON Schema — **structured
+    /// output** (SMOODEV-1472). The returned response's `content` is the JSON
+    /// string the model produced; use
+    /// [`LlmResponse::structured_json`](crate::llm::LlmResponse::structured_json)
+    /// / [`LlmResponse::deserialize_json`](crate::llm::LlmResponse::deserialize_json)
+    /// to parse it.
+    async fn chat_structured(&self, messages: &[&Message], format: &ResponseFormat) -> anyhow::Result<LlmResponse>;
 }
 
 // The `LlmClient::` paths are intentional (not `Self::`): they fully-qualify the
@@ -51,6 +59,10 @@ impl LlmProvider for LlmClient {
 
     async fn chat_stream(&self, messages: &[&Message], tools: &[ToolSchema]) -> anyhow::Result<LlmEventStream> {
         LlmClient::chat_stream(self, messages, tools).await
+    }
+
+    async fn chat_structured(&self, messages: &[&Message], format: &ResponseFormat) -> anyhow::Result<LlmResponse> {
+        LlmClient::chat_structured(self, messages, format).await
     }
 }
 
@@ -97,8 +109,11 @@ pub struct RecordedCall {
     pub messages: Vec<Message>,
     /// The tool schemas offered to the model.
     pub tools: Vec<ToolSchema>,
-    /// `true` if this was a `chat_stream` call, `false` for `chat`.
+    /// `true` if this was a `chat_stream` call, `false` for `chat`/`chat_structured`.
     pub streamed: bool,
+    /// The structured-output format requested, if this was a `chat_structured`
+    /// call (SMOODEV-1472). `None` for plain `chat`/`chat_stream`.
+    pub response_format: Option<ResponseFormat>,
 }
 
 /// A scripted outcome for a `chat` call.
@@ -209,11 +224,12 @@ impl MockLlmClient {
         self.lock().calls.last().cloned()
     }
 
-    fn record(&self, messages: &[&Message], tools: &[ToolSchema], streamed: bool) {
+    fn record(&self, messages: &[&Message], tools: &[ToolSchema], streamed: bool, response_format: Option<ResponseFormat>) {
         self.lock().calls.push(RecordedCall {
             messages: messages.iter().map(|m| (*m).clone()).collect(),
             tools: tools.to_vec(),
             streamed,
+            response_format,
         });
     }
 }
@@ -221,7 +237,21 @@ impl MockLlmClient {
 #[async_trait]
 impl LlmProvider for MockLlmClient {
     async fn chat(&self, messages: &[&Message], tools: &[ToolSchema]) -> anyhow::Result<LlmResponse> {
-        self.record(messages, tools, false);
+        self.record(messages, tools, false, None);
+        let outcome = self.lock().chat.pop_front();
+        match outcome {
+            Some(ChatOutcome::Response(r)) => Ok(*r),
+            Some(ChatOutcome::Error(e)) => Err(anyhow::anyhow!(e)),
+            // Empty script: a benign terminal response so loops don't hang.
+            None => Ok(text_response("")),
+        }
+    }
+
+    async fn chat_structured(&self, messages: &[&Message], format: &ResponseFormat) -> anyhow::Result<LlmResponse> {
+        // Structured-output calls share the scripted `chat` queue (FIFO) so a
+        // test scripts the JSON response via `push_text`/`push_response`. The
+        // requested format is captured on the RecordedCall for assertions.
+        self.record(messages, &[], false, Some(format.clone()));
         let outcome = self.lock().chat.pop_front();
         match outcome {
             Some(ChatOutcome::Response(r)) => Ok(*r),
@@ -232,7 +262,7 @@ impl LlmProvider for MockLlmClient {
     }
 
     async fn chat_stream(&self, messages: &[&Message], tools: &[ToolSchema]) -> anyhow::Result<LlmEventStream> {
-        self.record(messages, tools, true);
+        self.record(messages, tools, true, None);
         let outcome = self.lock().streams.pop_front();
         match outcome {
             Some(StreamOutcome::Events(events)) => Ok(stream::iter(events.into_iter().map(Ok)).boxed()),
@@ -384,5 +414,96 @@ mod tests {
         // Compiles + runs through the trait object.
         let r = provider.chat(&msgs(&u), &[]).await.expect("chat");
         assert_eq!(r.finish_reason, "stop");
+    }
+
+    // -------- Structured output (SMOODEV-1472) --------
+
+    #[tokio::test]
+    async fn chat_structured_records_the_requested_format() {
+        let mock = MockLlmClient::new();
+        mock.push_text(r#"{"answer":42}"#);
+        let u = Message::user("the question");
+        let format = ResponseFormat::json_schema(
+            "answer_schema",
+            serde_json::json!({"type": "object", "properties": {"answer": {"type": "integer"}}}),
+        );
+
+        let resp = mock.chat_structured(&msgs(&u), &format).await.expect("structured chat");
+        assert_eq!(resp.content, r#"{"answer":42}"#);
+
+        let call = mock.last_call().expect("recorded a call");
+        assert!(!call.streamed);
+        let recorded = call.response_format.expect("response_format captured");
+        assert_eq!(recorded, format, "the requested format must be recorded for assertions");
+    }
+
+    #[tokio::test]
+    async fn chat_structured_response_parses_and_deserializes() {
+        let mock = MockLlmClient::new();
+        mock.push_text(r#"{"city":"SF","temp_c":18.5}"#);
+        let u = Message::user("weather?");
+        let format = ResponseFormat::json_schema("weather", serde_json::json!({"type": "object"}));
+
+        let resp = mock.chat_structured(&msgs(&u), &format).await.expect("structured chat");
+
+        // serde_json::Value path
+        let value = resp.structured_json().expect("valid JSON object");
+        assert_eq!(value["city"], "SF");
+
+        // typed deserialization path
+        #[derive(serde::Deserialize)]
+        struct Weather {
+            city: String,
+            temp_c: f64,
+        }
+        let typed: Weather = resp.deserialize_json().expect("deserialize into T");
+        assert_eq!(typed.city, "SF");
+        assert!((typed.temp_c - 18.5).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn chat_structured_non_json_response_surfaces_clear_error() {
+        let mock = MockLlmClient::new();
+        // Model ignored the schema and returned prose.
+        mock.push_text("Sorry, I cannot answer that.");
+        let u = Message::user("?");
+        let format = ResponseFormat::json_schema("x", serde_json::json!({"type": "object"}));
+
+        let resp = mock.chat_structured(&msgs(&u), &format).await.expect("structured chat");
+        // Don't silently return empty: parsing must fail loudly.
+        let err = resp.structured_json().expect_err("non-JSON must error");
+        assert!(err.to_string().contains("not valid JSON"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn chat_structured_propagates_scripted_errors() {
+        let mock = MockLlmClient::new();
+        mock.push_error("rate limited");
+        let u = Message::user("?");
+        let format = ResponseFormat::json_schema("x", serde_json::json!({"type": "object"}));
+        let err = mock.chat_structured(&msgs(&u), &format).await.expect_err("should error");
+        assert!(err.to_string().contains("rate limited"));
+    }
+
+    #[tokio::test]
+    async fn chat_does_not_record_a_response_format() {
+        let mock = MockLlmClient::new();
+        mock.push_text("ok");
+        let u = Message::user("hi");
+        mock.chat(&msgs(&u), &[]).await.expect("chat");
+        assert!(mock.last_call().expect("call").response_format.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_structured_usable_as_trait_object() {
+        let provider: Arc<dyn LlmProvider> = Arc::new({
+            let m = MockLlmClient::new();
+            m.push_text(r#"{"ok":true}"#);
+            m
+        });
+        let u = Message::user("hi");
+        let format = ResponseFormat::json_schema("x", serde_json::json!({"type": "object"}));
+        let r = provider.chat_structured(&msgs(&u), &format).await.expect("structured");
+        assert_eq!(r.structured_json().expect("json")["ok"], true);
     }
 }

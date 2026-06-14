@@ -54,6 +54,85 @@ pub enum ApiFormat {
     Anthropic,
 }
 
+/// A constraint on the shape of the model's response — used to request
+/// **structured output** (a guaranteed-JSON answer that conforms to a
+/// caller-supplied JSON Schema).
+///
+/// This is the keystone capability for an agent "brain" that must emit a
+/// typed JSON object every turn (SMOODEV-1472).
+///
+/// # Wire mapping
+/// - **OpenAI-compatible** (`ApiFormat::OpenAiCompat`, e.g. the LiteLLM
+///   gateway at `llm.smoo.ai`): serialized on `/chat/completions` as
+///   `response_format: { type: "json_schema", json_schema: { name, schema,
+///   strict } }`. This is what most models behind the gateway expect.
+/// - **Anthropic-native** (`ApiFormat::Anthropic`, `/v1/messages`): Anthropic
+///   has no `response_format` field, so structured output is achieved via a
+///   **forced single tool call** — a synthetic tool whose `input_schema` IS the
+///   requested schema, with `tool_choice` forcing exactly that tool. The tool's
+///   `input` is then surfaced back as the response content (the JSON string).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponseFormat {
+    /// Constrain the response to a named JSON Schema.
+    JsonSchema {
+        /// A short identifier for the schema (e.g. `"weather_report"`). On the
+        /// Anthropic forced-tool path this also names the synthetic tool.
+        name: String,
+        /// The JSON Schema the response object must conform to.
+        schema: serde_json::Value,
+        /// When `true`, request strict schema adherence. OpenAI/LiteLLM
+        /// enforce the schema exactly (no extra keys); on the Anthropic
+        /// forced-tool path this flag is informational (the forced tool call
+        /// already constrains the shape).
+        strict: bool,
+    },
+}
+
+impl ResponseFormat {
+    /// Convenience constructor for a strict JSON-schema response format.
+    #[must_use]
+    pub fn json_schema(name: impl Into<String>, schema: serde_json::Value) -> Self {
+        Self::JsonSchema {
+            name: name.into(),
+            schema,
+            strict: true,
+        }
+    }
+}
+
+/// OpenAI-compatible `response_format` wire object:
+/// `{ "type": "json_schema", "json_schema": { name, schema, strict } }`.
+#[derive(Debug, Serialize)]
+struct OpenAiResponseFormat {
+    r#type: &'static str,
+    json_schema: OpenAiJsonSchema,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiJsonSchema {
+    name: String,
+    schema: serde_json::Value,
+    strict: bool,
+}
+
+impl ResponseFormat {
+    /// Render this format into the OpenAI-compatible `response_format` wire
+    /// object. Returns `None` for variants that don't map to `response_format`
+    /// (none today, but keeps the call site future-proof).
+    fn to_openai(&self) -> OpenAiResponseFormat {
+        match self {
+            Self::JsonSchema { name, schema, strict } => OpenAiResponseFormat {
+                r#type: "json_schema",
+                json_schema: OpenAiJsonSchema {
+                    name: name.clone(),
+                    schema: schema.clone(),
+                    strict: *strict,
+                },
+            },
+        }
+    }
+}
+
 /// Configuration for the LLM client.
 #[derive(Clone)]
 pub struct LlmConfig {
@@ -169,6 +248,47 @@ pub struct LlmResponse {
     pub reasoning_content: Option<String>,
 }
 
+impl LlmResponse {
+    /// Parse the response `content` as a JSON value. For a
+    /// [structured-output](ResponseFormat) response this is the
+    /// schema-conforming object the model produced.
+    ///
+    /// # Errors
+    /// Returns an error if `content` is empty or is not valid JSON — the error
+    /// includes a (truncated) snippet of the offending content so callers can
+    /// diagnose a model that ignored the schema. Never silently returns an
+    /// empty/null value.
+    pub fn structured_json(&self) -> anyhow::Result<serde_json::Value> {
+        let trimmed = self.content.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("structured output: model returned empty content (expected a JSON object)");
+        }
+        serde_json::from_str(trimmed).map_err(|e| {
+            let snippet: String = trimmed.chars().take(200).collect();
+            anyhow::anyhow!("structured output: response content was not valid JSON ({e}): {snippet}")
+        })
+    }
+
+    /// Parse the response `content` into a caller type `T`.
+    ///
+    /// Convenience over [`Self::structured_json`] for the common case of
+    /// deserializing directly into a typed struct.
+    ///
+    /// # Errors
+    /// Returns an error if `content` is empty, is not valid JSON, or does not
+    /// match the shape of `T`.
+    pub fn deserialize_json<T: serde::de::DeserializeOwned>(&self) -> anyhow::Result<T> {
+        let trimmed = self.content.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("structured output: model returned empty content (expected JSON for the requested type)");
+        }
+        serde_json::from_str(trimmed).map_err(|e| {
+            let snippet: String = trimmed.chars().take(200).collect();
+            anyhow::anyhow!("structured output: could not deserialize response into the requested type ({e}): {snippet}")
+        })
+    }
+}
+
 /// Parse the gateway's authoritative cost from an HTTP response's
 /// headers. Checks a few header name variants so the same parser
 /// works across LiteLLM versions and other OpenAI-compat gateways
@@ -241,6 +361,13 @@ struct ChatRequest {
     /// the field without `tools`.
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    /// Structured-output constraint. When present, serialized as
+    /// `response_format: { type: "json_schema", json_schema: { name, schema,
+    /// strict } }` — the OpenAI/LiteLLM shape for schema-constrained JSON
+    /// responses (SMOODEV-1472). Skipped when absent so providers that don't
+    /// support it (and the no-structured-output path) see no change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<OpenAiResponseFormat>,
 }
 
 #[derive(Debug, Serialize)]
@@ -535,6 +662,20 @@ struct AnthropicRequest {
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicTool>,
+    /// Forces a specific tool call. Anthropic has no `response_format`, so
+    /// structured output is achieved by attaching a single synthetic tool
+    /// (whose `input_schema` is the requested JSON Schema) and forcing it via
+    /// `tool_choice: { type: "tool", name }`. SMOODEV-1472.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<AnthropicToolChoice>,
+}
+
+/// Anthropic `tool_choice` wire object. For structured output we use the
+/// `{ "type": "tool", "name": "..." }` form to force exactly one tool call.
+#[derive(Debug, Serialize)]
+struct AnthropicToolChoice {
+    r#type: &'static str,
+    name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -582,6 +723,23 @@ struct AnthropicResponse {
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
+}
+
+/// Sanitize a [`ResponseFormat`] schema name into a valid tool name for the
+/// Anthropic forced-tool structured-output path. Anthropic tool names must
+/// match `^[a-zA-Z0-9_-]{1,64}$`, so we replace any other character with `_`
+/// and fall back to a stable default when the result would be empty.
+fn sanitize_tool_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "structured_output".to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Calculate exponential backoff duration for a given retry attempt.
@@ -658,8 +816,39 @@ impl LlmClient {
     /// # Errors
     /// Returns error if the API call fails after all retries or returns an invalid response.
     pub async fn chat(&self, messages: &[&Message], tools: &[ToolSchema]) -> anyhow::Result<LlmResponse> {
+        self.chat_with_format(messages, tools, None).await
+    }
+
+    /// Send a chat completion request constrained to a JSON Schema —
+    /// **structured output** (SMOODEV-1472).
+    ///
+    /// The returned [`LlmResponse`]'s `content` is the JSON string produced by
+    /// the model. Use [`LlmResponse::structured_json`] /
+    /// [`LlmResponse::deserialize_json`] to parse it; both surface a clear
+    /// error if the model returned non-JSON.
+    ///
+    /// # Provider handling
+    /// - **OpenAI-compatible**: sends the `response_format` field.
+    /// - **Anthropic-native**: forces a single tool call whose `input_schema`
+    ///   is the requested schema, then surfaces the tool input as the content.
+    ///
+    /// # Errors
+    /// Returns error if the API call fails after all retries or returns an
+    /// invalid response.
+    pub async fn chat_structured(&self, messages: &[&Message], format: &ResponseFormat) -> anyhow::Result<LlmResponse> {
+        self.chat_with_format(messages, &[], Some(format)).await
+    }
+
+    /// Core chat implementation shared by [`Self::chat`] and
+    /// [`Self::chat_structured`]. When `format` is `Some`, the request is
+    /// constrained to the given JSON Schema (see [`ResponseFormat`]).
+    ///
+    /// # Errors
+    /// Returns error if the API call fails after all retries or returns an
+    /// invalid response.
+    pub async fn chat_with_format(&self, messages: &[&Message], tools: &[ToolSchema], format: Option<&ResponseFormat>) -> anyhow::Result<LlmResponse> {
         match self.config.api_format {
-            ApiFormat::Anthropic => return self.chat_anthropic(messages, tools).await,
+            ApiFormat::Anthropic => return self.chat_anthropic(messages, tools, format).await,
             ApiFormat::OpenAiCompat => {}
         }
 
@@ -690,6 +879,7 @@ impl LlmClient {
             temperature: self.config.temperature,
             tools: chat_tools,
             tool_choice,
+            response_format: format.map(ResponseFormat::to_openai),
         };
 
         let url = format!("{}/chat/completions", self.config.api_url);
@@ -854,6 +1044,10 @@ impl LlmClient {
             temperature: self.config.temperature,
             tools: chat_tools,
             tool_choice,
+            // Streaming structured output is not yet wired — callers needing a
+            // schema-constrained response use the non-streaming
+            // `chat_structured` path. SMOODEV-1472 follow-up.
+            response_format: None,
         };
 
         let url = format!("{}/chat/completions", self.config.api_url);
@@ -1025,10 +1219,10 @@ impl LlmClient {
     }
 
     /// Send a chat completion request using the Anthropic native API.
-    async fn chat_anthropic(&self, messages: &[&Message], tools: &[ToolSchema]) -> anyhow::Result<LlmResponse> {
+    async fn chat_anthropic(&self, messages: &[&Message], tools: &[ToolSchema], format: Option<&ResponseFormat>) -> anyhow::Result<LlmResponse> {
         let (system, anthropic_messages) = convert_messages_to_anthropic(messages);
 
-        let anthropic_tools: Vec<AnthropicTool> = tools
+        let mut anthropic_tools: Vec<AnthropicTool> = tools
             .iter()
             .map(|t| AnthropicTool {
                 name: t.name.clone(),
@@ -1037,12 +1231,36 @@ impl LlmClient {
             })
             .collect();
 
+        // Structured output on the Anthropic-native path: Anthropic has no
+        // `response_format`, so we attach a synthetic tool whose `input_schema`
+        // is the requested JSON Schema and force it via `tool_choice`. The
+        // model's tool `input` becomes the structured JSON answer. SMOODEV-1472.
+        let (tool_choice, forced_tool_name) = match format {
+            Some(ResponseFormat::JsonSchema { name, schema, .. }) => {
+                let tool_name = sanitize_tool_name(name);
+                anthropic_tools.push(AnthropicTool {
+                    name: tool_name.clone(),
+                    description: "Return the response as a single JSON object conforming to the schema.".into(),
+                    input_schema: schema.clone(),
+                });
+                (
+                    Some(AnthropicToolChoice {
+                        r#type: "tool",
+                        name: tool_name.clone(),
+                    }),
+                    Some(tool_name),
+                )
+            }
+            None => (None, None),
+        };
+
         let request = AnthropicRequest {
             model: self.config.model.clone(),
             max_tokens: self.config.max_tokens,
             system,
             messages: anthropic_messages,
             tools: anthropic_tools,
+            tool_choice,
         };
 
         let url = format!("{}/messages", self.config.api_url);
@@ -1071,6 +1289,9 @@ impl LlmClient {
 
                 let mut content = String::new();
                 let mut tool_calls = Vec::new();
+                // For structured output (forced tool), capture the forced
+                // tool's `input` and surface it as the JSON content string.
+                let mut structured_content: Option<String> = None;
 
                 for block in anthropic_resp.content {
                     match block {
@@ -1081,10 +1302,21 @@ impl LlmClient {
                             content.push_str(&text);
                         }
                         AnthropicContentBlock::ToolUse { id, name, input } => {
-                            tool_calls.push(ToolCall { id, name, arguments: input });
+                            if forced_tool_name.as_deref() == Some(name.as_str()) {
+                                // The forced structured-output tool: its input IS
+                                // the answer. Serialize back to a JSON string so
+                                // the content shape matches the OpenAI path.
+                                structured_content = Some(serde_json::to_string(&input).unwrap_or_else(|_| input.to_string()));
+                            } else {
+                                tool_calls.push(ToolCall { id, name, arguments: input });
+                            }
                         }
                         AnthropicContentBlock::ToolResult { .. } => {}
                     }
+                }
+
+                if let Some(json) = structured_content {
+                    content = json;
                 }
 
                 let finish_reason = anthropic_resp.stop_reason.unwrap_or_else(|| "stop".into());
@@ -1173,6 +1405,9 @@ impl LlmClient {
             system,
             messages: anthropic_messages,
             tools: anthropic_tools,
+            // Streaming structured output is not wired on the Anthropic path —
+            // use the non-streaming `chat_structured` path. SMOODEV-1472.
+            tool_choice: None,
         };
 
         // Add `stream: true` to the request body. AnthropicRequest doesn't
@@ -2496,6 +2731,7 @@ mod tests {
             temperature: 0.0,
             tools: vec![],
             tool_choice: None,
+            response_format: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(json.contains("test-model"));
@@ -3259,6 +3495,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
                 description: "Echoes text".into(),
                 input_schema: serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}}),
             }],
+            tool_choice: None,
         };
         let json: serde_json::Value = serde_json::to_value(&req).expect("serialize");
         assert_eq!(json["model"], "claude-sonnet-4-20250514");
@@ -3494,6 +3731,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             temperature: 0.0,
             tools: chat_tools,
             tool_choice: None,
+            response_format: None,
         }
     }
 
@@ -3587,6 +3825,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             temperature: 0.0,
             tools: chat_tools,
             tool_choice: None,
+            response_format: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(
@@ -3628,5 +3867,173 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         }"#;
         let resp2: ChatResponse = serde_json::from_str(json2).expect("deserialize");
         assert!(resp2.usage.expect("usage").prompt_tokens_details.is_none());
+    }
+
+    // -------- Structured output (SMOODEV-1472) --------
+
+    fn weather_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "temp_c": {"type": "number"}
+            },
+            "required": ["city", "temp_c"],
+            "additionalProperties": false
+        })
+    }
+
+    #[test]
+    fn openai_request_carries_response_format_json_schema() {
+        // The OpenAI/LiteLLM wire shape:
+        // response_format: { type: "json_schema", json_schema: { name, schema, strict } }
+        let format = ResponseFormat::json_schema("weather_report", weather_schema());
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: ChatContent::Text(Some("weather in SF?".into())),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: vec![],
+                reasoning_content: None,
+            }],
+            max_tokens: 100,
+            temperature: 0.0,
+            tools: vec![],
+            tool_choice: None,
+            response_format: Some(format.to_openai()),
+        };
+        let json: serde_json::Value = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(json["response_format"]["type"], "json_schema");
+        assert_eq!(json["response_format"]["json_schema"]["name"], "weather_report");
+        assert_eq!(json["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(json["response_format"]["json_schema"]["schema"]["type"], "object");
+        assert_eq!(json["response_format"]["json_schema"]["schema"]["required"][0], "city");
+    }
+
+    #[test]
+    fn no_response_format_is_omitted_from_the_wire() {
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![],
+            max_tokens: 100,
+            temperature: 0.0,
+            tools: vec![],
+            tool_choice: None,
+            response_format: None,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(!json.contains("response_format"), "absent format must not serialize: {json}");
+    }
+
+    #[test]
+    fn anthropic_forced_tool_request_for_structured_output() {
+        // The Anthropic-native path expresses structured output as a forced
+        // tool call: a tool whose input_schema IS the requested schema, with
+        // tool_choice forcing exactly that tool.
+        let req = AnthropicRequest {
+            model: "claude-sonnet-4-20250514".into(),
+            max_tokens: 1024,
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "user".into(),
+                content: AnthropicContent::Text("weather?".into()),
+            }],
+            tools: vec![AnthropicTool {
+                name: "weather_report".into(),
+                description: "Return the response as a single JSON object conforming to the schema.".into(),
+                input_schema: weather_schema(),
+            }],
+            tool_choice: Some(AnthropicToolChoice {
+                r#type: "tool",
+                name: "weather_report".into(),
+            }),
+        };
+        let json: serde_json::Value = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(json["tool_choice"]["type"], "tool");
+        assert_eq!(json["tool_choice"]["name"], "weather_report");
+        assert_eq!(json["tools"][0]["name"], "weather_report");
+        assert_eq!(json["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn response_format_constructor_defaults_strict() {
+        let format = ResponseFormat::json_schema("x", serde_json::json!({"type": "object"}));
+        match format {
+            ResponseFormat::JsonSchema { name, strict, .. } => {
+                assert_eq!(name, "x");
+                assert!(strict, "json_schema() must default strict=true");
+            }
+        }
+    }
+
+    #[test]
+    fn structured_json_parses_object_content() {
+        let resp = LlmResponse {
+            content: r#"{"city":"SF","temp_c":18.5}"#.into(),
+            tool_calls: vec![],
+            finish_reason: "stop".into(),
+            usage: Usage::default(),
+            rate_limit: None,
+            gateway_cost_usd: None,
+            resolved_model: None,
+            reasoning_content: None,
+        };
+        let value = resp.structured_json().expect("valid JSON");
+        assert_eq!(value["city"], "SF");
+        assert_eq!(value["temp_c"], 18.5);
+
+        #[derive(serde::Deserialize)]
+        struct Weather {
+            city: String,
+            temp_c: f64,
+        }
+        let typed: Weather = resp.deserialize_json().expect("deserialize");
+        assert_eq!(typed.city, "SF");
+        assert!((typed.temp_c - 18.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn structured_json_errors_on_non_json_content() {
+        let resp = LlmResponse {
+            content: "I'm sorry, I can't help with that.".into(),
+            tool_calls: vec![],
+            finish_reason: "stop".into(),
+            usage: Usage::default(),
+            rate_limit: None,
+            gateway_cost_usd: None,
+            resolved_model: None,
+            reasoning_content: None,
+        };
+        let err = resp.structured_json().expect_err("non-JSON must error");
+        assert!(err.to_string().contains("not valid JSON"), "err was: {err}");
+        // And it must not silently swallow — the snippet is surfaced.
+        assert!(err.to_string().contains("I'm sorry"), "err should include snippet: {err}");
+    }
+
+    #[test]
+    fn structured_json_errors_on_empty_content() {
+        let resp = LlmResponse {
+            content: "   ".into(),
+            tool_calls: vec![],
+            finish_reason: "stop".into(),
+            usage: Usage::default(),
+            rate_limit: None,
+            gateway_cost_usd: None,
+            resolved_model: None,
+            reasoning_content: None,
+        };
+        let err = resp.structured_json().expect_err("empty must error");
+        assert!(err.to_string().contains("empty content"), "err was: {err}");
+    }
+
+    #[test]
+    fn sanitize_tool_name_handles_invalid_chars() {
+        assert_eq!(sanitize_tool_name("weather report!"), "weather_report_");
+        assert_eq!(sanitize_tool_name("ok_name-1"), "ok_name-1");
+        assert_eq!(sanitize_tool_name(""), "structured_output");
+        assert_eq!(sanitize_tool_name("***"), "___");
+        assert_eq!(sanitize_tool_name(&"x".repeat(100)).len(), 64);
     }
 }
