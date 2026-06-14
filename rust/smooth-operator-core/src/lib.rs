@@ -32,7 +32,7 @@ pub use conversation::{CompactionResult, CompactionStrategy, Conversation, Messa
 pub use cost::{BudgetExceeded, CostBudget, CostEntry, CostTracker, ModelPricing};
 pub use human::{human_channel, ConfirmationHook, HumanChannelPair, HumanRequest, HumanResponse};
 pub use knowledge::{Document, DocumentType, InMemoryKnowledge, KnowledgeBase, KnowledgeResult};
-pub use llm::{accumulate_stream_events, LlmClient, LlmConfig, LlmResponse, StreamEvent};
+pub use llm::{accumulate_stream_events, LlmClient, LlmConfig, LlmResponse, ResponseFormat, StreamEvent};
 pub use memory::{InMemoryMemory, Memory, MemoryEntry, MemoryType};
 pub use providers::{Activity, ModelRouting, ModelSlot, ProviderConfig, ProviderRegistry};
 pub use tool::{Tool, ToolCall, ToolRegistry, ToolResult, ToolSchema};
