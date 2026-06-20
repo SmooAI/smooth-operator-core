@@ -1,0 +1,50 @@
+[package]
+name = "smooai-smooth-operator-temporal"
+version = "0.14.0"
+edition = "2021"
+description = "Optional Temporal-backed durable execution backend for the smooth-operator agent engine (ADR-030)."
+license = "MIT"
+publish = false
+
+# The Temporal SDK + workflow/executor wiring is behind the `temporal` feature so
+# the default build (and the OSS core's CI) compiles NONE of the preview SDK and
+# stays zero-infra. Only `--features temporal` pulls temporalio-* in.
+#
+# The serde DTO boundary + engine-type conversions (dto.rs) are always compiled
+# and tested — they're pure serde over smooth-operator-core types and are what the
+# Temporal activities marshal across the activity boundary.
+[features]
+default = []
+temporal = [
+    "dep:temporalio-client",
+    "dep:temporalio-common",
+    "dep:temporalio-macros",
+    "dep:temporalio-sdk",
+    "dep:temporalio-sdk-core",
+    "dep:futures",
+    "dep:futures-util",
+]
+
+[dependencies]
+smooai-smooth-operator-core = { path = "../smooth-operator-core" }
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros"] }
+tracing = "0.1"
+
+# Pinned preview SDK (=0.4.0), matching the platform's temporal-worker (ADR-029).
+# The macros need temporalio-common + futures + futures-util as DIRECT deps.
+temporalio-client = { version = "=0.4.0", optional = true }
+temporalio-common = { version = "=0.4.0", optional = true }
+temporalio-macros = { version = "=0.4.0", optional = true }
+temporalio-sdk = { version = "=0.4.0", optional = true }
+temporalio-sdk-core = { version = "=0.4.0", optional = true, features = ["ephemeral-server"] }
+futures = { version = "0.3", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
+anyhow = "1"
+url = "2"

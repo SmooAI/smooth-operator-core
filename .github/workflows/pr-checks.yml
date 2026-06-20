@@ -21,6 +21,11 @@ jobs:
               with:
                   components: rustfmt, clippy
 
+            # Required to compile the Temporal SDK (temporalio-sdk-core) used by
+            # the optional `temporal` feature of smooth-operator-temporal.
+            - name: Install protoc
+              run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
             - name: Cache cargo
               uses: Swatinem/rust-cache@v2
               with:
@@ -38,6 +43,20 @@ jobs:
             - name: Test
               working-directory: rust
               run: cargo test --workspace
+
+            # The `temporal` feature (optional Temporal SDK + workflow/executor)
+            # is off by default, so the steps above don't compile it. Exercise it
+            # here: clippy + tests. The ephemeral-dev-server integration test
+            # downloads the Temporal CLI on first run and self-skips if that
+            # download is blocked, so this step is robust offline.
+            - name: Clippy (temporal feature)
+              working-directory: rust
+              run: cargo clippy -p smooai-smooth-operator-temporal --features temporal --all-targets -- -D warnings
+              continue-on-error: true # pedantic + nursery lints set to warn in workspace; shouldn't block PRs
+
+            - name: Test (temporal feature)
+              working-directory: rust
+              run: cargo test -p smooai-smooth-operator-temporal --features temporal
 
             - name: Build (release)
               working-directory: rust
