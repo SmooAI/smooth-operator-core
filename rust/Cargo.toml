@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["smooth-operator-core"]
+members = ["smooth-operator-core", "smooth-operator-temporal"]
 
 [profile.release]
 lto = "thin"
