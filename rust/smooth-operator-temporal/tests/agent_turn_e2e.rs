@@ -95,6 +95,7 @@ async fn agent_turn_workflow_runs_a_real_turn_end_to_end() -> anyhow::Result<()>
             user_message: "what is the durable answer?".to_string(),
             tools: vec![],
             max_iterations: 5,
+            approval_required_tools: vec![],
         };
         let handle = starter
             .start_workflow(AgentTurnWorkflow::run, input, WorkflowStartOptions::new(TASK_QUEUE, "agent-turn-e2e-1").build())

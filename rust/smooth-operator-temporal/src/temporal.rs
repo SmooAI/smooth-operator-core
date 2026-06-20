@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use temporalio_common::error::ApplicationFailure;
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
-use temporalio_sdk::{ActivityOptions, WorkflowContext, WorkflowResult};
+use temporalio_sdk::{ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult};
 
 use smooth_operator_core::activities::{drive_turn, AgentActivities, TurnPolicy};
 use smooth_operator_core::conversation::{Conversation, Message};
@@ -112,8 +112,14 @@ fn agent_activity_opts() -> ActivityOptions {
 /// Adapter that makes the engine's [`AgentActivities`] surface schedule Temporal
 /// activities on a [`WorkflowContext`]. Holding `&WorkflowContext` (a `!Send`
 /// `Rc<RefCell<…>>` internally) is why [`AgentActivities`] is `?Send`.
+///
+/// `approval_required` names the tools that need human approval before they run:
+/// `tool_invoke` blocks **durably** on an approval signal for those, resuming
+/// across worker restarts (the HITL unlock — no mid-turn connection state, just a
+/// signal).
 struct WorkflowAgentActivities<'a> {
     ctx: &'a WorkflowContext<AgentTurnWorkflow>,
+    approval_required: Vec<String>,
 }
 
 #[async_trait(?Send)]
@@ -128,6 +134,29 @@ impl AgentActivities for WorkflowAgentActivities<'_> {
     }
 
     async fn tool_invoke(&self, call: ToolCall) -> anyhow::Result<ToolResult> {
+        // Durable human-in-the-loop gate: if this tool needs approval, block
+        // until an `approve_tool` / `deny_tool` signal names this call id. The
+        // wait is recorded in workflow history, so it survives restarts and can
+        // resolve hours later. `drive_turn` is unchanged — the gate lives here.
+        if self.approval_required.iter().any(|name| name == &call.name) {
+            let pending_id = call.id.clone();
+            self.ctx
+                .wait_condition(move |wf: &AgentTurnWorkflow| wf.approved.contains(&pending_id) || wf.denied.contains(&pending_id))
+                .await;
+
+            let denied_id = call.id.clone();
+            if self.ctx.state(move |wf: &AgentTurnWorkflow| wf.denied.contains(&denied_id)) {
+                // Denied: surface a tool-error result so the model can react,
+                // without ever executing the tool.
+                return Ok(ToolResult {
+                    tool_call_id: call.id.clone(),
+                    content: format!("Tool call '{}' was denied by human approval.", call.name),
+                    is_error: true,
+                    details: None,
+                });
+            }
+        }
+
         let result = self
             .ctx
             .start_activity(AgentTurnActivities::tool_invoke, ToolInvokeInput { call }, agent_activity_opts())
@@ -151,14 +180,28 @@ pub struct AgentTurnInput {
     /// Iteration bound. `0` falls back to the [`TurnPolicy`] default.
     #[serde(default)]
     pub max_iterations: u32,
+    /// Names of tools that require human approval before they run. When the
+    /// model calls one of these, the workflow blocks durably until an
+    /// `approve_tool` / `deny_tool` signal names that tool call.
+    #[serde(default)]
+    pub approval_required_tools: Vec<String>,
 }
 
 /// The agent turn as a Temporal workflow. Seeds the conversation, then drives the
 /// engine's [`drive_turn`] unchanged over [`WorkflowAgentActivities`], so the
 /// durable path is the same loop as in-process. Returns the full conversation.
+///
+/// Workflow state is the human-approval ledger: `approved` / `denied` tool-call
+/// ids, populated by the `approve_tool` / `deny_tool` signals and observed by the
+/// adapter's durable gate.
 #[workflow]
 #[derive(Default)]
-pub struct AgentTurnWorkflow;
+pub struct AgentTurnWorkflow {
+    /// Tool-call ids a human has approved.
+    approved: Vec<String>,
+    /// Tool-call ids a human has denied.
+    denied: Vec<String>,
+}
 
 #[workflow_methods]
 impl AgentTurnWorkflow {
@@ -175,12 +218,32 @@ impl AgentTurnWorkflow {
             }
         };
 
-        let adapter = WorkflowAgentActivities { ctx: &*ctx };
+        let adapter = WorkflowAgentActivities {
+            ctx: &*ctx,
+            approval_required: input.approval_required_tools,
+        };
         drive_turn(&adapter, &mut conversation, input.tools, &policy)
             .await
             .map_err(|e| anyhow::anyhow!("drive_turn: {e}"))?;
 
         Ok(conversation)
+    }
+
+    /// Signal: a human approves the tool call with this id, unblocking the gate.
+    #[signal]
+    pub fn approve_tool(&mut self, _ctx: &mut SyncWorkflowContext<Self>, call_id: String) {
+        if !self.approved.contains(&call_id) {
+            self.approved.push(call_id);
+        }
+    }
+
+    /// Signal: a human denies the tool call with this id; the gate returns a
+    /// tool-error result instead of running it.
+    #[signal]
+    pub fn deny_tool(&mut self, _ctx: &mut SyncWorkflowContext<Self>, call_id: String) {
+        if !self.denied.contains(&call_id) {
+            self.denied.push(call_id);
+        }
     }
 }
 
