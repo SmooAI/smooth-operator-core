@@ -6,6 +6,7 @@
 //! Inspired by LangGraph, CrewAI, and Agno — purpose-built for orchestrated
 //! agent workloads with security-first design.
 
+pub mod activities;
 pub mod agent;
 pub mod cast;
 pub mod checkpoint;
@@ -26,6 +27,7 @@ pub mod tool_search;
 pub mod workflow;
 pub mod ws_resilience;
 
+pub use activities::{drive_turn, AgentActivities, InProcessActivities, TurnPolicy};
 pub use agent::{Agent, AgentConfig, AgentEvent, DelegationHandle, DelegationTool, SubAgentConfig};
 pub use cast::{Cast, Clearance, DispatchResult, DispatchSubagentTool, LlmConfigFactory, OperatorRole, PermissionHook, RoleKind};
 pub use checkpoint::{Checkpoint, CheckpointStore, MemoryCheckpointStore};
