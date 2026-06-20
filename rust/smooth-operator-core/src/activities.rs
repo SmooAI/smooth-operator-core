@@ -57,8 +57,14 @@ use crate::tool::{ToolCall, ToolRegistry, ToolResult, ToolSchema};
 ///
 /// Inputs/outputs are owned values (not borrows) so an implementation may
 /// serialize them across an activity boundary.
-#[async_trait]
-pub trait AgentActivities: Send + Sync {
+///
+/// The trait is `?Send` (no `Send`/`Sync` bound, non-`Send` futures): a Temporal
+/// workflow-backed implementation drives the single-threaded, `!Send`
+/// `WorkflowContext` (`Rc<RefCell<…>>` internally), so requiring `Send` would make
+/// `drive_turn` uncallable from workflow code. The in-process path awaits
+/// `drive_turn` directly (never across threads), so it is unaffected.
+#[async_trait(?Send)]
+pub trait AgentActivities {
     /// Invoke the model with the given context and available tool schemas.
     ///
     /// # Errors
@@ -160,7 +166,7 @@ impl InProcessActivities {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl AgentActivities for InProcessActivities {
     async fn model_call(&self, messages: Vec<Message>, tools: Vec<ToolSchema>) -> anyhow::Result<LlmResponse> {
         let refs: Vec<&Message> = messages.iter().collect();
