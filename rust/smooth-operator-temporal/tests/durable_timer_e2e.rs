@@ -1,25 +1,22 @@
-//! End-to-end test of a **real agent turn** running through `AgentTurnWorkflow`
-//! against an ephemeral Temporal dev server.
+//! End-to-end test of a **durable timer** — an agent that pauses itself on a
+//! Temporal timer mid-turn, then resumes.
 //!
-//! The model call is backed by a `MockLlmClient` installed via `init_engine`, so
-//! the whole per-step path is exercised: workflow → `model_call` activity (mock
-//! model) → engine `drive_turn` → returned `Conversation`. This is the proof that
-//! the durable backend runs the same loop as the in-process path.
+//! The model calls the configured `wait` tool; the workflow sleeps on
+//! `ctx.timer` (recorded in history, so it survives restarts and can span days)
+//! and then continues the turn. We use a short (1s) real timer against the dev
+//! server, which reliably proves the durable pause without depending on
+//! time-skipping mechanics.
 //!
-//! Self-skips if the ephemeral server can't be downloaded/started (offline/CI),
-//! mirroring the engine's Docker-gated Postgres tests. Run with:
-//!
-//! ```sh
-//! cargo test -p smooai-smooth-operator-temporal --features temporal
-//! ```
+//! Self-skips if the ephemeral server can't be started (offline/CI). Run with:
+//! `cargo test -p smooai-smooth-operator-temporal --features temporal`.
 
 #![cfg(feature = "temporal")]
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use smooai_smooth_operator_temporal::temporal::{init_engine, AgentTurnActivities, AgentTurnInput, AgentTurnWorkflow, EngineHandles, HealthWorkflow};
-use smooth_operator_core::conversation::Conversation;
+use smooai_smooth_operator_temporal::temporal::{init_engine, AgentTurnActivities, AgentTurnInput, AgentTurnWorkflow, EngineHandles};
+use smooth_operator_core::conversation::{Conversation, Role};
 use smooth_operator_core::llm_provider::MockLlmClient;
 use smooth_operator_core::tool::ToolRegistry;
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions, WorkflowGetResultOptions, WorkflowStartOptions};
@@ -29,14 +26,17 @@ use temporalio_sdk_core::ephemeral_server::{default_cached_download, TemporalDev
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions};
 use url::Url;
 
-const TASK_QUEUE: &str = "smooth-operator-temporal-agent-turn-test";
+const TASK_QUEUE: &str = "smooth-operator-temporal-timer-test";
 
 #[tokio::test]
-async fn agent_turn_workflow_runs_a_real_turn_end_to_end() -> anyhow::Result<()> {
-    // Install a mock model so the `model_call` activity returns a scripted reply.
-    // (Set once per test process; this is the only test in this binary.)
+async fn durable_wait_tool_sleeps_on_a_timer_then_resumes() -> anyhow::Result<()> {
+    // The model asks to wait 1 second, then wraps up.
     let mock = MockLlmClient::new();
-    mock.push_text("the durable answer is 42");
+    mock.push_tool_call("call-wait", "wait", serde_json::json!({ "seconds": 1 }));
+    mock.push_text("resumed after the timer");
+
+    // No tools registered — the `wait` tool is handled by the workflow, not the
+    // tool registry/activity.
     if init_engine(EngineHandles {
         llm: Arc::new(mock.clone()),
         tools: Arc::new(ToolRegistry::new()),
@@ -73,33 +73,32 @@ async fn agent_turn_workflow_runs_a_real_turn_end_to_end() -> anyhow::Result<()>
     let target = Url::parse(&format!("http://{}", server.target))?;
     let connection = Connection::connect(
         ConnectionOptions::new(target)
-            .identity("smooth-operator-temporal-agent-turn-test".to_owned())
+            .identity("smooth-operator-temporal-timer-test".to_owned())
             .build(),
     )
     .await?;
     let client = Client::new(connection, ClientOptions::new("default").build()).map_err(|e| anyhow::anyhow!("client: {e}"))?;
 
-    // Register both workflows + the activities (which read the mock via the engine global).
     let worker_options = WorkerOptions::new(TASK_QUEUE)
         .register_workflow::<AgentTurnWorkflow>()
-        .register_workflow::<HealthWorkflow>()
         .register_activities(AgentTurnActivities)
         .build();
     let mut worker = Worker::new(&runtime, client.clone(), worker_options).map_err(|e| anyhow::anyhow!("worker: {e}"))?;
     let shutdown = worker.shutdown_handle();
 
+    let started = Instant::now();
     let starter = client.clone();
     let client_work = async move {
         let input = AgentTurnInput {
-            system_prompt: "You are a test agent".to_string(),
-            user_message: "what is the durable answer?".to_string(),
+            system_prompt: "You are a self-pacing agent".to_string(),
+            user_message: "wait a moment, then answer".to_string(),
             tools: vec![],
             max_iterations: 5,
             approval_required_tools: vec![],
-            wait_tool: None,
+            wait_tool: Some("wait".to_string()),
         };
         let handle = starter
-            .start_workflow(AgentTurnWorkflow::run, input, WorkflowStartOptions::new(TASK_QUEUE, "agent-turn-e2e-1").build())
+            .start_workflow(AgentTurnWorkflow::run, input, WorkflowStartOptions::new(TASK_QUEUE, "durable-timer-1").build())
             .await?;
         let conversation: Conversation = handle.get_result(WorkflowGetResultOptions::default()).await?;
         shutdown();
@@ -109,14 +108,22 @@ async fn agent_turn_workflow_runs_a_real_turn_end_to_end() -> anyhow::Result<()>
     let (worker_res, client_res): (Result<(), anyhow::Error>, anyhow::Result<Conversation>) = tokio::join!(worker.run(), client_work);
     worker_res?;
     let conversation = client_res?;
+    let elapsed = started.elapsed();
 
-    // The turn ran through the workflow: the mock's scripted reply is the final
-    // assistant message, and the model was called exactly once (no tools).
-    assert_eq!(conversation.last_assistant_content(), Some("the durable answer is 42"));
-    assert_eq!(mock.call_count(), 1);
-    // The user's message reached the model through the activity boundary.
-    let calls = mock.calls();
-    assert!(calls[0].messages.iter().any(|m| m.content.contains("what is the durable answer?")));
+    // The wait tool produced a durable-timer result, and the turn resumed after.
+    let tool_msgs: Vec<&_> = conversation.messages.iter().filter(|m| m.role == Role::Tool).collect();
+    assert_eq!(tool_msgs.len(), 1);
+    assert!(
+        tool_msgs[0].content.contains("durable timer"),
+        "unexpected wait result: {}",
+        tool_msgs[0].content
+    );
+    assert_eq!(conversation.last_assistant_content(), Some("resumed after the timer"));
+    // It actually waited (the 1s timer elapsed), not skipped instantly.
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "turn returned too fast to have honored the timer: {elapsed:?}"
+    );
 
     let mut server = server;
     server.shutdown().await.ok();
