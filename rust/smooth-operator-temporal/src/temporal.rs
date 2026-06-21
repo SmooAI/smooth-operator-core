@@ -117,9 +117,16 @@ fn agent_activity_opts() -> ActivityOptions {
 /// `tool_invoke` blocks **durably** on an approval signal for those, resuming
 /// across worker restarts (the HITL unlock — no mid-turn connection state, just a
 /// signal).
+///
+/// `wait_tool` (if set) names a built-in **durable wait**: when the model calls
+/// it with an integer `seconds` argument, the workflow sleeps on a Temporal timer
+/// — a durable pause that survives restarts and can span days, letting an agent
+/// schedule its own follow-up turn. The wait is intercepted here, not dispatched
+/// to an activity.
 struct WorkflowAgentActivities<'a> {
     ctx: &'a WorkflowContext<AgentTurnWorkflow>,
     approval_required: Vec<String>,
+    wait_tool: Option<String>,
 }
 
 #[async_trait(?Send)]
@@ -134,6 +141,27 @@ impl AgentActivities for WorkflowAgentActivities<'_> {
     }
 
     async fn tool_invoke(&self, call: ToolCall) -> anyhow::Result<ToolResult> {
+        // Durable wait: if this is the configured wait tool, sleep on a Temporal
+        // timer instead of dispatching an activity. The timer is recorded in
+        // workflow history, so the pause survives restarts and can span days.
+        if self.wait_tool.as_deref() == Some(call.name.as_str()) {
+            let Some(seconds) = call.arguments.get("seconds").and_then(serde_json::Value::as_u64) else {
+                return Ok(ToolResult {
+                    tool_call_id: call.id.clone(),
+                    content: format!("wait tool '{}' requires an integer `seconds` argument", call.name),
+                    is_error: true,
+                    details: None,
+                });
+            };
+            let _ = self.ctx.timer(Duration::from_secs(seconds)).await;
+            return Ok(ToolResult {
+                tool_call_id: call.id.clone(),
+                content: format!("Waited {seconds}s (durable timer)."),
+                is_error: false,
+                details: None,
+            });
+        }
+
         // Durable human-in-the-loop gate: if this tool needs approval, block
         // until an `approve_tool` / `deny_tool` signal names this call id. The
         // wait is recorded in workflow history, so it survives restarts and can
@@ -185,6 +213,12 @@ pub struct AgentTurnInput {
     /// `approve_tool` / `deny_tool` signal names that tool call.
     #[serde(default)]
     pub approval_required_tools: Vec<String>,
+    /// Name of the built-in **durable wait** tool, if any. A model call to this
+    /// tool with an integer `seconds` argument sleeps the workflow on a Temporal
+    /// timer (a durable pause that can span days), instead of dispatching a tool
+    /// activity. `None` disables the wait tool.
+    #[serde(default)]
+    pub wait_tool: Option<String>,
 }
 
 /// The agent turn as a Temporal workflow. Seeds the conversation, then drives the
@@ -221,6 +255,7 @@ impl AgentTurnWorkflow {
         let adapter = WorkflowAgentActivities {
             ctx: &*ctx,
             approval_required: input.approval_required_tools,
+            wait_tool: input.wait_tool,
         };
         drive_turn(&adapter, &mut conversation, input.tools, &policy)
             .await

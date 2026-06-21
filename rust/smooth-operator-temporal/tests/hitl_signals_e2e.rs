@@ -111,6 +111,7 @@ async fn hitl_gate_approves_and_denies_via_signals() -> anyhow::Result<()> {
             tools: vec![],
             max_iterations: 5,
             approval_required_tools: vec!["echo".to_string()],
+            wait_tool: None,
         };
 
         // --- Turn 1: APPROVE ---
