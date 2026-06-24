@@ -1,1 +1,6 @@
-packages: []
+packages:
+    - typescript/*
+
+# Match the value recorded in pnpm-lock.yaml so `pnpm install --frozen-lockfile`
+# (CI) doesn't fail with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH.
+injectWorkspacePackages: true

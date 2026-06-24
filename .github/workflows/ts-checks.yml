@@ -1,0 +1,45 @@
+# Typecheck + test the TypeScript engine (@smooai/smooth-operator-core).
+# Parity for the TS core is enforced here — its Phase-N tests must stay green.
+# The live E2E eval (test/evals.test.ts) is gated behind SMOOTH_AGENT_E2E +
+# SMOOAI_GATEWAY_KEY and self-skips without them, so this job needs no secrets.
+name: TypeScript
+
+on:
+    push:
+        branches: [main]
+        paths:
+            - 'typescript/**'
+            - 'pnpm-workspace.yaml'
+            - 'pnpm-lock.yaml'
+            - '.github/workflows/ts-checks.yml'
+    pull_request:
+        paths:
+            - 'typescript/**'
+            - 'pnpm-workspace.yaml'
+            - 'pnpm-lock.yaml'
+            - '.github/workflows/ts-checks.yml'
+
+jobs:
+    typecheck-test:
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install pnpm
+              uses: pnpm/action-setup@v4
+
+            - name: Install Node 22
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+                  cache: 'pnpm'
+
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile
+
+            - name: Typecheck
+              run: pnpm --filter @smooai/smooth-operator-core typecheck
+
+            - name: Test
+              run: pnpm --filter @smooai/smooth-operator-core test
