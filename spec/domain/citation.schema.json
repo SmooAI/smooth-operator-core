@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/domain/citation.schema.json",
+  "title": "Citation",
+  "description": "A source the agent used to ground its answer. Each citation points back at one retrieved knowledge-base document — the chunk the model read, plus enough metadata to render an attribution link. Citations are collected by the runtime from the documents that actually grounded a turn (the auto-injected `[Relevant knowledge]` context and any `knowledge_search` tool results) and attached to the terminal `eventual_response`. For GitHub-sourced documents `url` is the blob/issue URL; documents without a web source omit it.",
+  "type": "object",
+  "required": ["id", "title", "snippet", "score"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Stable identifier of the cited source document (the knowledge-base `document_id`). Used to deduplicate citations within a turn."
+    },
+    "title": {
+      "type": "string",
+      "description": "Human-readable label for the source — typically the document's source path or, for web-sourced docs, the URL/title."
+    },
+    "url": {
+      "type": "string",
+      "description": "Canonical link to the source, when one exists. For GitHub-sourced documents this is the blob/issue URL stamped onto the document's `source` at ingest (see CONNECTORS.md). Absent for sources with no web location (e.g. uploaded files)."
+    },
+    "snippet": {
+      "type": "string",
+      "description": "The retrieved chunk text that grounded the answer, truncated to a bounded length for display."
+    },
+    "score": {
+      "type": "number",
+      "description": "Relevance score of this source for the turn's query (the knowledge-base similarity score). Higher is more relevant."
+    }
+  }
+}

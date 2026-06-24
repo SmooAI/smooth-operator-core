@@ -1,0 +1,43 @@
+name: Go Checks
+
+on:
+    pull_request:
+        branches: [main]
+        types: [opened, synchronize]
+
+jobs:
+    go:
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install Go toolchain
+              uses: actions/setup-go@v5
+              with:
+                  go-version: '1.26'
+                  # The module lives under go/, so the go.sum it caches on is go/go.sum.
+                  cache-dependency-path: go/go.sum
+
+            # gofmt -l prints any file that is NOT gofmt-clean. We fail the job if
+            # the list is non-empty (the trailing `[ -z ... ]` guard).
+            - name: Format check (gofmt)
+              working-directory: go
+              run: |
+                  unformatted="$(gofmt -l .)"
+                  if [ -n "$unformatted" ]; then
+                      echo "The following files are not gofmt-clean:"
+                      echo "$unformatted"
+                      exit 1
+                  fi
+
+            - name: Vet
+              working-directory: go
+              run: go vet ./...
+
+            # -race catches data races; the protocol conformance tests validate the
+            # migrated Go types against the shared spec/ fixtures at the repo root.
+            - name: Test (race)
+              working-directory: go
+              run: go test -race ./...

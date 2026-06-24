@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/envelope.schema.json",
+  "title": "Envelope",
+  "description": "Top-level WebSocket frame definitions. All frames are JSON objects. Client-to-server frames are *action envelopes*; server-to-client frames are *event envelopes*. Each is discriminated by `action` (client) or `type` (server).",
+
+  "$defs": {
+    "ErrorObject": {
+      "title": "ErrorObject",
+      "description": "A structured error descriptor. Used in error events and nested inside event data payloads.",
+      "type": "object",
+      "required": ["code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "Machine-readable error code (e.g. `SESSION_NOT_FOUND`, `RATE_LIMITED`, `VALIDATION_ERROR`)."
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable error description."
+        }
+      }
+    },
+
+    "ActionEnvelope": {
+      "title": "ActionEnvelope",
+      "description": "Base shape for every client-to-server WebSocket frame. The `action` field is a snake_case verb that selects the handler. `requestId` is chosen by the client and echoed back on all related server events so the client can correlate responses to pending requests.",
+      "type": "object",
+      "required": ["action"],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "create_conversation_session",
+            "send_message",
+            "get_session",
+            "get_conversation_messages",
+            "confirm_tool_action",
+            "verify_otp",
+            "ping"
+          ],
+          "description": "The action to perform."
+        },
+        "requestId": {
+          "type": "string",
+          "description": "Client-generated correlation ID. Will be echoed back on all related server events. Should be unique per in-flight request. If omitted the server may generate one, but correlating responses becomes the client's problem."
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "EventEnvelope": {
+      "title": "EventEnvelope",
+      "description": "Base shape for every server-to-client WebSocket frame. `type` is a snake_case noun that identifies the event. `requestId` echoes the originating action's `requestId` where applicable (may be absent for unsolicited events such as `keepalive`). `status` uses HTTP-like codes: 202 = accepted/in-progress, 200 = final success, 4xx/5xx = error.",
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "immediate_response",
+            "eventual_response",
+            "stream_chunk",
+            "stream_token",
+            "keepalive",
+            "write_confirmation_required",
+            "otp_verification_required",
+            "otp_sent",
+            "otp_verified",
+            "otp_invalid",
+            "error",
+            "pong"
+          ],
+          "description": "Identifies which event this frame carries."
+        },
+        "requestId": {
+          "type": "string",
+          "description": "Echoes the `requestId` from the originating action. Absent for unsolicited server-push events."
+        },
+        "status": {
+          "type": "integer",
+          "description": "HTTP-like status code. 202 = acknowledged/in-progress; 200 = final success; 4xx/5xx = error conditions."
+        },
+        "message": {
+          "type": "string",
+          "description": "Optional human-readable status description (used in `immediate_response` acks)."
+        },
+        "data": {
+          "description": "Event-specific payload. Shape is defined by the per-event schema in `events/`.",
+          "type": ["object", "array", "string", "number", "boolean", "null"]
+        },
+        "node": {
+          "type": "string",
+          "description": "Name of the workflow node that produced this event. Present on `stream_chunk` events."
+        },
+        "token": {
+          "type": "string",
+          "description": "A streamed LLM token. Present on `stream_token` events."
+        },
+        "error": {
+          "$ref": "#/$defs/ErrorObject",
+          "description": "Present on `error` events."
+        },
+        "timestamp": {
+          "type": "integer",
+          "description": "Unix epoch milliseconds. Present on `pong` events and optionally on others."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+
+  "oneOf": [
+    { "$ref": "#/$defs/ActionEnvelope" },
+    { "$ref": "#/$defs/EventEnvelope" }
+  ]
+}

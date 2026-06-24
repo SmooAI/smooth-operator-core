@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/domain/message.schema.json",
+  "title": "Message",
+  "description": "A single message within a conversation. Direction is from the conversation's perspective: `inbound` = arriving from the user/external party; `outbound` = sent by the agent or platform. Corresponds to a row in the `conversation_messages` table.",
+  "type": "object",
+  "required": ["id", "direction", "content", "createdAt"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique message identifier."
+    },
+    "externalId": {
+      "type": ["string", "null"],
+      "description": "ID assigned by an external platform (e.g. a Twilio SID or Messenger message id)."
+    },
+    "organizationId": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "The organization that owns this message."
+    },
+    "conversationId": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "The conversation this message belongs to."
+    },
+    "direction": {
+      "type": "string",
+      "enum": ["inbound", "outbound"],
+      "description": "Message direction relative to the platform: `inbound` = from user/external, `outbound` = from agent/platform."
+    },
+    "content": {
+      "$ref": "#/$defs/MessageContent",
+      "description": "The message payload."
+    },
+    "from": {
+      "type": ["object", "null"],
+      "description": "Abbreviated sender descriptor (wire shape used in API responses; full participant data lives in domain/participant.schema.json).",
+      "required": ["id", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Participant ID of the sender."
+        },
+        "type": {
+          "type": "string",
+          "description": "Participant type of the sender."
+        },
+        "name": {
+          "type": ["string", "null"],
+          "description": "Display name of the sender."
+        }
+      }
+    },
+    "to": {
+      "type": ["object", "null"],
+      "description": "Abbreviated recipient descriptor.",
+      "required": ["id", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Participant ID of the recipient."
+        },
+        "type": {
+          "type": "string",
+          "description": "Participant type of the recipient."
+        },
+        "name": {
+          "type": ["string", "null"],
+          "description": "Display name of the recipient."
+        }
+      }
+    },
+    "metadataJson": {
+      "type": ["object", "null"],
+      "description": "Arbitrary key/value metadata attached to this message.",
+      "additionalProperties": true
+    },
+    "analyticsJson": {
+      "type": ["object", "null"],
+      "description": "Analytics data associated with this message (e.g. sentiment scores, token counts).",
+      "additionalProperties": true
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when the message was created."
+    },
+    "updatedAt": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when the message was last updated."
+    }
+  },
+  "$defs": {
+    "MessageContent": {
+      "title": "MessageContent",
+      "description": "Structured content of a message. Currently always contains `items`; `text` and `structuredResponse` are the two supported item types.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "type": "array",
+          "description": "Ordered list of content items that make up this message.",
+          "items": {
+            "$ref": "#/$defs/ContentItem"
+          }
+        },
+        "text": {
+          "type": ["string", "null"],
+          "description": "Convenience flat-text representation of the message (populated for simple text-only messages)."
+        },
+        "structuredResponse": {
+          "description": "Structured agent response payload. Shape varies by agent template.",
+          "type": ["object", "null"],
+          "additionalProperties": true
+        }
+      }
+    },
+    "ContentItem": {
+      "title": "ContentItem",
+      "description": "A single content element within a message. Currently only `text` items are defined; additional types (image, file, tool_result) may be added in future protocol versions.",
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["text"],
+          "description": "Content item type discriminator."
+        },
+        "text": {
+          "type": "string",
+          "description": "The text content (required when type = `text`)."
+        }
+      }
+    }
+  }
+}

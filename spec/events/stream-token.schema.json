@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/events/stream-token.schema.json",
+  "title": "StreamToken",
+  "description": "Event: `stream_token`. A single LLM output token forwarded to the client in real time. Corresponds to smooth-operator's `AgentEvent::TokenDelta`. Clients accumulate tokens to display a live typing animation. After the node finishes, a `stream_chunk` event carries the complete state snapshot for that node.",
+  "type": "object",
+  "required": ["type", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "const": "stream_token",
+      "description": "Event type discriminator."
+    },
+    "requestId": {
+      "type": "string",
+      "description": "Echoes the `requestId` from the originating `send_message` action."
+    },
+    "token": {
+      "type": "string",
+      "description": "The raw token text. Also present inside `data.token` for consumers that only inspect `data`."
+    },
+    "data": {
+      "type": "object",
+      "description": "Token event payload.",
+      "required": ["requestId", "token"],
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "description": "The request ID this token belongs to."
+        },
+        "token": {
+          "type": "string",
+          "description": "The raw token text."
+        }
+      }
+    },
+    "timestamp": {
+      "type": "integer",
+      "description": "Unix epoch milliseconds when the event was emitted."
+    }
+  }
+}

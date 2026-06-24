@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/events/eventual-response.schema.json",
+  "title": "EventualResponse",
+  "description": "Event: `eventual_response`. The terminal event of a streaming turn. Emitted after the agent workflow completes and its output has been persisted. Clients should treat this as the authoritative final state for the turn and may discard intermediate `stream_chunk` / `stream_token` data. Status is always 200 on success.",
+  "type": "object",
+  "required": ["type", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "const": "eventual_response",
+      "description": "Event type discriminator."
+    },
+    "requestId": {
+      "type": "string",
+      "description": "Echoes the `requestId` from the originating `send_message` action."
+    },
+    "status": {
+      "type": "integer",
+      "description": "HTTP-like status. Always 200 for a successful eventual response."
+    },
+    "data": {
+      "type": "object",
+      "description": "The terminal response payload.",
+      "required": ["requestId", "status", "data"],
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "description": "The request ID this response belongs to."
+        },
+        "status": {
+          "type": "integer",
+          "description": "HTTP-like status. Typically 200."
+        },
+        "data": {
+          "type": "object",
+          "description": "The final agent output.",
+          "required": ["messageId", "response"],
+          "additionalProperties": false,
+          "properties": {
+            "messageId": {
+              "type": "string",
+              "description": "ID of the agent message as persisted to the `conversation_messages` table."
+            },
+            "response": {
+              "description": "The structured agent response payload. Shape depends on the agent template. Clients should validate against a template-specific schema before rendering.",
+              "type": ["object", "array", "string", "number", "boolean", "null"]
+            },
+            "needsEscalation": {
+              "type": "boolean",
+              "description": "True if the agent flagged this conversation for human escalation."
+            },
+            "escalationReason": {
+              "type": "string",
+              "description": "Human-readable escalation reason when `needsEscalation` is true."
+            },
+            "citations": {
+              "type": "array",
+              "description": "The sources that grounded this answer, when any were retrieved. Collected by the runtime from the documents that actually grounded the turn — the auto-injected `[Relevant knowledge]` context and any `knowledge_search` tool results — deduplicated by source id and capped. Optional and back-compatible: absent when the turn used no knowledge sources. Each item is a `Citation` (see `domain/citation.schema.json`).",
+              "items": {
+                "type": "object",
+                "description": "A source the agent used to ground its answer (a `Citation` — see `domain/citation.schema.json`). For GitHub-sourced documents `url` is the blob/issue URL; documents without a web source omit it.",
+                "required": ["id", "title", "snippet", "score"],
+                "additionalProperties": false,
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Stable identifier of the cited source document (the knowledge-base `document_id`). Used to deduplicate citations within a turn."
+                  },
+                  "title": {
+                    "type": "string",
+                    "description": "Human-readable label for the source — typically the document's source path or, for web-sourced docs, the URL/title."
+                  },
+                  "url": {
+                    "type": "string",
+                    "description": "Canonical link to the source, when one exists. For GitHub-sourced documents this is the blob/issue URL stamped onto the document's `source` at ingest. Absent for sources with no web location."
+                  },
+                  "snippet": {
+                    "type": "string",
+                    "description": "The retrieved chunk text that grounded the answer, truncated to a bounded length for display."
+                  },
+                  "score": {
+                    "type": "number",
+                    "description": "Relevance score of this source for the turn's query (the knowledge-base similarity score). Higher is more relevant."
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "timestamp": {
+      "type": "integer",
+      "description": "Unix epoch milliseconds when the event was emitted."
+    }
+  }
+}

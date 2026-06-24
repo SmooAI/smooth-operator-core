@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/domain/conversation.schema.json",
+  "title": "Conversation",
+  "description": "A conversation thread between participants (users, AI agents, or human agents). Corresponds to a row in the `conversations` table. Platform indicates the channel on which the conversation takes place.",
+  "type": "object",
+  "required": ["id", "platform", "name", "organizationId", "idempotencyKey", "createdAt", "updatedAt"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique conversation identifier."
+    },
+    "platform": {
+      "type": "string",
+      "enum": ["web", "messenger", "instagram", "email", "discord", "phone", "sms", "slack", "whatsapp", "tiktok"],
+      "description": "The channel on which this conversation takes place."
+    },
+    "name": {
+      "type": "string",
+      "description": "Human-readable display name for the conversation."
+    },
+    "organizationId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The organization that owns this conversation."
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "description": "Client-provided key that prevents duplicate conversations from being created for the same logical thread."
+    },
+    "metadataJson": {
+      "type": "object",
+      "description": "Arbitrary key/value metadata attached to the conversation (e.g. campaign source, CRM fields).",
+      "additionalProperties": true
+    },
+    "analyticsJson": {
+      "type": "object",
+      "description": "Analytics and scoring data aggregated from messages in this conversation.",
+      "additionalProperties": true
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when the conversation was created."
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when the conversation was last updated."
+    }
+  }
+}

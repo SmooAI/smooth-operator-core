@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/actions/ping.schema.json",
+  "title": "Ping",
+  "description": "Action: `ping`. Client-initiated keepalive. The server replies with a `pong` event carrying the server's current Unix timestamp in milliseconds. Clients should send a ping every 30 seconds (or at the configured `heartbeatInterval`) to prevent AWS API Gateway's 10-minute idle connection timeout.",
+
+  "$defs": {
+    "Request": {
+      "title": "PingRequest",
+      "description": "A ping frame. Only `action` and the optional `requestId` are required.",
+      "type": "object",
+      "required": ["action"],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "const": "ping",
+          "description": "Action discriminator."
+        },
+        "requestId": {
+          "type": "string",
+          "description": "Client-generated correlation ID echoed back in the `pong` event."
+        }
+      }
+    },
+
+    "Response": {
+      "title": "PongResponse",
+      "description": "Data payload carried in the `pong` event.",
+      "type": "object",
+      "required": ["timestamp"],
+      "additionalProperties": false,
+      "properties": {
+        "timestamp": {
+          "type": "integer",
+          "description": "Server-side Unix epoch milliseconds when the pong was sent."
+        }
+      }
+    }
+  },
+
+  "oneOf": [
+    { "$ref": "#/$defs/Request" },
+    { "$ref": "#/$defs/Response" }
+  ]
+}

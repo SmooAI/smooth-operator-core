@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/actions/get-session.schema.json",
+  "title": "GetSession",
+  "description": "Action: `get_session`. Fetches a snapshot of an existing session by ID. The server replies with an `immediate_response` event whose `data` contains the session details. Useful for reconnects — the client can restore its local state without creating a new session.",
+
+  "$defs": {
+    "Request": {
+      "title": "GetSessionRequest",
+      "description": "Fields sent by the client to retrieve a session.",
+      "type": "object",
+      "required": ["action", "sessionId"],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "const": "get_session",
+          "description": "Action discriminator."
+        },
+        "requestId": {
+          "type": "string",
+          "description": "Client-generated correlation ID echoed back on all related events."
+        },
+        "sessionId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "ID of the session to retrieve."
+        }
+      }
+    },
+
+    "Response": {
+      "title": "GetSessionResponse",
+      "description": "Data payload carried in the `immediate_response` event. Field set matches `Session` in `domain/session.schema.json` (wire-subset; full domain object may include additional server-only fields).",
+      "type": "object",
+      "required": ["sessionId", "conversationId", "agentId", "agentName", "userParticipantId", "agentParticipantId"],
+      "additionalProperties": false,
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Session ID."
+        },
+        "conversationId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Conversation ID."
+        },
+        "agentId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Agent ID."
+        },
+        "agentName": {
+          "type": "string",
+          "description": "Display name of the agent."
+        },
+        "userParticipantId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Participant ID for the user in this session."
+        },
+        "agentParticipantId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Participant ID for the agent in this session."
+        },
+        "threadId": {
+          "type": "string",
+          "description": "smooth-operator thread identifier. Present when the session has an associated workflow thread."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "idle", "ended"],
+          "description": "Current lifecycle status of the session."
+        }
+      }
+    }
+  },
+
+  "oneOf": [
+    { "$ref": "#/$defs/Request" },
+    { "$ref": "#/$defs/Response" }
+  ]
+}

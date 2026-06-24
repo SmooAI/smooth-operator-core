@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/actions/verify-otp.schema.json",
+  "title": "VerifyOtp",
+  "description": "Action: `verify_otp`. Sent after the user receives an OTP code (delivered via a channel indicated in `otp_verification_required`) and enters it. The server validates the code and either resumes the agent workflow (success → `otp_verified` event + resumed stream) or rejects it (`otp_invalid` event with remaining attempt count). On max attempts exhausted the session is locked and a new `otp_sent` / `otp_verification_required` flow must be started.",
+
+  "$defs": {
+    "Request": {
+      "title": "VerifyOtpRequest",
+      "description": "Fields sent by the client to submit an OTP code.",
+      "type": "object",
+      "required": ["action", "sessionId", "requestId", "code"],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "const": "verify_otp",
+          "description": "Action discriminator."
+        },
+        "requestId": {
+          "type": "string",
+          "description": "Must match the `requestId` from the `otp_verification_required` event being responded to."
+        },
+        "sessionId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Session ID of the paused session."
+        },
+        "code": {
+          "type": "string",
+          "description": "The one-time password code entered by the user."
+        }
+      }
+    },
+
+    "Response": {
+      "title": "VerifyOtpResponse",
+      "description": "No dedicated response event for `verify_otp`. On success the server emits `otp_verified` followed by the resumed stream. On failure it emits `otp_invalid`. This schema is provided for documentation completeness only.",
+      "type": "object",
+      "description": "No dedicated response — outcome signalled by `otp_verified` or `otp_invalid` events.",
+      "additionalProperties": true
+    }
+  },
+
+  "oneOf": [
+    { "$ref": "#/$defs/Request" },
+    { "$ref": "#/$defs/Response" }
+  ]
+}

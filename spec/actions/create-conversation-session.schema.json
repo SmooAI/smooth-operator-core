@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/actions/create-conversation-session.schema.json",
+  "title": "CreateConversationSession",
+  "description": "Action: `create_conversation_session`. Starts a new AI conversation session for the given agent. On success the server creates a conversation, two participants (user + agent), and a session record, then replies with an `immediate_response` event whose `data` matches the `Response` schema below.",
+
+  "$defs": {
+    "Request": {
+      "title": "CreateConversationSessionRequest",
+      "description": "Fields sent by the client to open a new session.",
+      "type": "object",
+      "required": ["action", "agentId"],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "const": "create_conversation_session",
+          "description": "Action discriminator."
+        },
+        "requestId": {
+          "type": "string",
+          "description": "Client-generated correlation ID echoed back on all related events."
+        },
+        "agentId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "UUID of the agent to start a session with."
+        },
+        "userName": {
+          "type": "string",
+          "description": "Optional display name for the user participant."
+        },
+        "userEmail": {
+          "type": "string",
+          "format": "email",
+          "description": "Optional email address for the user participant."
+        },
+        "browserFingerprint": {
+          "type": "string",
+          "description": "Browser fingerprint string (e.g. from ThumbmarkJS) used for anonymous user correlation across sessions."
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Arbitrary key/value metadata to attach to the session.",
+          "additionalProperties": true
+        },
+        "authContext": {
+          "type": "object",
+          "description": "Pre-auth context for HMAC-based identity verification. When provided, the server can skip OTP flows by verifying the HMAC signature instead.",
+          "required": ["userId", "signature", "timestamp"],
+          "additionalProperties": false,
+          "properties": {
+            "userId": {
+              "type": "string",
+              "description": "The user's identity claim."
+            },
+            "signature": {
+              "type": "string",
+              "description": "HMAC-SHA256 signature over `userId + timestamp` using a shared secret."
+            },
+            "timestamp": {
+              "type": "integer",
+              "description": "Unix epoch seconds when the HMAC was signed. Used for replay protection (typical max age: 60s)."
+            }
+          }
+        }
+      }
+    },
+
+    "Response": {
+      "title": "CreateConversationSessionResponse",
+      "description": "Data payload carried in the `immediate_response` event that acknowledges session creation.",
+      "type": "object",
+      "required": ["sessionId", "conversationId", "agentId", "agentName", "userParticipantId", "agentParticipantId"],
+      "additionalProperties": false,
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Newly created session ID. Use this in all subsequent actions."
+        },
+        "conversationId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "ID of the conversation created for this session."
+        },
+        "agentId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "ID of the agent handling this session."
+        },
+        "agentName": {
+          "type": "string",
+          "description": "Display name of the agent."
+        },
+        "userParticipantId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Participant ID representing the user in this conversation."
+        },
+        "agentParticipantId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Participant ID representing the AI agent in this conversation."
+        }
+      }
+    }
+  },
+
+  "oneOf": [
+    { "$ref": "#/$defs/Request" },
+    { "$ref": "#/$defs/Response" }
+  ]
+}
