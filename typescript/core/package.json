@@ -1,0 +1,23 @@
+{
+    "name": "@smooai/smooth-operator-core",
+    "version": "0.1.0",
+    "description": "Native TypeScript implementation of the smooth-operator agent engine — an in-process, OpenAI-compatible agentic tool-calling loop with knowledge grounding. The TypeScript sibling of the Rust reference engine, the C# core, and the Python core.",
+    "type": "module",
+    "license": "MIT",
+    "private": true,
+    "exports": {
+        ".": "./src/index.ts"
+    },
+    "scripts": {
+        "typecheck": "tsc -p tsconfig.json --noEmit",
+        "test": "vitest run"
+    },
+    "dependencies": {
+        "openai": "^4.77.0"
+    },
+    "devDependencies": {
+        "@types/node": "^25.9.2",
+        "typescript": "^5.7.3",
+        "vitest": "^2.1.8"
+    }
+}

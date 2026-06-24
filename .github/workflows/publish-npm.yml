@@ -1,0 +1,86 @@
+# Publish the smooth-operator-core TypeScript engine to npm.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Package:
+#   • @smooai/smooth-operator-core  (typescript/core/) — the native, in-process
+#     TypeScript agent engine. The sibling of the Rust reference engine, the C#
+#     core, and the Python core.
+#
+# Notes:
+#   • Publishing to npm is effectively IRREVERSIBLE — `npm unpublish` is only
+#     allowed within 72h and the version number can never be reused.
+#   • BUMP THE VERSION in typescript/core/package.json BEFORE publishing (the
+#     Changesets flow in release.yml does this for you). npm rejects re-uploading
+#     a version that already exists.
+#
+# RELEASE-GATED: this workflow never publishes from a branch push. It only runs
+# on an explicit, deliberate trigger:
+#   1. Manual (primary path): Actions → "Publish npm" → Run workflow. Defaults to
+#      a DRY RUN (packs + validates but uploads nothing). To actually publish,
+#      set the `dry_run` input to `false` — a deliberate, explicit opt-in.
+#   2. Tag: push a tag matching `npm-v*` (e.g. `npm-v0.1.0`). The tag path always
+#      publishes for real.
+#
+# Auth: uses the org-level secret SMOOAI_NPM_TOKEN.
+# ─────────────────────────────────────────────────────────────────────────────
+name: Publish npm
+
+on:
+    workflow_dispatch:
+        inputs:
+            dry_run:
+                description: 'Dry run (pack + validate but do NOT upload). Set to false to actually publish.'
+                type: boolean
+                default: true
+    push:
+        tags:
+            - 'npm-v*'
+
+# Never let two publishes race against each other.
+concurrency:
+    group: publish-npm
+    cancel-in-progress: false
+
+jobs:
+    publish:
+        name: Publish smooth-operator-core to npm
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+
+        # `id-token: write` is required for npm provenance attestation
+        # (NPM_CONFIG_PROVENANCE) — without it npm fails with EUSAGE before upload.
+        permissions:
+            contents: read
+            id-token: write
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install pnpm
+              uses: pnpm/action-setup@v4
+
+            - name: Install Node 22
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+                  registry-url: 'https://registry.npmjs.org'
+
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile
+
+            - name: Typecheck
+              run: pnpm --filter @smooai/smooth-operator-core typecheck
+
+            - name: Test
+              run: pnpm --filter @smooai/smooth-operator-core test
+
+            # On manual runs `dry_run` defaults to true, so a bare "Run workflow"
+            # click uploads NOTHING. Tag pushes have no input, so `inputs.dry_run`
+            # is false and this publishes for real.
+            - name: Publish (or dry-run)
+              run: |
+                  pnpm --filter "@smooai/smooth-operator-core" \
+                    publish --no-git-checks --access public ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '--dry-run' || '' }}
+              env:
+                  NODE_AUTH_TOKEN: ${{ secrets.SMOOAI_NPM_TOKEN }}
+                  NPM_CONFIG_PROVENANCE: 'true'
