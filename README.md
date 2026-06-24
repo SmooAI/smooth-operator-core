@@ -309,7 +309,7 @@ cargo clippy --all-targets -- -D warnings
 
 ## Repository layout
 
-This is a multi-language SmooAI package. The Rust crate is the reference; other languages mirror its surface.
+This is a multi-language SmooAI package. The Rust crate is the reference; other languages mirror its surface. For install commands and a hello-agent example in every language, see [**docs/Polyglot-Engines.md**](./docs/Polyglot-Engines.md).
 
 | Directory | Language | Status |
 | --- | --- | --- |
