@@ -1,0 +1,89 @@
+# Publish the C# agent-engine core to NuGet.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# THIS WORKFLOW IS THE ONLY PLACE THIS PACKAGE IS PUBLISHED.
+#
+# Package: SmooAI.SmoothOperator.Core  (dotnet/core/src) — the native C# engine.
+#
+#   • Publishing to NuGet is effectively IRREVERSIBLE — you can unlist a version
+#     but never delete it or reuse the version number.
+#   • BUMP <Version> in dotnet/core/src/SmooAI.SmoothOperator.Core.csproj BEFORE
+#     publishing. NuGet rejects re-uploading an existing version (push uses
+#     --skip-duplicate so a re-run is a no-op rather than a failure).
+#
+# How to publish:
+#   1. Manual (primary): Actions → "Publish NuGet" → Run workflow. Defaults to a
+#      DRY RUN (packs + validates, pushes nothing). Set dry_run=false to publish.
+#   2. Tag: push a tag matching `nuget-v*` (e.g. `nuget-v1.1.0`) — always real.
+#
+# Auth: the org-level secret SMOOAI_NUGET_API_KEY (visibility=all, matching
+# SMOOAI_NPM_TOKEN / SMOOAI_CARGO_REGISTRY_TOKEN / SMOOAI_PYPI_TOKEN).
+# ─────────────────────────────────────────────────────────────────────────────
+name: Publish NuGet
+
+on:
+    workflow_dispatch:
+        inputs:
+            dry_run:
+                description: 'Dry run (pack + validate but do NOT push). Set to false to actually publish.'
+                type: boolean
+                default: true
+    push:
+        tags:
+            - 'nuget-v*'
+
+concurrency:
+    group: publish-nuget
+    cancel-in-progress: false
+
+env:
+    FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+    publish:
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Setup .NET
+              uses: actions/setup-dotnet@v4
+              with:
+                  dotnet-version: '8.0.x'
+
+            - name: Restore
+              run: dotnet restore dotnet/SmooAI.SmoothOperator.Core.slnx
+
+            - name: Build
+              run: dotnet build dotnet/SmooAI.SmoothOperator.Core.slnx -c Release --no-restore
+
+            - name: Test (excluding gateway-gated suites)
+              run: |
+                  dotnet test dotnet/SmooAI.SmoothOperator.Core.slnx \
+                      -c Release --no-build --verbosity normal \
+                      --filter "FullyQualifiedName!~EvalTests&FullyQualifiedName!~LiveE2E"
+
+            - name: Pack
+              run: dotnet pack dotnet/core/src/SmooAI.SmoothOperator.Core.csproj -c Release --no-build -o dist
+
+            - name: Push to NuGet (or dry-run)
+              env:
+                  NUGET_API_KEY: ${{ secrets.SMOOAI_NUGET_API_KEY }}
+                  DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && 'true' || 'false' }}
+              run: |
+                  ls -la dist
+                  if [ "$DRY_RUN" = "true" ]; then
+                      echo "Dry run — not pushing. Built packages:"
+                      ls dist/*.nupkg
+                      exit 0
+                  fi
+                  if [ -z "${NUGET_API_KEY}" ]; then
+                      echo "::error::NUGET_API_KEY secret is not set for this repo"
+                      exit 1
+                  fi
+                  dotnet nuget push "dist/*.nupkg" \
+                      --api-key "${NUGET_API_KEY}" \
+                      --source https://api.nuget.org/v3/index.json \
+                      --skip-duplicate
