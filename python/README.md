@@ -1,7 +1,17 @@
-# smooai-agent (Python)
+# smooth-operator-core (Python)
 
-Python bindings for the `smooai-agent` framework — **planned, not yet implemented.**
+The native Python implementation of the smooth-operator agent engine lives in
+[`core/`](./core) and is published to PyPI as
+[`smooai-smooth-operator-core`](https://pypi.org/project/smooai-smooth-operator-core/)
+from this repo (see `.github/workflows/publish-pypi.yml`).
 
-The Rust implementation in [`../rust/`](../rust) is the source of truth. When a Python consumer appears, this directory will likely host a [PyO3](https://pyo3.rs/) wrapper around the Rust crate, published as `smooai-agent` on PyPI.
+It is the Python sibling of the Rust reference engine ([`../rust/`](../rust)) and
+the C# core ([`../dotnet/`](../dotnet)) — an in-process, OpenAI-compatible
+agentic tool-calling loop with knowledge grounding. Pure Python; no native
+bindings (PyO3 is not used).
 
-Track interest / progress against [SMOODEV-1314](https://smooai.atlassian.net/browse/SMOODEV-1314) and follow-on tickets.
+```bash
+cd core
+uv sync
+uv run pytest tests/ -q
+```

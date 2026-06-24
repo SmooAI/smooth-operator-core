@@ -1,0 +1,46 @@
+# PR checks for the Python engine (`smooai-smooth-operator-core`).
+#
+# The Python engine lives in `python/core/` and is published from THIS repo
+# (see publish-pypi.yml). This workflow gates PRs that touch it: it syncs the
+# uv environment, runs ruff (format check + lint), and runs the test suite.
+#
+# Scoped to `python/core/**` so Rust/C#/other-language PRs don't pay for it.
+name: Python Checks
+
+on:
+    pull_request:
+        paths:
+            - 'python/core/**'
+            - '.github/workflows/py-checks.yml'
+
+concurrency:
+    group: py-checks-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    checks:
+        name: ruff + pytest
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        defaults:
+            run:
+                working-directory: python/core
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install uv
+              uses: astral-sh/setup-uv@v5
+              with:
+                  version: '0.7.8'
+
+            - name: Sync (locked)
+              run: uv sync --locked
+
+            - name: Ruff format check
+              run: uv run --quiet ruff format --check src tests
+
+            - name: Ruff lint
+              run: uv run --quiet ruff check src tests
+
+            - name: Pytest
+              run: uv run --quiet pytest tests/ -q

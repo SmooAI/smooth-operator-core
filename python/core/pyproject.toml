@@ -1,0 +1,37 @@
+[project]
+name = "smooai-smooth-operator-core"
+version = "1.1.0"
+description = "Native Python implementation of the smooth-operator agent engine — an in-process, OpenAI-compatible agentic tool-calling loop with knowledge grounding. The Python sibling of the Rust reference engine and the C# core."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    # The engine drives any OpenAI-compatible chat endpoint via the official SDK
+    # (pointed at the gateway). This is the IChatClient analogue.
+    "openai>=1.40",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/smooth_operator_core"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-select = ["I"]

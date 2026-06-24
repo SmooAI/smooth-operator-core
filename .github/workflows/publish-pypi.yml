@@ -1,0 +1,95 @@
+# Publish the Python agent-engine core to PyPI.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# THIS WORKFLOW IS THE ONLY PLACE THIS PACKAGE IS PUBLISHED.
+#
+# Package: smooai-smooth-operator-core  (python/core) — the native Python engine.
+#
+#   • Publishing to PyPI is IRREVERSIBLE — you can yank a release but never
+#     delete it or reuse the version number.
+#   • BUMP `version` in python/core/pyproject.toml BEFORE publishing. PyPI
+#     rejects re-uploading an existing version (`--check-url` makes a re-run of
+#     an already-published version a no-op rather than a hard failure).
+#
+# How to publish:
+#   1. Manual (primary): Actions → "Publish PyPI" → Run workflow. Defaults to a
+#      DRY RUN (builds + validates, uploads nothing). Set dry_run=false to publish.
+#   2. Tag: push a tag matching `py-v*` (e.g. `py-v1.1.0`) — always real.
+#
+# Auth: the org-level secret SMOOAI_PYPI_TOKEN (visibility=all, matching
+# SMOOAI_NPM_TOKEN / SMOOAI_CARGO_REGISTRY_TOKEN / SMOOAI_NUGET_API_KEY),
+# exposed to uv as UV_PUBLISH_TOKEN.
+# ─────────────────────────────────────────────────────────────────────────────
+name: Publish PyPI
+
+on:
+    workflow_dispatch:
+        inputs:
+            dry_run:
+                description: 'Dry run (build + validate but do NOT upload). Set to false to actually publish.'
+                type: boolean
+                default: true
+    push:
+        tags:
+            - 'py-v*'
+
+# Never let two publishes race against each other.
+concurrency:
+    group: publish-pypi
+    cancel-in-progress: false
+
+jobs:
+    publish:
+        name: Publish smooai-smooth-operator-core to PyPI
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        permissions:
+            contents: read
+        defaults:
+            run:
+                working-directory: python/core
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install uv
+              uses: astral-sh/setup-uv@v5
+              with:
+                  version: '0.7.8'
+
+            # Gate the publish on a green build before we touch the registry.
+            - name: Sync (locked)
+              run: uv sync --locked
+
+            - name: Ruff format check
+              run: uv run --quiet ruff format --check src tests
+
+            - name: Ruff lint
+              run: uv run --quiet ruff check src tests
+
+            - name: Pytest
+              run: uv run --quiet pytest tests/ -q
+
+            - name: Build (sdist + wheel)
+              run: uv build
+
+            # On manual runs `dry_run` defaults to true, so a bare "Run workflow"
+            # click uploads NOTHING. Tag pushes have no input, so DRY_RUN is false
+            # there and the package publishes for real.
+            - name: Publish (or dry-run)
+              env:
+                  UV_PUBLISH_TOKEN: ${{ secrets.SMOOAI_PYPI_TOKEN }}
+                  DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && 'true' || 'false' }}
+              run: |
+                  ls -la dist
+                  if [ "$DRY_RUN" = "true" ]; then
+                      echo "Dry run — not uploading. Built artifacts:"
+                      ls dist/*
+                      exit 0
+                  fi
+                  if [ -z "${UV_PUBLISH_TOKEN}" ]; then
+                      echo "::error::SMOOAI_PYPI_TOKEN secret is not set for this repo"
+                      exit 1
+                  fi
+                  # --check-url lets a re-run of an already-published version
+                  # succeed as a no-op instead of erroring on the duplicate.
+                  uv publish --check-url https://pypi.org/simple/
