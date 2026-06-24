@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://smoo.ai"><img src="https://raw.githubusercontent.com/SmooAI/smooth-operator-core/main/.github/banner-dotnet.png" alt="smooth-operator-core — The C# / .NET engine for orchestrated AI agents" width="100%" /></a>
+  <a href="https://smoo.ai"><img src="https://raw.githubusercontent.com/SmooAI/smooth-operator-core/main/.github/banner-go.png" alt="smooth-operator-core — The Go engine for orchestrated AI agents" width="100%" /></a>
 </p>
 
 <p align="center">
@@ -9,39 +9,53 @@
 </p>
 
 <p align="center">
-  <a href="https://www.nuget.org/packages/SmooAI.SmoothOperator.Core"><img src="https://img.shields.io/nuget/v/SmooAI.SmoothOperator.Core?style=flat-square&color=00A6A6&labelColor=020618" alt="NuGet"></a>
-  <img src="https://img.shields.io/badge/.NET-engine-512BD4?style=flat-square&labelColor=020618" alt=".NET engine">
+  <a href="https://pkg.go.dev/github.com/SmooAI/smooth-operator-core/go/core"><img src="https://img.shields.io/badge/pkg.go.dev-reference-00ADD8?style=flat-square&labelColor=020618" alt="pkg.go.dev"></a>
+  <img src="https://img.shields.io/badge/Go-engine-00ADD8?style=flat-square&labelColor=020618" alt="Go engine">
 </p>
 
 ---
 
-> The C#/.NET sibling of the [Rust reference engine](https://github.com/SmooAI/smooth-operator-core). Agents, tools, knowledge/RAG, memory, checkpointing, human-in-the-loop, cost budgets, and workflows — as one embeddable NuGet package. It's the engine, not a notebook demo.
+> The Go sibling of the [Rust reference engine](https://github.com/SmooAI/smooth-operator-core). Agents, tools, knowledge/RAG, memory, checkpointing, human-in-the-loop, cost budgets, and workflows — as one embeddable package. It's the engine, not a notebook demo.
 
-`SmooAI.SmoothOperator.Core` is the **native C# implementation** of the Smoo AI agent engine — the in-process observe→think→act loop that powers [**lom.smoo.ai**](https://lom.smoo.ai). It's a sibling of the [Rust reference engine](https://github.com/SmooAI/smooth-operator-core) and one of the [polyglot set](https://github.com/SmooAI/smooth-operator-core/blob/main/docs/Polyglot-Engines.md) (Rust, TypeScript, Python, Go, C#/.NET) whose behavior is held at parity by a shared eval suite. Its API follows Microsoft.Extensions.AI naming.
+`github.com/SmooAI/smooth-operator-core/go/core` is the **native Go implementation** of the Smoo AI agent engine — the in-process observe→think→act loop that powers [**lom.smoo.ai**](https://lom.smoo.ai). It's a sibling of the [Rust reference engine](https://github.com/SmooAI/smooth-operator-core) and one of the [polyglot set](https://github.com/SmooAI/smooth-operator-core/blob/main/docs/Polyglot-Engines.md) (Rust, TypeScript, Python, Go, C#/.NET) whose behavior is held at parity by a shared eval suite.
 
-It's a library, not a client to a remote server: it *is* the agent, running in your .NET process. Every surface is covered by **fast, offline tests** built on a deterministic `MockLlmProvider`, so the loop is verified — not vibe-coded.
+It's a library, not a client to a remote server: it *is* the agent, running in your Go process. Every surface is covered by **fast, offline tests** built on a deterministic `MockLlmProvider`, so the loop is verified — not vibe-coded.
 
 ## Install
 
 ```bash
-dotnet add package SmooAI.SmoothOperator.Core
+go get github.com/SmooAI/smooth-operator-core/go/core
 ```
+
+The engine is the `core` package; idiomatic alias `core`.
 
 ## Quickstart
 
 A complete agent — no credentials needed — using the deterministic mock provider the engine's own tests run on:
 
-```csharp
-using SmooAI.SmoothOperator.Core;
+```go
+package main
 
-var provider = new MockLlmProvider().PushText("the answer is 42");
-var agent = new SmoothAgent(provider, new AgentOptions { Instructions = "You are a helpful assistant" });
+import (
+	"context"
+	"fmt"
 
-var response = await agent.RunAsync("what is the answer?");
-Console.WriteLine(response.Text);
+	core "github.com/SmooAI/smooth-operator-core/go/core"
+)
+
+func main() {
+	provider := core.NewMockLlmProvider().PushText("the answer is 42")
+	agent := core.NewSmoothAgent(provider, core.AgentOptions{Instructions: "You are a helpful assistant"})
+
+	res, err := agent.Run(context.Background(), "what is the answer?", nil)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(res.Text)
+}
 ```
 
-`new SmoothAgent(chatClient, options)` takes an `IChatClient` (the `MockLlmProvider` implements it — swap in any OpenAI-compatible client) and an `AgentOptions`. `await agent.RunAsync(...)` returns an `AgentRunResponse`; `response.Text` is the final assistant message.
+`NewSmoothAgent(client, options)` takes a `ChatClient` (the `MockLlmProvider` implements it — swap in any OpenAI-compatible client) and an `AgentOptions` struct. `Run(ctx, message, history)` — pass `nil` history for a fresh turn — returns `(AgentRunResponse, error)`; `res.Text` is the final answer.
 
 ## Features
 
@@ -58,17 +72,17 @@ The full parity surface — every engine in the [polyglot set](https://github.co
 - **Sub-agents / delegation** — spawn child agents for sub-tasks.
 - **Cast + clearance** — roles with per-role tool-access policy.
 - **Human-in-the-loop gate** — require approval before designated tool calls run.
-- **Conversation thread** — carry a conversation across multiple `RunAsync` calls.
+- **Conversation thread** — carry a conversation across multiple `Run` calls.
 - **`LlmProvider` seam + `MockLlmProvider`** — inject any OpenAI-compatible client; the record/replay mock drives the offline tests.
 - **Deferred tools + `tool_search`** — hide rarely-used tool schemas behind a meta-tool the model calls to promote the ones it needs.
-- **Typed workflow graph** — a node/edge workflow engine alongside the agent loop.
+- **Typed workflow graph** — a generic `Workflow[S]` node/edge engine alongside the agent loop.
 - **Parallel tool calls** — dispatch ≥2 tool calls concurrently (transcript order preserved).
 - **Retry / backoff** — retry transient model-call failures with exponential backoff.
 - **Streaming** — stream incremental text, tool calls, and tool results as the turn runs.
 
 ## Streaming
 
-`RunStreamingAsync` is the streaming variant of `RunAsync`: it yields incremental updates — text deltas as the model produces them, each tool call before dispatch, each tool result after it finishes, and a terminal update carrying the same response `RunAsync` would have returned.
+`RunStream` is the streaming variant of `Run`: it yields incremental events — `text` deltas as the model produces them, each tool call before dispatch, each tool result after it finishes, and a terminal `done` event carrying the same response `Run` would have returned.
 
 ## Part of Smoo AI
 
