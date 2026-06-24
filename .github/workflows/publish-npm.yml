@@ -74,6 +74,12 @@ jobs:
             - name: Test
               run: pnpm --filter @smooai/smooth-operator-core test
 
+            # Compile TS → dist/ (.js + .d.ts). The published tarball ships dist
+            # (package.json `files`/`exports` point there); without this the pack
+            # has no entry point.
+            - name: Build
+              run: pnpm --filter @smooai/smooth-operator-core build
+
             # On manual runs `dry_run` defaults to true, so a bare "Run workflow"
             # click uploads NOTHING. Tag pushes have no input, so `inputs.dry_run`
             # is false and this publishes for real.
