@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/events/otp-verified.schema.json",
+  "title": "OtpVerified",
+  "description": "Event: `otp_verified`. Emitted when the caller's OTP attempt succeeds, or when a pre-auth HMAC makes OTP unnecessary. The session is now authenticated at the required level and the paused agent workflow resumes. A streaming sequence (`stream_chunk` / `stream_token` → `eventual_response`) follows.",
+  "type": "object",
+  "required": ["type", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "const": "otp_verified",
+      "description": "Event type discriminator."
+    },
+    "requestId": {
+      "type": "string",
+      "description": "Echoes the `requestId` from the originating `verify_otp` action."
+    },
+    "data": {
+      "type": "object",
+      "description": "Verification success details.",
+      "required": ["requestId", "data"],
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "description": "The request ID this verification belongs to."
+        },
+        "data": {
+          "type": "object",
+          "description": "Success payload.",
+          "required": ["message"],
+          "additionalProperties": false,
+          "properties": {
+            "message": {
+              "type": "string",
+              "description": "Short human-readable confirmation message (e.g. `Identity verified successfully.`)."
+            }
+          }
+        }
+      }
+    },
+    "timestamp": {
+      "type": "integer",
+      "description": "Unix epoch milliseconds when the event was emitted."
+    }
+  }
+}

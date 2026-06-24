@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/domain/checkpoint.schema.json",
+  "title": "Checkpoint",
+  "description": "A point-in-time snapshot of a smooth-operator agent's state. Checkpoints are written by the agent runtime and are used to resume execution after interruptions (Lambda cold starts, HITL pauses, network errors). Corresponds to the `Checkpoint` struct in the smooth-operator Rust crate.",
+  "type": "object",
+  "required": ["id", "threadId", "agentId", "iteration", "createdAt"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique checkpoint identifier (UUID v4)."
+    },
+    "threadId": {
+      "type": "string",
+      "description": "smooth-operator workflow thread identifier this checkpoint belongs to. Matches `Session.threadId` for the associated session."
+    },
+    "agentId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The agent whose state is captured in this checkpoint."
+    },
+    "iteration": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Agent loop iteration counter at the time the checkpoint was taken."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Arbitrary string key/value metadata attached to this checkpoint (e.g. phase name, bead ID).",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when the checkpoint was created."
+    }
+  }
+}

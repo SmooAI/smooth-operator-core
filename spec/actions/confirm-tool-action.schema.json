@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/actions/confirm-tool-action.schema.json",
+  "title": "ConfirmToolAction",
+  "description": "Action: `confirm_tool_action`. Sent in response to a `write_confirmation_required` event. Resumes the paused agent workflow with the user's approval or rejection decision. Approved calls proceed; rejected calls are skipped and the agent receives the rejection as context.",
+
+  "$defs": {
+    "Request": {
+      "title": "ConfirmToolActionRequest",
+      "description": "Fields sent by the client to approve or reject a pending tool write.",
+      "type": "object",
+      "required": ["action", "sessionId", "requestId", "approved"],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "const": "confirm_tool_action",
+          "description": "Action discriminator."
+        },
+        "requestId": {
+          "type": "string",
+          "description": "Must match the `requestId` from the `write_confirmation_required` event being responded to. This is how the server correlates the confirmation back to the paused workflow."
+        },
+        "sessionId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Session ID of the paused session."
+        },
+        "approved": {
+          "type": "boolean",
+          "description": "True to allow the tool call to proceed; false to reject it. On rejection the agent workflow resumes with an informational context message."
+        }
+      }
+    },
+
+    "Response": {
+      "title": "ConfirmToolActionResponse",
+      "description": "There is no dedicated response event for `confirm_tool_action`. After the confirmation is received, the agent workflow resumes and emits the normal streaming sequence (`stream_chunk` / `stream_token` → `eventual_response`). This schema is provided for documentation completeness only.",
+      "type": "object",
+      "description": "No dedicated response — the workflow continuation is signalled by resumed streaming events.",
+      "additionalProperties": true
+    }
+  },
+
+  "oneOf": [
+    { "$ref": "#/$defs/Request" },
+    { "$ref": "#/$defs/Response" }
+  ]
+}

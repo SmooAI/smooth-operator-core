@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/events/stream-chunk.schema.json",
+  "title": "StreamChunk",
+  "description": "Event: `stream_chunk`. Emitted each time a node in the smooth-operator workflow completes. Carries the node name and a filtered state snapshot. Clients use this to show per-node progress (e.g. `knowledge_search completed`, tool activity) in an agent team view. Distinct from `stream_token` which carries raw token deltas; a `stream_chunk` typically fires once per node while multiple `stream_token` events may fire within a single node's LLM call.",
+  "type": "object",
+  "required": ["type", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "const": "stream_chunk",
+      "description": "Event type discriminator."
+    },
+    "requestId": {
+      "type": "string",
+      "description": "Echoes the `requestId` from the originating `send_message` action."
+    },
+    "node": {
+      "type": "string",
+      "description": "Name of the workflow node that just completed and produced this chunk."
+    },
+    "data": {
+      "type": "object",
+      "description": "The per-node state snapshot.",
+      "required": ["requestId", "node", "state"],
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "description": "The request ID this chunk belongs to."
+        },
+        "node": {
+          "type": "string",
+          "description": "Name of the workflow node that produced this state snapshot."
+        },
+        "state": {
+          "type": "object",
+          "description": "Filtered subset of the node's output state exposed to the client. Only safe-to-expose fields are included; server-internal state is stripped.",
+          "additionalProperties": false,
+          "properties": {
+            "rawResponse": {
+              "description": "Unstructured LLM output from this node, if any.",
+              "type": ["object", "array", "string", "number", "boolean", "null"]
+            },
+            "structuredResponse": {
+              "description": "Parsed structured response from this node, if any.",
+              "type": ["object", "array", "string", "number", "boolean", "null"]
+            },
+            "pendingWriteConfirmation": {
+              "description": "Non-null when the workflow has paused awaiting user confirmation of a write operation. Clients should surface a confirmation UI.",
+              "type": ["object", "null"],
+              "additionalProperties": true
+            },
+            "pendingOtpVerification": {
+              "description": "Non-null when the workflow has paused awaiting OTP verification. Clients should surface an OTP input UI.",
+              "type": ["object", "null"],
+              "additionalProperties": true
+            }
+          }
+        },
+        "done": {
+          "type": "boolean",
+          "description": "Reserved for future use. When true, this is the last `stream_chunk` for the request. Currently clients should use `eventual_response` to detect stream completion."
+        }
+      }
+    },
+    "timestamp": {
+      "type": "integer",
+      "description": "Unix epoch milliseconds when the event was emitted."
+    }
+  }
+}

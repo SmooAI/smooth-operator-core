@@ -315,7 +315,7 @@ This is a multi-language SmooAI package. The Rust crate is the reference; other 
 | --- | --- | --- |
 | [`rust/`](./rust) | Rust (reference) | Active — crate `smooai-smooth-operator-core` (lib `smooth_operator_core`) |
 | [`typescript/`](./typescript) | TypeScript | Planned |
-| [`go/`](./go) | Go | Planned |
+| [`go/`](./go) | Go | Active — module `github.com/SmooAI/smooth-operator-core/go` |
 | [`dotnet/`](./dotnet) | C# / .NET | Planned (first-class target) |
 | [`python/`](./python) | Python | Planned |
 

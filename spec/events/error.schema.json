@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/events/error.schema.json",
+  "title": "Error",
+  "description": "Event: `error`. Emitted when an unrecoverable error occurs during request processing. The nested `error` object shape (`{ code, message }`) is preserved for wire compatibility with clients that destructure `message.error.code`. `details` carries additional structured context when available.",
+  "type": "object",
+  "required": ["type", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "const": "error",
+      "description": "Event type discriminator."
+    },
+    "requestId": {
+      "type": "string",
+      "description": "Echoes the `requestId` from the originating action, if applicable. Absent for server-initiated errors with no associated request."
+    },
+    "error": {
+      "type": "object",
+      "description": "Top-level error object (duplicate of `data.error`; kept for clients that pattern-match on the envelope-level `error` field).",
+      "required": ["code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "Machine-readable error code."
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable error description."
+        }
+      }
+    },
+    "data": {
+      "type": "object",
+      "description": "Full error payload.",
+      "required": ["error"],
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "description": "The request ID this error belongs to, if any."
+        },
+        "error": {
+          "type": "object",
+          "description": "The error descriptor (nested for wire backward-compatibility).",
+          "required": ["code", "message"],
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "type": "string",
+              "description": "Machine-readable error code (e.g. `SESSION_NOT_FOUND`, `RATE_LIMITED`, `VALIDATION_ERROR`, `INTERNAL_ERROR`)."
+            },
+            "message": {
+              "type": "string",
+              "description": "Human-readable error description."
+            }
+          }
+        },
+        "details": {
+          "description": "Optional additional structured error context (e.g. validation issues, partial results).",
+          "type": ["object", "array", "string", "number", "boolean", "null"]
+        }
+      }
+    },
+    "timestamp": {
+      "type": "integer",
+      "description": "Unix epoch milliseconds when the event was emitted."
+    }
+  }
+}

@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/domain/participant.schema.json",
+  "title": "Participant",
+  "description": "A participant in a conversation. Participants may be end users, AI agents, or human support agents. Corresponds to a row in the `conversation_participants` table.",
+  "type": "object",
+  "required": ["id", "conversationId", "organizationId", "type", "name", "createdAt", "updatedAt"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique participant identifier."
+    },
+    "conversationId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The conversation this participant belongs to."
+    },
+    "organizationId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The organization that owns this participant record."
+    },
+    "type": {
+      "type": "string",
+      "enum": ["user", "ai-agent", "human-agent"],
+      "description": "Participant role: `user` = end-user, `ai-agent` = smooth-operator agent, `human-agent` = live support agent."
+    },
+    "externalId": {
+      "type": ["string", "null"],
+      "description": "External identity (e.g. Supabase auth user UUID) for authenticated participants."
+    },
+    "internalId": {
+      "type": ["string", "null"],
+      "description": "Internal system identifier (e.g. agent UUID from the agents table)."
+    },
+    "browserFingerprint": {
+      "type": ["string", "null"],
+      "description": "Browser fingerprint (ThumbmarkJS) for anonymous user identification."
+    },
+    "browserInfo": {
+      "type": ["object", "null"],
+      "description": "Parsed browser / device metadata collected at session start.",
+      "additionalProperties": true
+    },
+    "name": {
+      "type": "string",
+      "description": "Display name for this participant."
+    },
+    "email": {
+      "type": ["string", "null"],
+      "format": "email",
+      "description": "Email address if known."
+    },
+    "phone": {
+      "type": ["string", "null"],
+      "description": "Phone number in E.164 format if known."
+    },
+    "crmContactId": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "Foreign key into the CRM contacts table if this participant has been matched."
+    },
+    "metadataJson": {
+      "type": "object",
+      "description": "Arbitrary key/value metadata attached to this participant.",
+      "additionalProperties": true
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when the participant record was created."
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when the participant record was last updated."
+    }
+  }
+}

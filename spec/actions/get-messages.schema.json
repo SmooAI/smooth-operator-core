@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/actions/get-messages.schema.json",
+  "title": "GetMessages",
+  "description": "Action: `get_conversation_messages`. Retrieves a page of messages from the conversation attached to the given session. Results are ordered newest-first. Use `before` for cursor-based pagination. The server replies with an `immediate_response` event whose `data` matches the `Response` schema below.",
+
+  "$defs": {
+    "Request": {
+      "title": "GetMessagesRequest",
+      "description": "Fields sent by the client to page through conversation history.",
+      "type": "object",
+      "required": ["action", "sessionId"],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "const": "get_conversation_messages",
+          "description": "Action discriminator."
+        },
+        "requestId": {
+          "type": "string",
+          "description": "Client-generated correlation ID echoed back on all related events."
+        },
+        "sessionId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Session ID whose conversation messages to fetch."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 50,
+          "description": "Maximum number of messages to return per page. Must be 1–100; defaults to 50."
+        },
+        "before": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 cursor: return only messages created strictly before this timestamp. Omit to start from the most recent message."
+        }
+      }
+    },
+
+    "Response": {
+      "title": "GetMessagesResponse",
+      "description": "Data payload carried in the `immediate_response` event.",
+      "type": "object",
+      "required": ["messages", "hasMore"],
+      "additionalProperties": false,
+      "properties": {
+        "messages": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConversationMessage" },
+          "description": "Ordered list of messages (newest-first up to `limit`)."
+        },
+        "hasMore": {
+          "type": "boolean",
+          "description": "True if more messages exist before the oldest message in this page. Use the oldest `createdAt` as the next `before` cursor."
+        }
+      }
+    },
+
+    "ConversationMessage": {
+      "title": "ConversationMessage",
+      "description": "A single message as returned on the wire. This is a subset of the full `Message` domain object — it omits server-only fields (metadataJson, analyticsJson) and includes abbreviated participant descriptors.",
+      "type": "object",
+      "required": ["id", "direction", "content", "createdAt"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Unique message ID."
+        },
+        "direction": {
+          "type": "string",
+          "enum": ["inbound", "outbound"],
+          "description": "Message direction: `inbound` = from user, `outbound` = from agent."
+        },
+        "content": {
+          "type": "object",
+          "description": "Message payload. `text` contains the plain-text form; `structuredResponse` contains parsed agent output when present.",
+          "additionalProperties": false,
+          "properties": {
+            "text": {
+              "type": "string",
+              "description": "Plain-text content."
+            },
+            "structuredResponse": {
+              "description": "Structured agent response (shape depends on agent template).",
+              "type": ["object", "null"],
+              "additionalProperties": true
+            }
+          }
+        },
+        "from": {
+          "type": "object",
+          "description": "Abbreviated sender descriptor.",
+          "required": ["id", "type"],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "to": {
+          "type": "object",
+          "description": "Abbreviated recipient descriptor.",
+          "required": ["id", "type"],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 timestamp when the message was created."
+        }
+      }
+    }
+  },
+
+  "oneOf": [
+    { "$ref": "#/$defs/Request" },
+    { "$ref": "#/$defs/Response" }
+  ]
+}

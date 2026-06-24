@@ -1,0 +1,143 @@
+{
+  "$comment": "Conformance fixtures for the smooth-operator wire protocol. Each entry is a valid instance of the named schema. Clients and servers validate their outgoing/incoming messages against these to catch drift between implementations.",
+
+  "create_session_request": {
+    "$schema_ref": "actions/create-conversation-session.schema.json#/$defs/Request",
+    "description": "Minimal create-session request (only required fields).",
+    "instance": {
+      "action": "create_conversation_session",
+      "requestId": "req-a1b2c3d4-0001",
+      "agentId": "11111111-1111-1111-1111-111111111111",
+      "userName": "Alice",
+      "userEmail": "alice@example.com",
+      "browserFingerprint": "fp_abc123def456",
+      "metadata": {
+        "campaignSource": "homepage-chat-widget",
+        "planTier": "pro"
+      }
+    }
+  },
+
+  "create_session_response": {
+    "$schema_ref": "actions/create-conversation-session.schema.json#/$defs/Response",
+    "description": "Session creation response carried in an immediate_response event's data field.",
+    "instance": {
+      "sessionId": "22222222-2222-2222-2222-222222222222",
+      "conversationId": "33333333-3333-3333-3333-333333333333",
+      "agentId": "11111111-1111-1111-1111-111111111111",
+      "agentName": "Aria",
+      "userParticipantId": "44444444-4444-4444-4444-444444444444",
+      "agentParticipantId": "55555555-5555-5555-5555-555555555555"
+    }
+  },
+
+  "send_message_request": {
+    "$schema_ref": "actions/send-message.schema.json#/$defs/Request",
+    "description": "A user message submitted to an active session with streaming enabled.",
+    "instance": {
+      "action": "send_message",
+      "requestId": "req-a1b2c3d4-0002",
+      "sessionId": "22222222-2222-2222-2222-222222222222",
+      "message": "What is the status of my last order?",
+      "stream": true
+    }
+  },
+
+  "stream_chunk_event": {
+    "$schema_ref": "events/stream-chunk.schema.json",
+    "description": "A per-node state snapshot emitted as the knowledge_search node completes.",
+    "instance": {
+      "type": "stream_chunk",
+      "requestId": "req-a1b2c3d4-0002",
+      "node": "knowledge_search",
+      "data": {
+        "requestId": "req-a1b2c3d4-0002",
+        "node": "knowledge_search",
+        "state": {
+          "rawResponse": null,
+          "structuredResponse": {
+            "snippets": [
+              "Order #ORD-9982 was shipped on 2026-06-01 via FedEx (tracking: 123456789012)."
+            ]
+          },
+          "pendingWriteConfirmation": null,
+          "pendingOtpVerification": null
+        },
+        "done": false
+      },
+      "timestamp": 1749340800000
+    }
+  },
+
+  "eventual_response_event": {
+    "$schema_ref": "events/eventual-response.schema.json",
+    "description": "Terminal response event for a completed send_message turn.",
+    "instance": {
+      "type": "eventual_response",
+      "requestId": "req-a1b2c3d4-0002",
+      "status": 200,
+      "data": {
+        "requestId": "req-a1b2c3d4-0002",
+        "status": 200,
+        "data": {
+          "messageId": "66666666-6666-6666-6666-666666666666",
+          "response": {
+            "responseParts": [
+              "Your order #ORD-9982 was shipped on June 1st via FedEx.",
+              "Tracking number: 123456789012. Expected delivery is June 4th."
+            ],
+            "customerHappinessScore": 0.85,
+            "needsSatisfactionScore": 0.9,
+            "requestSummary": "User asked about the status of their most recent order.",
+            "resolutionStatus": "resolved",
+            "suggestedNextActions": [
+              "Track shipment on FedEx website",
+              "Contact support if package does not arrive by June 5th"
+            ]
+          },
+          "needsEscalation": false
+        }
+      },
+      "timestamp": 1749340803500
+    }
+  },
+
+  "eventual_response_with_citations_event": {
+    "$schema_ref": "events/eventual-response.schema.json",
+    "description": "Terminal response for a knowledge-grounded turn that carries the sources it used. One citation is a GitHub-sourced doc (with a blob url), the other a local doc with no web source (url omitted).",
+    "instance": {
+      "type": "eventual_response",
+      "requestId": "req-a1b2c3d4-0003",
+      "status": 200,
+      "data": {
+        "requestId": "req-a1b2c3d4-0003",
+        "status": 200,
+        "data": {
+          "messageId": "77777777-7777-7777-7777-777777777777",
+          "response": {
+            "responseParts": [
+              "Returns are accepted within 30 days of delivery for a full refund."
+            ]
+          },
+          "needsEscalation": false,
+          "citations": [
+            {
+              "id": "doc-returns-policy",
+              "title": "acme/handbook@main#policies/returns.md",
+              "url": "https://github.com/acme/handbook/blob/main/policies/returns.md",
+              "snippet": "SmooAI returns are accepted within 30 days of delivery for a full refund.",
+              "score": 0.91
+            },
+            {
+              "id": "doc-shipping-policy",
+              "title": "policies/shipping.md",
+              "snippet": "Standard shipping takes 5 to 7 business days within the continental US.",
+              "score": 0.42
+            }
+          ]
+        }
+      },
+      "timestamp": 1749340806700
+    }
+  }
+}

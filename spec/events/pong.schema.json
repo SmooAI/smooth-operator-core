@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/events/pong.schema.json",
+  "title": "Pong",
+  "description": "Event: `pong`. The server's reply to a `ping` action. Carries the server's current Unix epoch timestamp in milliseconds. Clients use the round-trip time to detect zombie connections.",
+  "type": "object",
+  "required": ["type"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "const": "pong",
+      "description": "Event type discriminator."
+    },
+    "requestId": {
+      "type": "string",
+      "description": "Echoes the `requestId` from the originating `ping` action."
+    },
+    "timestamp": {
+      "type": "integer",
+      "description": "Server-side Unix epoch milliseconds when the pong was emitted."
+    },
+    "data": {
+      "type": "object",
+      "description": "Pong payload (mirrors top-level `timestamp` for clients that only inspect `data`).",
+      "required": ["timestamp"],
+      "additionalProperties": false,
+      "properties": {
+        "timestamp": {
+          "type": "integer",
+          "description": "Server-side Unix epoch milliseconds."
+        }
+      }
+    }
+  }
+}

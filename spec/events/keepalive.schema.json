@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/events/keepalive.schema.json",
+  "title": "Keepalive",
+  "description": "Event: `keepalive`. Sent periodically by the server during long-running agent turns (typically every 30 seconds) to prevent AWS API Gateway's 10-minute idle connection timeout from closing the WebSocket while the backend is still computing. Clients should acknowledge receipt by updating their last-seen timestamp, but no reply action is needed. Distinct from `ping`/`pong` which are client-initiated.",
+  "type": "object",
+  "required": ["type", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "const": "keepalive",
+      "description": "Event type discriminator."
+    },
+    "requestId": {
+      "type": "string",
+      "description": "The `requestId` of the in-flight request this keepalive is associated with."
+    },
+    "data": {
+      "type": "object",
+      "description": "Keepalive payload.",
+      "required": ["requestId"],
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "description": "The request ID of the in-flight request this keepalive belongs to."
+        }
+      }
+    },
+    "timestamp": {
+      "type": "integer",
+      "description": "Unix epoch milliseconds when the keepalive was sent."
+    }
+  }
+}

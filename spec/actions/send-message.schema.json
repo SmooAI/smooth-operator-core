@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smooth-agent.dev/spec/actions/send-message.schema.json",
+  "title": "SendMessage",
+  "description": "Action: `send_message`. Submits a user message to the active session. The server immediately acknowledges with `immediate_response` (status 202), then emits zero or more `stream_chunk` / `stream_token` events as the agent workflow runs, and finally emits `eventual_response` (status 200) with the terminal output. If the agent requires human confirmation mid-stream, a `write_confirmation_required` event is sent and processing pauses until the client sends `confirm_tool_action`.",
+
+  "$defs": {
+    "Request": {
+      "title": "SendMessageRequest",
+      "description": "Fields sent by the client to submit a message.",
+      "type": "object",
+      "required": ["action", "sessionId", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "const": "send_message",
+          "description": "Action discriminator."
+        },
+        "requestId": {
+          "type": "string",
+          "description": "Client-generated correlation ID echoed back on all related events."
+        },
+        "sessionId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Session ID returned by `create_conversation_session`."
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10000,
+          "description": "The user's message text. Between 1 and 10 000 characters."
+        },
+        "stream": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether to receive incremental `stream_chunk` and `stream_token` events. Defaults to `true`. Set to `false` to receive only the final `eventual_response`."
+        }
+      }
+    },
+
+    "Response": {
+      "title": "SendMessageResponse",
+      "description": "Data payload carried in the terminal `eventual_response` event for this action. Also see `GeneralAgentResponse` for the structured response shape.",
+      "type": "object",
+      "required": ["messageId", "response", "needsEscalation"],
+      "additionalProperties": false,
+      "properties": {
+        "messageId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "ID of the agent's response message as persisted to the database."
+        },
+        "response": {
+          "$ref": "#/$defs/GeneralAgentResponse",
+          "description": "Structured agent response."
+        },
+        "needsEscalation": {
+          "type": "boolean",
+          "description": "True if the agent flagged this turn for human escalation."
+        },
+        "escalationReason": {
+          "type": "string",
+          "description": "Human-readable reason when `needsEscalation` is true."
+        }
+      }
+    },
+
+    "GeneralAgentResponse": {
+      "title": "GeneralAgentResponse",
+      "description": "Structured output from the default general-purpose agent template. Agents built on custom templates may extend or replace this shape.",
+      "type": "object",
+      "required": ["responseParts", "customerHappinessScore", "needsSatisfactionScore", "requestSummary", "resolutionStatus", "suggestedNextActions"],
+      "additionalProperties": false,
+      "properties": {
+        "responseParts": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Ordered text segments that together form the agent's reply. Clients may join them or render each separately."
+        },
+        "customerHappinessScore": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Estimated customer happiness for this turn (0 = very unhappy, 1 = very happy)."
+        },
+        "needsSatisfactionScore": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Estimated degree to which the customer's needs were met (0 = not met, 1 = fully met)."
+        },
+        "requestSummary": {
+          "type": "string",
+          "description": "One-sentence summary of what the user requested."
+        },
+        "resolutionStatus": {
+          "type": "string",
+          "enum": ["resolved", "in_progress", "requires_escalation", "needs_more_info", "blocked"],
+          "description": "The agent's assessment of where the conversation stands after this turn."
+        },
+        "suggestedNextActions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Ordered list of suggested follow-up actions the client UI may surface to the user."
+        }
+      }
+    }
+  },
+
+  "oneOf": [
+    { "$ref": "#/$defs/Request" },
+    { "$ref": "#/$defs/Response" }
+  ]
+}
