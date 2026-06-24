@@ -1,7 +1,18 @@
-# smooai-agent (.NET)
+# smooth-operator-core (.NET)
 
-C# / .NET bindings for the `smooai-agent` framework — **planned, not yet implemented.**
+Native **C# / .NET** implementation of the smooth-operator agent engine — the
+in-process, [`Microsoft.Extensions.AI`](https://learn.microsoft.com/dotnet/ai/microsoft-extensions-ai)-based
+sibling of the Rust [`smooai-smooth-operator-core`](../rust) crate.
 
-The Rust implementation in [`../rust/`](../rust) is the source of truth. When a .NET consumer appears, this directory will likely host a P/Invoke wrapper around the Rust crate, published to NuGet as `SmooAI.Agent`.
+- Engine: [`core/src`](core/src) — published to NuGet as **`SmooAI.SmoothOperator.Core`**.
+- Tests: [`core/tests`](core/tests).
+- Solution: [`SmooAI.SmoothOperator.Core.slnx`](SmooAI.SmoothOperator.Core.slnx) — builds the engine + tests standalone.
 
-Track interest / progress against [SMOODEV-1314](https://smooai.atlassian.net/browse/SMOODEV-1314) and follow-on tickets.
+```bash
+dotnet test dotnet/SmooAI.SmoothOperator.Core.slnx \
+  --filter "FullyQualifiedName!~EvalTests&FullyQualifiedName!~LiveE2E"
+```
+
+The `EvalTests` / `LiveE2E` suites require a live LLM gateway and are excluded by
+default (and in CI). CI runs in [`.github/workflows/dotnet-checks.yml`](../.github/workflows/dotnet-checks.yml);
+publishing is release-gated in [`.github/workflows/publish-nuget.yml`](../.github/workflows/publish-nuget.yml).

@@ -1,0 +1,36 @@
+# CI for the C# agent-engine core (dotnet/core).
+#
+# Restore → build → test the engine + its tests standalone, EXCLUDING the
+# gateway-gated suites (EvalTests / LiveE2E) which need a live LLM gateway.
+# The real publish lives in publish-nuget.yml.
+name: .NET Checks
+
+on:
+    pull_request:
+        branches: [main]
+        types: [opened, synchronize]
+
+jobs:
+    dotnet:
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Setup .NET
+              uses: actions/setup-dotnet@v4
+              with:
+                  dotnet-version: '8.0.x'
+
+            - name: Restore
+              run: dotnet restore dotnet/SmooAI.SmoothOperator.Core.slnx
+
+            - name: Build
+              run: dotnet build dotnet/SmooAI.SmoothOperator.Core.slnx -c Release --no-restore
+
+            - name: Test (excluding gateway-gated suites)
+              run: |
+                  dotnet test dotnet/SmooAI.SmoothOperator.Core.slnx \
+                      -c Release --no-build --verbosity normal \
+                      --filter "FullyQualifiedName!~EvalTests&FullyQualifiedName!~LiveE2E"

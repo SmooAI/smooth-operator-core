@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/core/">
+    <Project Path="core/src/SmooAI.SmoothOperator.Core.csproj" />
+    <Project Path="core/tests/SmooAI.SmoothOperator.Core.Tests.csproj" />
+  </Folder>
+</Solution>

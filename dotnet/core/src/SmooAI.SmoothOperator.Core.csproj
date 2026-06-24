@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>SmooAI.SmoothOperator.Core</RootNamespace>
+    <AssemblyName>SmooAI.SmoothOperator.Core</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Phase-0 docstrings are intentionally partial; don't fail the build on CS1591. -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <!-- NuGet package metadata -->
+  <PropertyGroup>
+    <PackageId>SmooAI.SmoothOperator.Core</PackageId>
+    <Version>1.1.0</Version>
+    <Authors>SmooAI</Authors>
+    <Company>SmooAI</Company>
+    <Description>Native C# implementation of the smooth-operator agent engine — the in-process, Microsoft.Extensions.AI-based sibling of the Rust smooai-smooth-operator-core. Drive an agentic tool-calling loop over any IChatClient; author tools from ordinary C# methods with AIFunctionFactory. Learns from Microsoft Agent Framework idioms.</Description>
+    <PackageTags>ai;agent;llm;chat;tools;rag;microsoft-extensions-ai;agent-framework;smooth-operator;smooai</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/SmooAI/smooth-operator-core/tree/main/dotnet/core</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/SmooAI/smooth-operator-core.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The README ships inside the package (shown on the nuget.org listing). -->
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Let the test project exercise internal helpers (e.g. Compactor). -->
+    <InternalsVisibleTo Include="SmooAI.SmoothOperator.Core.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The engine is built ON Microsoft.Extensions.AI: IChatClient is the model
+         abstraction, ChatMessage/AIFunction/FunctionCallContent the conversation +
+         tool types. Any MEAI provider plugs in; a normal C# method becomes a tool. -->
+    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="9.7.1" />
+  </ItemGroup>
+
+</Project>
