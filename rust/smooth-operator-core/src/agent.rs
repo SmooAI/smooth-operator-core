@@ -330,6 +330,16 @@ pub enum AgentEvent {
     TokenDelta {
         content: String,
     },
+    /// A streamed *reasoning* token from a reasoning-model's separate thinking
+    /// channel (`reasoning_content`/`reasoning` deltas — Kimi, DeepSeek R1,
+    /// gpt-oss/harmony, MiniMax). Kept distinct from [`TokenDelta`] so consumers
+    /// can surface it as live "thinking" without it bleeding into the answer;
+    /// the accumulator already drops reasoning from the final response content.
+    /// Back-compat: older consumers skip this unknown variant, so they simply
+    /// stop showing reasoning (rather than showing it as answer text).
+    ReasoningDelta {
+        content: String,
+    },
     StreamingComplete,
     DelegationStarted {
         parent_id: String,
@@ -961,10 +971,12 @@ impl Agent {
                             let _ = tap_tx.send(AgentEvent::TokenDelta { content: content.clone() });
                         }
                         Ok(StreamEvent::Reasoning { content }) => {
-                            // Surface reasoning tokens as TokenDelta so progress is visible
-                            // during long reasoning phases (Kimi K2.5, DeepSeek R1, etc.).
-                            // The accumulator drops these from the final response content.
-                            let _ = tap_tx.send(AgentEvent::TokenDelta { content: content.clone() });
+                            // Surface reasoning on its OWN event so consumers can show it
+                            // as live "thinking" without it bleeding into the answer
+                            // (Kimi K2.5, DeepSeek R1, gpt-oss/harmony, etc.). The
+                            // accumulator still drops reasoning from the final response
+                            // content, so the answer stays clean either way.
+                            let _ = tap_tx.send(AgentEvent::ReasoningDelta { content: content.clone() });
                         }
                         Ok(StreamEvent::Done { .. }) => {
                             let _ = tap_tx.send(AgentEvent::StreamingComplete);
