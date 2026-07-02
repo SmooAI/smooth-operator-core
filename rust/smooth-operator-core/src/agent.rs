@@ -376,6 +376,37 @@ pub enum AgentEvent {
         /// `qwen3-coder-flash`).
         upstream: String,
     },
+    /// SEP: a new agent turn (one `run`) is starting. Emitted only when an
+    /// extension host is attached; also fanned out to subscribed extensions as
+    /// the `turn_start` event. Additive — clients skip unknown variants.
+    TurnStart {
+        agent_id: String,
+    },
+    /// SEP: the agent turn finished.
+    TurnEnd {
+        agent_id: String,
+        iterations: u32,
+    },
+    /// SEP: an incremental update to the in-progress assistant message.
+    /// Reserved for the streaming/observe wiring in a later phase; defined now
+    /// so clients can round-trip it.
+    MessageUpdate {
+        iteration: u32,
+        content_preview: String,
+    },
+    /// SEP: the assistant produced its final message this turn (maps to the
+    /// `message_end` extension event).
+    MessageEnd {
+        iteration: u32,
+        content_preview: String,
+    },
+    /// SEP: progress for an in-flight tool call (an extension `tool/update`, or
+    /// a native tool's progress channel — benefits native tools too).
+    ToolCallUpdate {
+        iteration: u32,
+        tool_name: String,
+        message: String,
+    },
 }
 
 /// Configuration for a sub-agent spawned via delegation.
@@ -503,6 +534,11 @@ pub struct Agent {
     /// inject a [`MockLlmClient`](crate::llm_provider::MockLlmClient) here to
     /// drive the loop deterministically without a live model.
     llm_provider: Option<Arc<dyn LlmProvider>>,
+    /// Optional SEP extension host. When `None` (the default) the agent loop is
+    /// exactly as it was before extensions existed. When set, the agent runs
+    /// the `tool_call` hook chain before executing tool calls and fans turn
+    /// events out to subscribed extensions.
+    extension_host: Option<Arc<crate::extension::ExtensionHost>>,
 }
 
 impl Agent {
@@ -517,7 +553,19 @@ impl Agent {
             cost_tracker: Arc::new(Mutex::new(CostTracker::default())),
             last_resolved_model: std::sync::Mutex::new(None),
             llm_provider: None,
+            extension_host: None,
         }
+    }
+
+    /// Attach a SEP [`ExtensionHost`](crate::extension::ExtensionHost). Purely
+    /// additive: with no host attached (the default) the agent loop is
+    /// unchanged. With a host, the agent runs the fail-closed `tool_call` hook
+    /// chain before executing tool calls (extensions may veto), and emits/fans
+    /// out turn events.
+    #[must_use]
+    pub fn with_extension_host(mut self, host: Arc<crate::extension::ExtensionHost>) -> Self {
+        self.extension_host = Some(host);
+        self
     }
 
     /// Inject a custom [`LlmProvider`] (e.g. a
@@ -616,6 +664,10 @@ impl Agent {
         conversation.push(Message::user(user_msg));
 
         self.emit(AgentEvent::Started { agent_id: self.id.clone() });
+        if let Some(host) = &self.extension_host {
+            host.dispatch_event(crate::extension::events::TURN_START, serde_json::json!({ "agent_id": self.id }));
+            self.emit(AgentEvent::TurnStart { agent_id: self.id.clone() });
+        }
 
         let llm: Arc<dyn LlmProvider> = match &self.llm_provider {
             Some(provider) => Arc::clone(provider),
@@ -758,10 +810,58 @@ impl Agent {
                     completion_tokens,
                     cached_tokens,
                 });
+                if let Some(host) = &self.extension_host {
+                    let preview: String = response.content.chars().take(100).collect();
+                    host.dispatch_event(crate::extension::events::MESSAGE_END, serde_json::json!({ "content": response.content }));
+                    self.emit(AgentEvent::MessageEnd {
+                        iteration,
+                        content_preview: preview,
+                    });
+                    self.emit(AgentEvent::TurnEnd {
+                        agent_id: self.id.clone(),
+                        iterations: iteration,
+                    });
+                }
                 return Ok(conversation);
             }
 
-            if self.config.parallel_tools {
+            // SEP: fail-closed `tool_call` hook chain. Extensions may veto a
+            // call BEFORE the registry runs it; the registry's own ToolHooks
+            // still veto inside `execute`/`execute_parallel` (clean layering).
+            // Empty + cheap when no extension host is attached, so the common
+            // parallel/sequential paths below stay byte-for-byte unchanged.
+            let sep_blocks = self.sep_tool_call_blocks(&response.tool_calls).await;
+            if !sep_blocks.is_empty() {
+                for tool_call in &response.tool_calls {
+                    self.emit(AgentEvent::ToolCallStart {
+                        iteration,
+                        tool_name: tool_call.name.clone(),
+                        arguments: tool_call.arguments.to_string(),
+                    });
+                    let start = std::time::Instant::now();
+                    let result = if let Some(reason) = sep_blocks.get(&tool_call.id) {
+                        crate::tool::ToolResult {
+                            tool_call_id: tool_call.id.clone(),
+                            content: format!("blocked by extension: {reason}"),
+                            is_error: true,
+                            details: None,
+                        }
+                    } else {
+                        self.tools.execute(tool_call).await
+                    };
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let result_preview: String = result.content.chars().take(500).collect();
+                    self.emit(AgentEvent::ToolCallComplete {
+                        iteration,
+                        tool_name: tool_call.name.clone(),
+                        is_error: result.is_error,
+                        result: result_preview,
+                        duration_ms,
+                    });
+                    conversation.push(Message::tool_result_named(&tool_call.id, &tool_call.name, &result.content));
+                    self.maybe_checkpoint(&conversation, iteration, CheckpointEvent::ToolCallComplete);
+                }
+            } else if self.config.parallel_tools {
                 for tool_call in &response.tool_calls {
                     self.emit(AgentEvent::ToolCallStart {
                         iteration,
@@ -1227,6 +1327,23 @@ impl Agent {
         if let Some(handler) = &self.event_handler {
             handler(event);
         }
+    }
+
+    /// SEP: run the fail-closed `tool_call` hook chain over the pending calls,
+    /// returning a map of vetoed `tool_call.id` → reason. Empty (and cheap)
+    /// when no extension host is attached, so callers stay on the unchanged
+    /// execution path in the common case.
+    async fn sep_tool_call_blocks(&self, calls: &[crate::tool::ToolCall]) -> std::collections::HashMap<String, String> {
+        let mut blocks = std::collections::HashMap::new();
+        let Some(host) = &self.extension_host else {
+            return blocks;
+        };
+        for call in calls {
+            if let crate::extension::FoldedHook::Blocked(reason) = host.run_tool_call_hook(&call.name, &call.arguments).await {
+                blocks.insert(call.id.clone(), reason);
+            }
+        }
+        blocks
     }
 
     /// Decide whether the latest `LlmResponse` warrants an

@@ -12,6 +12,13 @@ categories = ["api-bindings", "asynchronous"]
 [lib]
 name = "smooth_operator_core"
 
+# Reference minimal SEP extension in Rust; also the fixture-replay peer for the
+# extension process-lifecycle tests (so they need no Node in CI). Not under
+# src/bin/ because the repo's .gitignore ignores `bin/`.
+[[bin]]
+name = "sep-echo-peer"
+path = "src/sep_echo_peer.rs"
+
 [features]
 default = []
 sqlite = ["rusqlite"]
@@ -31,6 +38,7 @@ anyhow = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
+toml = "0.8"
 bytes = "1"
 futures-core = "0.3"
 futures-util = "0.3"
@@ -43,6 +51,7 @@ r2d2_postgres = { version = "0.18", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+async-trait = "0.1"
 tokio = { version = "1", features = ["full", "test-util"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # SMOODEV-1468: spin up a throwaway Postgres for the checkpoint-store integration test.

@@ -1,0 +1,358 @@
+{
+  "$comment": "Conformance fixtures for SEP (Smooth Extension Protocol). Each keyed entry (other than `$invalid`) is a valid instance of the schema named by its `$schema_ref`, resolved relative to spec/extension/. Every engine host and every extension SDK replays these against its own serde/schema validator to catch drift between implementations. `$invalid` holds instances that MUST be rejected by the schema they reference.",
+
+  "initialize_params": {
+    "$schema_ref": "methods/initialize.schema.json#/$defs/Params",
+    "description": "Minimal handshake from a daemon host with a session and full UI capabilities.",
+    "instance": {
+      "protocol_version": 1,
+      "host": { "name": "smooth-operator-core", "version": "0.14.0" },
+      "workspace": { "root": "/Users/dev/project", "trusted": true },
+      "session": { "id": "sess-abc123" },
+      "mode": "tui",
+      "ui_capabilities": ["select", "confirm", "input", "notify", "set_status", "set_widget", "set_title"],
+      "capabilities_enabled": { "tools": true, "commands": true, "ui": true, "exec": true, "kv": true, "bus": true, "session": true }
+    }
+  },
+
+  "initialize_result": {
+    "$schema_ref": "methods/initialize.schema.json#/$defs/Result",
+    "description": "Echo extension's handshake reply: negotiated protocol version, identity, and one registered tool plus one event subscription.",
+    "instance": {
+      "protocol_version": 1,
+      "extension": { "name": "echo", "version": "0.1.0" },
+      "registrations": {
+        "tools": [
+          {
+            "name": "say",
+            "description": "Echo a phrase back.",
+            "parameters": { "type": "object", "properties": { "phrase": { "type": "string" } }, "required": ["phrase"] }
+          }
+        ],
+        "commands": [],
+        "flags": [],
+        "subscriptions": ["turn_start"]
+      }
+    }
+  },
+
+  "shutdown_params": {
+    "$schema_ref": "methods/shutdown.schema.json#/$defs/Params",
+    "description": "Empty shutdown request params.",
+    "instance": {}
+  },
+
+  "shutdown_result": {
+    "$schema_ref": "methods/shutdown.schema.json#/$defs/Result",
+    "description": "Empty shutdown reply.",
+    "instance": {}
+  },
+
+  "ping_params": {
+    "$schema_ref": "methods/ping.schema.json#/$defs/Params",
+    "description": "Empty ping request params.",
+    "instance": {}
+  },
+
+  "ping_result": {
+    "$schema_ref": "methods/ping.schema.json#/$defs/Result",
+    "description": "Empty pong reply.",
+    "instance": {}
+  },
+
+  "event_params": {
+    "$schema_ref": "methods/event.schema.json#/$defs/Params",
+    "description": "A turn_start lifecycle event delivered to a subscribed extension.",
+    "instance": {
+      "event": "turn_start",
+      "context": { "token": "epoch-7", "tier": "event" },
+      "payload": { "turn_id": "turn-42" }
+    }
+  },
+
+  "hook_params": {
+    "$schema_ref": "methods/hook.schema.json#/$defs/Params",
+    "description": "A tool_call intercept awaiting the extension's HookOutcome.",
+    "instance": {
+      "hook": "tool_call",
+      "context": { "token": "epoch-7", "tier": "command" },
+      "input": { "tool": "bash", "arguments": { "command": "rm -rf /" } }
+    }
+  },
+
+  "hook_outcome_continue": {
+    "$schema_ref": "methods/hook.schema.json#/$defs/HookOutcome",
+    "description": "Hook reply that proceeds unchanged.",
+    "instance": { "action": "continue" }
+  },
+
+  "hook_outcome_block": {
+    "$schema_ref": "methods/hook.schema.json#/$defs/HookOutcome",
+    "description": "Hook reply that vetoes the intercepted operation.",
+    "instance": { "action": "block", "reason": "rm -rf blocked" }
+  },
+
+  "hook_outcome_modify": {
+    "$schema_ref": "methods/hook.schema.json#/$defs/HookOutcome",
+    "description": "Hook reply that replaces the intercepted value with a patch.",
+    "instance": { "action": "modify", "patch": { "tool": "bash", "arguments": { "command": "echo blocked" } } }
+  },
+
+  "tool_execute_params": {
+    "$schema_ref": "methods/tool-execute.schema.json#/$defs/Params",
+    "description": "Dispatch of the echo extension's `say` tool.",
+    "instance": {
+      "call_id": "call-1",
+      "tool": "say",
+      "arguments": { "phrase": "hello" },
+      "context": { "token": "epoch-7", "tier": "command" }
+    }
+  },
+
+  "tool_execute_result": {
+    "$schema_ref": "methods/tool-execute.schema.json#/$defs/Result",
+    "description": "Successful tool result echoing the phrase back.",
+    "instance": { "content": "hello", "is_error": false }
+  },
+
+  "tool_update_params": {
+    "$schema_ref": "methods/tool-update.schema.json#/$defs/Params",
+    "description": "Progress notification for an in-flight tool/execute.",
+    "instance": { "call_id": "call-1", "message": "working...", "progress": 0.5 }
+  },
+
+  "cancel_params": {
+    "$schema_ref": "methods/cancel.schema.json#/$defs/Params",
+    "description": "Cancellation of an in-flight request by numeric id.",
+    "instance": { "id": 42 }
+  },
+
+  "log_params": {
+    "$schema_ref": "methods/log.schema.json#/$defs/Params",
+    "description": "A structured log line folded into host tracing.",
+    "instance": { "level": "info", "message": "extension ready", "fields": { "pid": 1234 } }
+  },
+
+  "command_execute_params": {
+    "$schema_ref": "methods/command-execute.schema.json#/$defs/Params",
+    "description": "Dispatch of a registered slash-command.",
+    "instance": {
+      "command": "say",
+      "context": { "token": "epoch-7", "tier": "command" },
+      "arguments": { "phrase": "hi there" }
+    }
+  },
+
+  "command_execute_result": {
+    "$schema_ref": "methods/command-execute.schema.json#/$defs/Result",
+    "description": "Text surfaced into the session by the slash-command.",
+    "instance": { "content": "hi there" }
+  },
+
+  "registry_update_params": {
+    "$schema_ref": "methods/registry-update.schema.json#/$defs/Params",
+    "description": "Late registration adding a second tool and a new subscription after handshake.",
+    "instance": {
+      "tools": [
+        {
+          "name": "shout",
+          "description": "Echo a phrase back in caps.",
+          "parameters": { "type": "object", "properties": { "phrase": { "type": "string" } }, "required": ["phrase"] }
+        }
+      ],
+      "commands": [{ "name": "shout", "description": "Shout a phrase." }],
+      "flags": [],
+      "subscriptions": ["turn_start", "turn_end"]
+    }
+  },
+
+  "tools_set_active_params": {
+    "$schema_ref": "methods/tools-set-active.schema.json#/$defs/Params",
+    "description": "Request to activate two tools.",
+    "instance": { "tools": ["say", "shout"] }
+  },
+
+  "tools_set_active_result": {
+    "$schema_ref": "methods/tools-set-active.schema.json#/$defs/Result",
+    "description": "Host clamped the active set down to one tool.",
+    "instance": { "active": ["say"] }
+  },
+
+  "session_send_message_params": {
+    "$schema_ref": "methods/session.schema.json#/$defs/SendMessageParams",
+    "description": "Extension posting an assistant message into the session.",
+    "instance": { "text": "Done processing.", "role": "assistant" }
+  },
+
+  "session_state_result": {
+    "$schema_ref": "methods/session.schema.json#/$defs/StateResult",
+    "description": "Session state read back by the extension.",
+    "instance": { "state": { "turn_count": 3, "model": "gpt-5" } }
+  },
+
+  "exec_run_params": {
+    "$schema_ref": "methods/exec-run.schema.json#/$defs/Params",
+    "description": "Extension running a command through the host's audited permission engine.",
+    "instance": {
+      "command": "ls",
+      "args": ["-la"],
+      "cwd": "/Users/dev/project",
+      "context": { "token": "epoch-7", "tier": "command" }
+    }
+  },
+
+  "exec_run_result": {
+    "$schema_ref": "methods/exec-run.schema.json#/$defs/Result",
+    "description": "Result of the exec/run call.",
+    "instance": { "stdout": "total 0\n", "stderr": "", "exit_code": 0 }
+  },
+
+  "ui_request_select_params": {
+    "$schema_ref": "methods/ui-request.schema.json#/$defs/Params",
+    "description": "A select-kind UI request.",
+    "instance": { "kind": "select", "prompt": "Pick a branch", "options": ["main", "dev"] }
+  },
+
+  "ui_request_confirm_params": {
+    "$schema_ref": "methods/ui-request.schema.json#/$defs/Params",
+    "description": "A confirm-kind UI request.",
+    "instance": { "kind": "confirm", "prompt": "Delete the branch?" }
+  },
+
+  "ui_request_result": {
+    "$schema_ref": "methods/ui-request.schema.json#/$defs/Result",
+    "description": "Reply to a confirm-kind UI request.",
+    "instance": { "confirmed": true }
+  },
+
+  "kv_get_params": {
+    "$schema_ref": "methods/kv.schema.json#/$defs/GetParams",
+    "description": "Fetch a value by key.",
+    "instance": { "key": "echo.count" }
+  },
+
+  "kv_get_result": {
+    "$schema_ref": "methods/kv.schema.json#/$defs/GetResult",
+    "description": "A found value.",
+    "instance": { "value": 3 }
+  },
+
+  "kv_set_params": {
+    "$schema_ref": "methods/kv.schema.json#/$defs/SetParams",
+    "description": "Store a value under a key.",
+    "instance": { "key": "echo.count", "value": 4 }
+  },
+
+  "kv_list_result": {
+    "$schema_ref": "methods/kv.schema.json#/$defs/ListResult",
+    "description": "Keys under the requested prefix.",
+    "instance": { "keys": ["echo.count", "echo.last_phrase"] }
+  },
+
+  "bus_publish_params": {
+    "$schema_ref": "methods/bus-publish.schema.json#/$defs/Params",
+    "description": "An inter-extension event published to a topic.",
+    "instance": { "topic": "echo.said", "payload": { "phrase": "hello" } }
+  },
+
+  "frame_request": {
+    "$schema_ref": "methods/envelope.schema.json#/$defs/Request",
+    "description": "A ping request frame.",
+    "instance": { "jsonrpc": "2.0", "id": 1, "method": "ping", "params": {} }
+  },
+
+  "frame_notification": {
+    "$schema_ref": "methods/envelope.schema.json#/$defs/Notification",
+    "description": "A log notification frame with no id.",
+    "instance": { "jsonrpc": "2.0", "method": "log", "params": { "level": "info", "message": "extension ready" } }
+  },
+
+  "frame_success_response": {
+    "$schema_ref": "methods/envelope.schema.json#/$defs/SuccessResponse",
+    "description": "A successful reply to the ping request.",
+    "instance": { "jsonrpc": "2.0", "id": 1, "result": {} }
+  },
+
+  "frame_error_response": {
+    "$schema_ref": "methods/envelope.schema.json#/$defs/ErrorResponse",
+    "description": "An error reply.",
+    "instance": { "jsonrpc": "2.0", "id": 2, "error": { "code": -32601, "message": "method not found: bogus/method" } }
+  },
+
+  "error_blocked": {
+    "$schema_ref": "methods/envelope.schema.json#/$defs/ErrorResponse",
+    "description": "A hook vetoed the operation.",
+    "instance": { "jsonrpc": "2.0", "id": 7, "error": { "code": -32000, "message": "blocked by tool_call hook" } }
+  },
+
+  "error_no_ui": {
+    "$schema_ref": "methods/envelope.schema.json#/$defs/ErrorResponse",
+    "description": "A ui/request was sent to a headless frontend.",
+    "instance": { "jsonrpc": "2.0", "id": 7, "error": { "code": -32001, "message": "no UI capability for kind: select" } }
+  },
+
+  "error_not_trusted": {
+    "$schema_ref": "methods/envelope.schema.json#/$defs/ErrorResponse",
+    "description": "An extension acted beyond its granted trust.",
+    "instance": { "jsonrpc": "2.0", "id": 7, "error": { "code": -32002, "message": "extension is not trusted for this workspace" } }
+  },
+
+  "error_context_violation": {
+    "$schema_ref": "methods/envelope.schema.json#/$defs/ErrorResponse",
+    "description": "A command-tier action was attempted from an event-tier context.",
+    "instance": { "jsonrpc": "2.0", "id": 7, "error": { "code": -32003, "message": "session/send_message requires the command tier" } }
+  },
+
+  "error_capability_disabled": {
+    "$schema_ref": "methods/envelope.schema.json#/$defs/ErrorResponse",
+    "description": "The method's capability group was not enabled at handshake.",
+    "instance": { "jsonrpc": "2.0", "id": 7, "error": { "code": -32004, "message": "capability 'exec' is disabled" } }
+  },
+
+  "error_cancelled": {
+    "$schema_ref": "methods/envelope.schema.json#/$defs/ErrorResponse",
+    "description": "The request was cancelled via $/cancel.",
+    "instance": { "jsonrpc": "2.0", "id": 7, "error": { "code": -32800, "message": "cancelled" } }
+  },
+
+  "$invalid": [
+    {
+      "name": "initialize_params_missing_protocol_version",
+      "$schema_ref": "methods/initialize.schema.json#/$defs/Params",
+      "instance": {
+        "host": { "name": "smooth-operator-core", "version": "0.14.0" },
+        "workspace": { "root": "/Users/dev/project", "trusted": true },
+        "mode": "tui"
+      }
+    },
+    {
+      "name": "hook_outcome_bogus_action",
+      "$schema_ref": "methods/hook.schema.json#/$defs/HookOutcome",
+      "instance": { "action": "bogus" }
+    },
+    {
+      "name": "tool_execute_params_missing_call_id",
+      "$schema_ref": "methods/tool-execute.schema.json#/$defs/Params",
+      "instance": {
+        "tool": "say",
+        "arguments": { "phrase": "hello" },
+        "context": { "token": "epoch-7", "tier": "command" }
+      }
+    },
+    {
+      "name": "frame_wrong_jsonrpc_version",
+      "$schema_ref": "methods/envelope.schema.json#/$defs/Request",
+      "instance": { "jsonrpc": "1.0", "id": 1, "method": "ping", "params": {} }
+    },
+    {
+      "name": "hook_outcome_modify_missing_patch",
+      "$schema_ref": "methods/hook.schema.json#/$defs/HookOutcome",
+      "instance": { "action": "modify" }
+    },
+    {
+      "name": "envelope_request_missing_method",
+      "$schema_ref": "methods/envelope.schema.json#/$defs/Request",
+      "instance": { "jsonrpc": "2.0", "id": 1, "params": {} }
+    }
+  ]
+}
