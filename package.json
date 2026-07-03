@@ -20,7 +20,7 @@
         "rust:clippy": "cd rust && cargo clippy --workspace --all-targets -- -D warnings",
         "rust:test": "cd rust && cargo test --workspace",
         "changeset": "changeset",
-        "ci:publish": "changeset publish"
+        "ci:publish": "pnpm --filter @smooai/smooth-operator-core build && changeset publish"
     },
     "devDependencies": {
         "@changesets/cli": "^2.27.10"
