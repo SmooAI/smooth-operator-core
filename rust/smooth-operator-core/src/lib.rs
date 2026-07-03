@@ -35,7 +35,7 @@ pub use checkpoint::{Checkpoint, CheckpointStore, MemoryCheckpointStore};
 pub use conversation::{CompactionResult, CompactionStrategy, Conversation, Message, Role};
 pub use cost::{BudgetExceeded, CostBudget, CostEntry, CostTracker, ModelPricing};
 pub use executor::{AgentExecutor, InProcessExecutor};
-pub use extension::{ExtensionHost, ExtensionManifest, ExtensionTool, FoldedHook, HookType, HostDelegate};
+pub use extension::{ExtensionHost, ExtensionLlmProvider, ExtensionManifest, ExtensionTool, FoldedHook, HookType, HostDelegate, ProviderRegistration};
 pub use human::{human_channel, ConfirmationHook, HumanChannelPair, HumanRequest, HumanResponse};
 pub use knowledge::{Document, DocumentType, InMemoryKnowledge, KnowledgeBase, KnowledgeResult};
 pub use llm::{accumulate_stream_events, LlmClient, LlmConfig, LlmResponse, ResponseFormat, StreamEvent};

@@ -11,16 +11,17 @@
       "session": { "id": "sess-abc123" },
       "mode": "tui",
       "ui_capabilities": ["select", "confirm", "input", "notify", "set_status", "set_widget", "set_title"],
+      "flags": { "plan": true },
       "capabilities_enabled": { "tools": true, "commands": true, "ui": true, "exec": true, "kv": true, "bus": true, "session": true }
     }
   },
 
   "initialize_result": {
     "$schema_ref": "methods/initialize.schema.json#/$defs/Result",
-    "description": "Echo extension's handshake reply: negotiated protocol version, identity, and one registered tool plus one event subscription.",
+    "description": "An extension's handshake reply: negotiated protocol version, identity, a tool, a slash-command, a declared flag, a keyboard shortcut, and event subscriptions.",
     "instance": {
       "protocol_version": 1,
-      "extension": { "name": "echo", "version": "0.1.0" },
+      "extension": { "name": "plan-mode", "version": "0.1.0" },
       "registrations": {
         "tools": [
           {
@@ -29,9 +30,10 @@
             "parameters": { "type": "object", "properties": { "phrase": { "type": "string" } }, "required": ["phrase"] }
           }
         ],
-        "commands": [],
-        "flags": [],
-        "subscriptions": ["turn_start"]
+        "commands": [{ "name": "plan", "description": "Toggle plan mode." }],
+        "flags": ["plan"],
+        "shortcuts": [{ "key": "ctrl+p", "command": "plan", "description": "Toggle plan mode" }],
+        "subscriptions": ["turn_start", "session_start", "session_shutdown"]
       }
     }
   },
@@ -71,23 +73,24 @@
     }
   },
 
+  "event_tool_execution_start": {
+    "$schema_ref": "methods/event.schema.json#/$defs/Params",
+    "description": "A tool_execution_start observe event (pi-aligned name), seq-numbered.",
+    "instance": {
+      "event": "tool_execution_start",
+      "seq": 42,
+      "context": { "token": "epoch-7", "tier": "event" },
+      "payload": { "iteration": 1, "tool": "bash" }
+    }
+  },
+
   "event_events_lost": {
     "$schema_ref": "methods/event.schema.json#/$defs/Params",
-    "description": "The out-of-band events_lost marker delivered after the bounded observe queue shed 12 oldest events. Carries the count and a context but NO seq.",
+    "description": "The out-of-band events_lost marker delivered after the bounded observe queue shed 12 oldest events. It carries the shed count and a context but NO seq — the gap in the surrounding seq run is itself the loss signal.",
     "instance": {
       "event": "events_lost",
       "context": { "token": "epoch-7", "tier": "event" },
       "payload": { "lost": 12 }
-    }
-  },
-
-  "hook_params_tool_result": {
-    "$schema_ref": "methods/hook.schema.json#/$defs/Params",
-    "description": "A tool_result intercept (fail-open): the completed result is offered to the extension before it is pushed to the conversation.",
-    "instance": {
-      "hook": "tool_result",
-      "context": { "token": "epoch-7", "tier": "command" },
-      "input": { "tool": "bash", "arguments": { "command": "ls" }, "content": "total 0\n", "is_error": false }
     }
   },
 
@@ -119,6 +122,22 @@
     "instance": { "action": "modify", "patch": { "tool": "bash", "arguments": { "command": "echo blocked" } } }
   },
 
+  "hook_params_tool_result": {
+    "$schema_ref": "methods/hook.schema.json#/$defs/Params",
+    "description": "A tool_result intercept (fail-open): the completed result is offered to the extension before it is pushed to the conversation.",
+    "instance": {
+      "hook": "tool_result",
+      "context": { "token": "epoch-7", "tier": "command" },
+      "input": { "tool": "bash", "arguments": { "command": "ls" }, "content": "total 0\n", "is_error": false }
+    }
+  },
+
+  "hook_outcome_modify_tool_result": {
+    "$schema_ref": "methods/hook.schema.json#/$defs/HookOutcome",
+    "description": "A tool_result modify that rewrites the content the agent sees (e.g. redaction).",
+    "instance": { "action": "modify", "patch": { "content": "[redacted]", "is_error": false } }
+  },
+
   "tool_execute_params": {
     "$schema_ref": "methods/tool-execute.schema.json#/$defs/Params",
     "description": "Dispatch of the echo extension's `say` tool.",
@@ -136,10 +155,28 @@
     "instance": { "content": "hello", "is_error": false }
   },
 
+  "tool_execute_result_error": {
+    "$schema_ref": "methods/tool-execute.schema.json#/$defs/Result",
+    "description": "A failed tool execution — the host surfaces it as an error tool-result.",
+    "instance": { "content": "unknown tool: nope", "is_error": true }
+  },
+
+  "tool_execute_result_with_details": {
+    "$schema_ref": "methods/tool-execute.schema.json#/$defs/Result",
+    "description": "A tool result carrying structured `details` for UI rendering alongside the LLM-facing content.",
+    "instance": { "content": "3 files changed", "is_error": false, "details": { "files": ["a.ts", "b.ts", "c.ts"] } }
+  },
+
   "tool_update_params": {
     "$schema_ref": "methods/tool-update.schema.json#/$defs/Params",
     "description": "Progress notification for an in-flight tool/execute.",
     "instance": { "call_id": "call-1", "message": "working...", "progress": 0.5 }
+  },
+
+  "tool_update_params_message_only": {
+    "$schema_ref": "methods/tool-update.schema.json#/$defs/Params",
+    "description": "A progress notification with only a message (no fractional progress) — the minimal tool/update.",
+    "instance": { "call_id": "call-1", "message": "started" }
   },
 
   "cancel_params": {
@@ -201,8 +238,32 @@
 
   "session_send_message_params": {
     "$schema_ref": "methods/session.schema.json#/$defs/SendMessageParams",
-    "description": "Extension posting an assistant message into the session.",
-    "instance": { "text": "Done processing.", "role": "assistant" }
+    "description": "Extension posting an assistant message into the session. Carries the command-tier context so the host can validate the tier + epoch.",
+    "instance": { "context": { "token": "epoch-7", "tier": "command" }, "text": "Done processing.", "role": "assistant" }
+  },
+
+  "session_send_user_message_params": {
+    "$schema_ref": "methods/session.schema.json#/$defs/SendUserMessageParams",
+    "description": "Extension delivering a user message that steers the in-flight turn.",
+    "instance": { "context": { "token": "epoch-7", "tier": "command" }, "text": "Actually, focus on the tests first.", "deliver_as": "steer" }
+  },
+
+  "session_append_entry_params": {
+    "$schema_ref": "methods/session.schema.json#/$defs/AppendEntryParams",
+    "description": "Extension appending an LLM-invisible transcript entry (persisted, not sent to the model).",
+    "instance": { "context": { "token": "epoch-7", "tier": "command" }, "entry": { "kind": "plan_mode", "enabled": true } }
+  },
+
+  "command_complete_params": {
+    "$schema_ref": "methods/command-complete.schema.json#/$defs/Params",
+    "description": "Host asking the owning extension for argument completions on a partial slash-command.",
+    "instance": { "command": "plan", "context": { "token": "epoch-7", "tier": "command" }, "partial": "on" }
+  },
+
+  "command_complete_result": {
+    "$schema_ref": "methods/command-complete.schema.json#/$defs/Result",
+    "description": "Two argument completions offered by the extension.",
+    "instance": { "completions": [{ "value": "on", "description": "enable plan mode" }, { "value": "off", "description": "disable plan mode" }] }
   },
 
   "session_state_result": {
@@ -244,6 +305,54 @@
     "$schema_ref": "methods/ui-request.schema.json#/$defs/Result",
     "description": "Reply to a confirm-kind UI request.",
     "instance": { "confirmed": true }
+  },
+
+  "ui_request_input_params": {
+    "$schema_ref": "methods/ui-request.schema.json#/$defs/Params",
+    "description": "An input-kind UI request with a default value.",
+    "instance": { "kind": "input", "prompt": "Branch name?", "default": "main" }
+  },
+
+  "ui_request_notify_params": {
+    "$schema_ref": "methods/ui-request.schema.json#/$defs/Params",
+    "description": "A notify-kind UI request at warn level.",
+    "instance": { "kind": "notify", "message": "Build finished with warnings", "level": "warn" }
+  },
+
+  "ui_request_set_status_params": {
+    "$schema_ref": "methods/ui-request.schema.json#/$defs/Params",
+    "description": "A set_status-kind UI request.",
+    "instance": { "kind": "set_status", "status": "indexing…" }
+  },
+
+  "ui_request_set_widget_params": {
+    "$schema_ref": "methods/ui-request.schema.json#/$defs/Params",
+    "description": "A set_widget-kind UI request carrying a keyvalue render block.",
+    "instance": { "kind": "set_widget", "widget": { "kind": "keyvalue", "title": "Todos", "rows": [{ "key": "1", "value": "○ ship phase 3" }], "text": "1. [ ] ship phase 3" } }
+  },
+
+  "ui_request_set_title_params": {
+    "$schema_ref": "methods/ui-request.schema.json#/$defs/Params",
+    "description": "A set_title-kind UI request.",
+    "instance": { "kind": "set_title", "title": "todo — 3 open" }
+  },
+
+  "ui_request_result_select": {
+    "$schema_ref": "methods/ui-request.schema.json#/$defs/Result",
+    "description": "Reply to a select-kind UI request.",
+    "instance": { "value": "main" }
+  },
+
+  "ui_request_result_input": {
+    "$schema_ref": "methods/ui-request.schema.json#/$defs/Result",
+    "description": "Reply to an input-kind UI request.",
+    "instance": { "text": "feature-x" }
+  },
+
+  "ui_request_result_cancelled": {
+    "$schema_ref": "methods/ui-request.schema.json#/$defs/Result",
+    "description": "The user dismissed the UI without answering.",
+    "instance": { "cancelled": true }
   },
 
   "kv_get_params": {
@@ -336,6 +445,97 @@
     "instance": { "jsonrpc": "2.0", "id": 7, "error": { "code": -32800, "message": "cancelled" } }
   },
 
+  "registrations_with_provider": {
+    "$schema_ref": "methods/initialize.schema.json#/$defs/Registrations",
+    "description": "An extension that contributes an LLM provider (Phase 7).",
+    "instance": {
+      "providers": [
+        {
+          "name": "corporate-proxy",
+          "base_url": "https://llm.internal.example/v1",
+          "api_key_env": "CORP_LLM_KEY",
+          "oauth": true,
+          "models": [
+            { "id": "corp-gpt-4o", "display_name": "Corporate GPT-4o" },
+            { "id": "corp-fast" }
+          ]
+        }
+      ]
+    }
+  },
+
+  "provider_complete_params": {
+    "$schema_ref": "methods/provider.schema.json#/$defs/CompleteParams",
+    "description": "Host asks the extension to run a streaming completion; request_id keys the delta stream.",
+    "instance": {
+      "request_id": "req-abc123",
+      "provider": "corporate-proxy",
+      "model": "corp-gpt-4o",
+      "messages": [{ "role": "user", "content": "hello" }],
+      "tools": [{ "name": "search", "description": "search the web", "parameters": { "type": "object" } }],
+      "stream": true,
+      "thinking": "high",
+      "context": { "token": "epoch-7", "tier": "command" }
+    }
+  },
+
+  "provider_complete_result": {
+    "$schema_ref": "methods/provider.schema.json#/$defs/CompleteResult",
+    "description": "The final reply to provider/complete, mapping onto the host's LlmResponse.",
+    "instance": {
+      "content": "Hello there.",
+      "finish_reason": "stop",
+      "usage": { "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13 },
+      "resolved_model": "corp-gpt-4o-2026"
+    }
+  },
+
+  "provider_complete_result_tool_calls": {
+    "$schema_ref": "methods/provider.schema.json#/$defs/CompleteResult",
+    "description": "A completion that requested a tool call.",
+    "instance": {
+      "content": "",
+      "tool_calls": [{ "id": "call_1", "name": "get_weather", "arguments": { "city": "SF" } }],
+      "finish_reason": "tool_calls",
+      "usage": { "prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28 }
+    }
+  },
+
+  "provider_delta_params": {
+    "$schema_ref": "methods/provider.schema.json#/$defs/DeltaParams",
+    "description": "One streamed chunk: a serialized host StreamEvent keyed by request_id.",
+    "instance": { "request_id": "req-abc123", "event": { "type": "Delta", "content": "Hel" } }
+  },
+
+  "provider_oauth_login_params": {
+    "$schema_ref": "methods/provider.schema.json#/$defs/OAuthParams",
+    "description": "Host asks the extension to run the OAuth login handshake for a provider.",
+    "instance": { "provider": "corporate-proxy", "context": { "token": "epoch-7", "tier": "command" } }
+  },
+
+  "provider_oauth_refresh_params": {
+    "$schema_ref": "methods/provider.schema.json#/$defs/OAuthParams",
+    "description": "Host asks the extension to refresh credentials, presenting the current refresh token.",
+    "instance": { "provider": "corporate-proxy", "refresh_token": "rt-xyz", "context": { "token": "epoch-7", "tier": "command" } }
+  },
+
+  "provider_credentials": {
+    "$schema_ref": "methods/provider.schema.json#/$defs/Credentials",
+    "description": "Credentials the extension's OAuth handshake produced.",
+    "instance": { "api_key": "sk-corp-abc", "refresh_token": "rt-xyz", "expires_at": 1900000000 }
+  },
+
+  "session_set_model_params_provider": {
+    "$schema_ref": "methods/session.schema.json#/$defs/SetModelParams",
+    "description": "Switch to an extension-registered provider's model with a thinking level (Phase 7).",
+    "instance": {
+      "context": { "token": "epoch-7", "tier": "command" },
+      "model": "corp-gpt-4o",
+      "provider": "corporate-proxy",
+      "thinking": "medium"
+    }
+  },
+
   "$invalid": [
     {
       "name": "initialize_params_missing_protocol_version",
@@ -361,6 +561,16 @@
       }
     },
     {
+      "name": "tool_execute_result_missing_content",
+      "$schema_ref": "methods/tool-execute.schema.json#/$defs/Result",
+      "instance": { "is_error": true }
+    },
+    {
+      "name": "tool_update_progress_out_of_range",
+      "$schema_ref": "methods/tool-update.schema.json#/$defs/Params",
+      "instance": { "call_id": "call-1", "progress": 1.5 }
+    },
+    {
       "name": "frame_wrong_jsonrpc_version",
       "$schema_ref": "methods/envelope.schema.json#/$defs/Request",
       "instance": { "jsonrpc": "1.0", "id": 1, "method": "ping", "params": {} }
@@ -374,6 +584,56 @@
       "name": "envelope_request_missing_method",
       "$schema_ref": "methods/envelope.schema.json#/$defs/Request",
       "instance": { "jsonrpc": "2.0", "id": 1, "params": {} }
+    },
+    {
+      "name": "ui_request_unknown_kind",
+      "$schema_ref": "methods/ui-request.schema.json#/$defs/Params",
+      "instance": { "kind": "toast", "message": "hi" }
+    },
+    {
+      "name": "ui_request_select_missing_options",
+      "$schema_ref": "methods/ui-request.schema.json#/$defs/Params",
+      "instance": { "kind": "select", "prompt": "Pick one" }
+    },
+    {
+      "name": "ui_request_notify_missing_message",
+      "$schema_ref": "methods/ui-request.schema.json#/$defs/Params",
+      "instance": { "kind": "notify", "level": "info" }
+    },
+    {
+      "name": "ui_request_confirm_extra_property",
+      "$schema_ref": "methods/ui-request.schema.json#/$defs/Params",
+      "instance": { "kind": "confirm", "prompt": "Sure?", "options": ["yes", "no"] }
+    },
+    {
+      "name": "session_send_message_missing_context",
+      "$schema_ref": "methods/session.schema.json#/$defs/SendMessageParams",
+      "instance": { "text": "no context — the tier/epoch guard field is required" }
+    },
+    {
+      "name": "command_complete_result_completion_missing_value",
+      "$schema_ref": "methods/command-complete.schema.json#/$defs/Result",
+      "instance": { "completions": [{ "description": "missing the required value" }] }
+    },
+    {
+      "name": "provider_complete_params_missing_request_id",
+      "$schema_ref": "methods/provider.schema.json#/$defs/CompleteParams",
+      "instance": { "provider": "corporate-proxy", "model": "corp-gpt-4o", "messages": [] }
+    },
+    {
+      "name": "provider_delta_missing_event",
+      "$schema_ref": "methods/provider.schema.json#/$defs/DeltaParams",
+      "instance": { "request_id": "req-abc123" }
+    },
+    {
+      "name": "provider_registration_missing_name",
+      "$schema_ref": "methods/initialize.schema.json#/$defs/ProviderRegistration",
+      "instance": { "base_url": "https://x/v1", "models": [{ "id": "m" }] }
+    },
+    {
+      "name": "provider_model_missing_id",
+      "$schema_ref": "methods/initialize.schema.json#/$defs/ProviderModel",
+      "instance": { "display_name": "No id" }
     }
   ]
 }

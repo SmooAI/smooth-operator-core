@@ -13,6 +13,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::llm::Usage;
+use crate::tool::ToolCall;
+
 /// JSON-RPC error codes. Standard range plus the SEP extensions documented in
 /// `spec/extension/envelope.md`.
 pub mod codes {
@@ -272,6 +275,153 @@ pub struct Registrations {
     pub shortcuts: Vec<ShortcutRegistration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subscriptions: Vec<String>,
+    /// LLM providers the extension contributes to the host's model surface
+    /// (Phase 7). Declarative: name + endpoint + models; the host proxies
+    /// `provider/complete` back to the extension at the [`crate::llm_provider::LlmProvider`]
+    /// seam. Also carried on `registry/update` for runtime registration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ProviderRegistration>,
+}
+
+// ---------------------------------------------------------------------------
+// provider registration (Phase 7)
+// ---------------------------------------------------------------------------
+
+/// One model an extension-registered provider exposes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderModel {
+    /// Model id the host passes back in `provider/complete` (`model`).
+    pub id: String,
+    /// Human-facing label for pickers (`th cast models`, model pickers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// A provider an extension contributes. Declarative — the extension owns the
+/// actual request/stream, reached over `provider/complete`; these fields let the
+/// host present the provider in its model surface and mediate auth.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderRegistration {
+    /// Provider name, unique within the host's merged surface (`<ext>` namespacing
+    /// is applied by the host, mirroring the tool `<ext>.<tool>` convention).
+    pub name: String,
+    /// Informational upstream base URL (the extension does the real call; the host
+    /// surfaces this for diagnostics). `None` when the extension keeps it private.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Env var the extension reads its API key from. Purely informational to the
+    /// host (the extension resolves it in its own process). `None` for OAuth-only
+    /// providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Whether the extension implements `provider/oauth_login` + `oauth_refresh`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub oauth: bool,
+    /// The models this provider exposes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ProviderModel>,
+}
+
+// ---------------------------------------------------------------------------
+// provider/complete + provider/delta (host↔ext, proxied streaming)
+// ---------------------------------------------------------------------------
+
+/// Host→ext `provider/complete` request: run one LLM completion through the
+/// extension. `messages`/`tools` are opaque JSON — the serialized engine
+/// [`Message`](crate::conversation::Message)/[`ToolSchema`](crate::tool::ToolSchema)
+/// (the engine is the single source of truth for their shape). When `stream` is
+/// true the extension emits `provider/delta` notifications keyed by `request_id`
+/// while it works, then replies with the final [`ProviderCompleteResult`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderCompleteParams {
+    /// Correlates the `provider/delta` notification stream with this request.
+    pub request_id: String,
+    /// The registered provider name (bare, as the extension declared it).
+    pub provider: String,
+    /// Model id within the provider.
+    pub model: String,
+    /// Serialized conversation messages (engine `Message` shape).
+    pub messages: Vec<serde_json::Value>,
+    /// Serialized tool schemas offered to the model (engine `ToolSchema` shape).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<serde_json::Value>,
+    /// Ask the extension to stream `provider/delta` notifications.
+    #[serde(default)]
+    pub stream: bool,
+    /// Structured-output JSON-schema response format, if constrained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
+    /// Reasoning/thinking level for reasoning-capable models (e.g. `off`, `low`,
+    /// `medium`, `high`, or a provider-specific token). `None` = provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+}
+
+/// The final reply to a `provider/complete` request. Maps directly onto the
+/// engine's [`LlmResponse`](crate::llm::LlmResponse).
+// No `PartialEq`: `ToolCall`/`Usage` don't implement it. Tests compare fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderCompleteResult {
+    #[serde(default)]
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default = "default_finish_reason")]
+    pub finish_reason: String,
+    #[serde(default)]
+    pub usage: Usage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
+}
+
+fn default_finish_reason() -> String {
+    "stop".to_string()
+}
+
+/// Ext→host `provider/delta` notification: one streaming chunk for an in-flight
+/// `provider/complete`, keyed by `request_id`. `event` is a serialized engine
+/// [`StreamEvent`](crate::llm::StreamEvent) (`{"type":"Delta","content":"…"}` …).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderDeltaParams {
+    pub request_id: String,
+    pub event: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// provider/oauth_login + provider/oauth_refresh (host→ext, request)
+// ---------------------------------------------------------------------------
+
+/// Host→ext `provider/oauth_login` / `provider/oauth_refresh` request. The
+/// extension runs the auth handshake, driving any user interaction (open URL,
+/// prompt for a code) back through the existing `ui/*` surface, and returns the
+/// resulting [`ProviderCredentials`]. `refresh_token` is set only on refresh.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderOAuthParams {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+}
+
+/// Credentials an extension's OAuth handshake produced. Opaque to the host beyond
+/// persistence — the extension consumes them on subsequent `provider/complete`
+/// calls. Every field optional so an api-key exchange and a full OAuth bundle
+/// both fit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProviderCredentials {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// Absolute expiry, unix seconds. `None` = non-expiring / unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// Provider-specific extras (scopes, token_type, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -467,6 +617,23 @@ pub struct SessionAppendEntryParams {
     pub entry: serde_json::Value,
 }
 
+/// `session/set_model` (Phase 7): switch the active model, optionally to an
+/// extension-registered provider, and optionally set a reasoning/thinking level.
+/// Command-tier + current-epoch, like every session action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionSetModelParams {
+    pub context: Context,
+    /// Model id to switch to.
+    pub model: String,
+    /// Provider name when the model belongs to an extension-registered provider.
+    /// `None` selects the model on the host's default/native provider surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Reasoning/thinking level (see [`ProviderCompleteParams::thinking`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+}
+
 /// SEP method names, centralized so the host and tests never spell one wrong.
 pub mod method {
     pub const INITIALIZE: &str = "initialize";
@@ -488,6 +655,12 @@ pub mod method {
     pub const SESSION_SEND_MESSAGE: &str = "session/send_message";
     pub const SESSION_SEND_USER_MESSAGE: &str = "session/send_user_message";
     pub const SESSION_APPEND_ENTRY: &str = "session/append_entry";
+    pub const SESSION_SET_MODEL: &str = "session/set_model";
+    // provider/* (Phase 7)
+    pub const PROVIDER_COMPLETE: &str = "provider/complete";
+    pub const PROVIDER_DELTA: &str = "provider/delta";
+    pub const PROVIDER_OAUTH_LOGIN: &str = "provider/oauth_login";
+    pub const PROVIDER_OAUTH_REFRESH: &str = "provider/oauth_refresh";
 }
 
 #[cfg(test)]
@@ -651,5 +824,109 @@ mod tests {
     fn rpc_error_is_std_error() {
         let e = RpcError::new(codes::NO_UI, "headless");
         assert_eq!(e.to_string(), "JSON-RPC error -32001: headless");
+    }
+
+    // -------- Phase 7: provider registration + proxied streaming + set_model --
+
+    #[test]
+    fn provider_registration_roundtrips_in_registrations() {
+        let regs = Registrations {
+            providers: vec![ProviderRegistration {
+                name: "corporate-proxy".into(),
+                base_url: Some("https://llm.internal.example/v1".into()),
+                api_key_env: Some("CORP_LLM_KEY".into()),
+                oauth: true,
+                models: vec![
+                    ProviderModel {
+                        id: "corp-gpt-4o".into(),
+                        display_name: Some("Corporate GPT-4o".into()),
+                    },
+                    ProviderModel {
+                        id: "corp-fast".into(),
+                        display_name: None,
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        assert_eq!(roundtrip(&regs), regs);
+    }
+
+    #[test]
+    fn provider_registration_omits_defaults_on_the_wire() {
+        // A minimal provider (no base_url/api_key_env, oauth=false) serializes lean.
+        let p = ProviderRegistration {
+            name: "p".into(),
+            base_url: None,
+            api_key_env: None,
+            oauth: false,
+            models: vec![],
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(!s.contains("oauth"), "false oauth must be omitted: {s}");
+        assert!(!s.contains("base_url"), "{s}");
+        assert!(!s.contains("models"), "empty models omitted: {s}");
+    }
+
+    #[test]
+    fn provider_complete_params_roundtrip() {
+        let p = ProviderCompleteParams {
+            request_id: "req-1".into(),
+            provider: "corporate-proxy".into(),
+            model: "corp-gpt-4o".into(),
+            messages: vec![json!({"role": "user", "content": "hi"})],
+            tools: vec![json!({"name": "search", "description": "", "parameters": {}})],
+            stream: true,
+            response_format: Some(json!({"type": "json_schema"})),
+            thinking: Some("high".into()),
+        };
+        assert_eq!(roundtrip(&p), p);
+    }
+
+    #[test]
+    fn provider_complete_result_deserializes_with_defaults() {
+        // Only `content` present → finish_reason defaults to "stop", usage default.
+        let r: ProviderCompleteResult = serde_json::from_value(json!({"content": "hello"})).unwrap();
+        assert_eq!(r.content, "hello");
+        assert_eq!(r.finish_reason, "stop");
+        assert!(r.tool_calls.is_empty());
+        assert_eq!(r.usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn provider_delta_params_roundtrip() {
+        let d = ProviderDeltaParams {
+            request_id: "req-1".into(),
+            event: json!({"type": "Delta", "content": "hel"}),
+        };
+        assert_eq!(roundtrip(&d), d);
+    }
+
+    #[test]
+    fn provider_credentials_all_optional() {
+        // Empty credentials serialize to `{}` — every field is skip-if-none.
+        let empty = ProviderCredentials::default();
+        assert_eq!(serde_json::to_value(&empty).unwrap(), json!({}));
+        let full = ProviderCredentials {
+            api_key: Some("sk-x".into()),
+            refresh_token: Some("rt".into()),
+            expires_at: Some(1_800_000_000),
+            ..Default::default()
+        };
+        assert_eq!(roundtrip(&full), full);
+    }
+
+    #[test]
+    fn session_set_model_params_roundtrip() {
+        let p = SessionSetModelParams {
+            context: Context {
+                token: "epoch-1".into(),
+                tier: Tier::Command,
+            },
+            model: "corp-gpt-4o".into(),
+            provider: Some("corporate-proxy".into()),
+            thinking: Some("medium".into()),
+        };
+        assert_eq!(roundtrip(&p), p);
     }
 }

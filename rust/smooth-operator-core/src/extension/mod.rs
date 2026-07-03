@@ -20,15 +20,17 @@ pub mod host;
 pub mod manifest;
 pub mod process;
 pub mod protocol;
+pub mod provider_proxy;
 pub mod tool_proxy;
 
 pub use host::{fold_hook_chain, DefaultHostDelegate, ExtensionHost, FoldedHook, HookStep, HookType, HostDelegate, PROTOCOL_VERSION};
 pub use manifest::{discover, Capabilities, DiscoveredExtension, ExtensionManifest, Resources, RunSpec, Scope};
 pub use process::{backoff_for, DefaultInboundHandler, ExtensionProcess, InboundHandler, SpawnSpec, PING_IDLE, RESTART_BACKOFFS};
 pub use protocol::{
-    CommandCompleteResult, CommandExecuteResult, CommandRegistration, Completion, Context, DeliverAs, HookOutcome, Message, RpcError, ShortcutRegistration,
-    Tier,
+    CommandCompleteResult, CommandExecuteResult, CommandRegistration, Completion, Context, DeliverAs, HookOutcome, Message, ProviderCompleteParams,
+    ProviderCompleteResult, ProviderCredentials, ProviderModel, ProviderRegistration, RpcError, SessionSetModelParams, ShortcutRegistration, Tier,
 };
+pub use provider_proxy::{ExtensionLlmProvider, ProviderStreams};
 pub use tool_proxy::ExtensionTool;
 
 /// Canonical SEP event names the host dispatches to subscribed extensions.
@@ -51,4 +53,7 @@ pub mod events {
     pub const TOOL_EXECUTION_END: &str = "tool_execution_end";
     /// Delivered when the bounded observe queue shed events. Carries `{lost: N}`.
     pub const EVENTS_LOST: &str = "events_lost";
+    /// Emitted when the active model changes (Phase 7 `session/set_model`).
+    /// Carries `{model, provider?, thinking?}`.
+    pub const MODEL_SELECT: &str = "model_select";
 }
