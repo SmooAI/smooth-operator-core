@@ -1,5 +1,66 @@
 # @smooai/smooth-operator-core
 
+## 0.7.0
+
+### Minor Changes
+
+- e5d1068: SEP host — port the ExtensionHost to the Python engine core.
+
+  The Smooth Extension Protocol host existed only in Rust; the Python engine now has
+  a faithful asyncio sibling under `smooth_operator_core.extension`, so a Python host
+  (the operator server, the daemon) can host `extension.toml` extensions. Purely
+  additive — nothing runs unless a caller builds an `ExtensionHost`.
+
+  - **protocol** — JSON-RPC 2.0 ndjson frames + typed method params/results
+    (`Message`, `HookOutcome`, `InitializeParams/Result`, `ToolExecuteParams/Result`,
+    `EventParams`, …). Replays the shared `spec/extension/conformance/fixtures.json`
+    green (round-trips valid instances, rejects the `$invalid` set).
+  - **manifest** — `extension.toml` discovery, global (`~/.smooth/extensions`) +
+    project (`.smooth/extensions`) merge with project-wins, and `${env:VAR}` expansion.
+  - **process** — one subprocess per extension: asyncio ndjson codec, pending-futures
+    map, generation-guarded in-place restart, a reliable control lane over a bounded,
+    lossy observe lane (sheds oldest + emits an out-of-band `events_lost` marker),
+    `$/cancel` on timeout/cancellation, and `ping` health.
+  - **host** — hook chaining in load order (`fold_hook_chain`: continue/modify/block,
+    per-class timeouts — `tool_call`/`user_bash` 60s fail-CLOSED, others 5s fail-open),
+    non-blocking event fanout, ext-tool proxies (`ExtensionTool`, dotted
+    `<ext>.<tool>`), the `HostDelegate` seam (headless defaults: NoUI, JSON-file kv,
+    exec denied, session actions unavailable), and the command-tier + epoch deadlock
+    guard for session-mutating ext→host actions.
+
+  Exhaustively unit-tested (fold policy, context guard, delegate defaults), plus a
+  live-subprocess suite and an integration test driving a real echo peer through the
+  host (tool proxy + `enabled_tools` filtering parity).
+
+- 46fbbea: SEP Phase 7 (engine) — registerProvider: declarative provider registration,
+  OAuth round-trips, proxied streaming, and `session/set_model`.
+
+  Extensions can now contribute LLM providers to the host. The engine gains:
+
+  - **Declarative provider registration** — `ProviderRegistration` (name, base_url,
+    api_key_env, oauth flag, models) rides the `initialize` handshake registrations
+    and `registry/update`. `ExtensionHost::providers()` surfaces the merged set so a
+    host can present extension providers in its model surface.
+  - **Proxied streaming** — `ExtensionLlmProvider` implements the engine's
+    `LlmProvider` trait, so an extension-registered provider is a drop-in for the
+    native `LlmClient` at the agent-loop seam. The host sends `provider/complete`;
+    the extension streams `provider/delta` notifications (serialized `StreamEvent`s)
+    keyed by a `request_id`, then replies with the final result. Deltas are routed
+    by a shared `ProviderStreams` registry and terminated cleanly when the request
+    resolves; ordering (deltas before the terminal `Done`) rides the process's
+    single ordered reader.
+  - **OAuth round-trips** — `ExtensionHost::provider_oauth_login` /
+    `provider_oauth_refresh` send `provider/oauth_login` / `provider/oauth_refresh`
+    to the owning extension, which drives any user interaction back over the
+    existing `ui/*` surface and returns a `ProviderCredentials` bundle.
+  - **`session/set_model`** — a new tier-guarded (command-tier + current-epoch)
+    `HostDelegate::session_set_model`, carrying an optional `provider` and
+    `thinking` level, so an extension can switch the active model to an
+    extension-registered provider/model. Plus a `model_select` SEP event name.
+
+  Additive: nothing runs unless a host attaches an `ExtensionHost`. The reference
+  `sep-echo-peer` gains a `SEP_ECHO_PROVIDER` mode exercising the whole path live.
+
 ## 0.6.0
 
 ### Minor Changes
