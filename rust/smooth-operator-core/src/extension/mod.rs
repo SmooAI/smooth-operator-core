@@ -56,4 +56,14 @@ pub mod events {
     /// Emitted when the active model changes (Phase 7 `session/set_model`).
     /// Carries `{model, provider?, thinking?}`.
     pub const MODEL_SELECT: &str = "model_select";
+    /// Inter-extension bus fanout (Phase 8): the host re-emits an extension's
+    /// `bus/publish` to every *other* extension subscribed to this event.
+    /// Carries `{from, topic, payload}`. Subscribe via `[capabilities] events`.
+    pub const BUS_EVENT: &str = "bus/event";
+    /// Targeted host→ext keypress for render-block v2 interactive widgets
+    /// (Phase 8). Unlike the fanout events above this is sent to a single
+    /// extension (the active widget's owner) via
+    /// [`ExtensionHost::dispatch_widget_key`](crate::extension::ExtensionHost::dispatch_widget_key),
+    /// bypassing the subscription filter. Carries `{widget_id?, key}`.
+    pub const WIDGET_KEY: &str = "widget/key";
 }

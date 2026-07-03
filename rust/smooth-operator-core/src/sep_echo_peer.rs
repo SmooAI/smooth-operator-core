@@ -20,6 +20,16 @@
 //!   `initialize`, waits for the host's reply, and returns `confirmed=<…>` as
 //!   the tool content. Exercises the ui/request seam and proves ui_capabilities
 //!   threading end-to-end (answered value or `error:-32001` when headless).
+//!
+//! Phase 8 modes:
+//! - `SEP_ECHO_SYSPROMPT=1` — the `before_agent_start` hook rewrites the system
+//!   prompt to `REWRITTEN BY ECHO` (declares the `before_agent_start` hook).
+//! - `SEP_ECHO_CTX=1` — the `context` hook replaces the whole message array with
+//!   a single user message `CONTEXT REPLACED` (declares the `context` hook).
+//! - `SEP_ECHO_BUS_PUB=1` — `tool/execute` sends a `bus/publish` (topic `ping`)
+//!   before replying, driving the inter-extension bus.
+//! - `SEP_ECHO_BUS_SUB=1` — subscribes to `bus/event` and, on receipt, records
+//!   the topic via `kv/set(bus_seen, <topic>)` so a test can observe the fanout.
 
 use std::io::{BufRead, Write};
 
@@ -55,15 +65,39 @@ fn main() {
             continue;
         };
 
+        // A frame with an id but no method is the host's *response* to one of our
+        // fire-and-forget ext→host requests (kv/set, bus/publish). Ignore it —
+        // the request sites that need a reply read it inline (UI mode).
+        if msg.get("method").is_none() {
+            continue;
+        }
+
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
-        // Notifications (no id). `$/cancel` releases a held tool/execute.
+        // Notifications (no id). `$/cancel` releases a held tool/execute;
+        // `bus/event` (Phase 8) is the inter-extension bus fanout.
         let Some(id) = msg.get("id").cloned() else {
             if method == "$/cancel" {
                 if let Some(held) = held_tool_call.take() {
                     write_frame(&mut out, &error(&held, -32800, "cancelled"));
                 }
+            } else if method == "event" && params.get("event").and_then(Value::as_str) == Some("bus/event") {
+                // Observe envelope: params = { event, seq, context, payload }.
+                // The bus payload is { from, topic, payload }.
+                let topic = params.get("payload").and_then(|p| p.get("topic")).and_then(Value::as_str).unwrap_or("");
+                write_frame(
+                    &mut out,
+                    &json!({ "jsonrpc": "2.0", "id": 7002, "method": "kv/set", "params": { "key": "bus_seen", "value": topic } }),
+                );
+            } else if method == "event" && params.get("event").and_then(Value::as_str) == Some("widget/key") {
+                // Phase 8: a targeted host→ext render-block v2 keypress. Record
+                // the key so a test can prove targeted routing (no subscription).
+                let key = params.get("payload").and_then(|p| p.get("key")).and_then(Value::as_str).unwrap_or("");
+                write_frame(
+                    &mut out,
+                    &json!({ "jsonrpc": "2.0", "id": 7003, "method": "kv/set", "params": { "key": "widget_key", "value": key } }),
+                );
             }
             continue;
         };
@@ -73,6 +107,26 @@ fn main() {
                 let their_version = params.get("protocol_version").and_then(Value::as_u64).unwrap_or(1);
                 if let Some(caps) = params.get("ui_capabilities").and_then(Value::as_array) {
                     ui_caps = caps.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                }
+                // Declare the intercept hooks this mode handles so the host's
+                // `any_hook` gate is exact (Phase 8). An undeclared/empty list
+                // means "unknown" and the host runs every hook to be safe.
+                let mut hooks: Vec<&str> = Vec::new();
+                if std::env::var("SEP_ECHO_BLOCK").is_ok() || std::env::var("SEP_ECHO_HANG").is_ok() {
+                    hooks.push("tool_call");
+                }
+                if std::env::var("SEP_ECHO_PATCH").is_ok() {
+                    hooks.push("tool_result");
+                }
+                if std::env::var("SEP_ECHO_SYSPROMPT").is_ok() {
+                    hooks.push("before_agent_start");
+                }
+                if std::env::var("SEP_ECHO_CTX").is_ok() {
+                    hooks.push("context");
+                }
+                let mut subs = vec!["turn_start", "turn_end", "message_end", "session_start", "session_shutdown"];
+                if std::env::var("SEP_ECHO_BUS_SUB").is_ok() {
+                    subs.push("bus/event");
                 }
                 success(
                     &id,
@@ -96,7 +150,11 @@ fn main() {
                                     "models": [{ "id": "echo-1", "display_name": "Echo One" }]
                                 }])
                             } else { json!([]) },
-                            "subscriptions": ["turn_start", "turn_end", "message_end", "session_start", "session_shutdown"]
+                            "message_renderers": if std::env::var("SEP_ECHO_RENDERER").is_ok() {
+                                json!([{ "tag": "echo_card", "template": { "kind": "markdown", "text": "**{{title}}**" } }])
+                            } else { json!([]) },
+                            "hooks": hooks,
+                            "subscriptions": subs
                         }
                     }),
                 )
@@ -118,6 +176,15 @@ fn main() {
             // `SEP_ECHO_BLOCK=1` turns the peer into a veto gate — used by the
             // host's tool_call-layering test.
             "hook" if std::env::var("SEP_ECHO_BLOCK").is_ok() => success(&id, json!({ "action": "block", "reason": "blocked by echo peer" })),
+            // Phase 8: `before_agent_start` rewrites the system prompt.
+            "hook" if std::env::var("SEP_ECHO_SYSPROMPT").is_ok() && params.get("hook").and_then(Value::as_str) == Some("before_agent_start") => {
+                success(&id, json!({ "action": "modify", "patch": { "system_prompt": "REWRITTEN BY ECHO" } }))
+            }
+            // Phase 8: `context` replaces the entire message array.
+            "hook" if std::env::var("SEP_ECHO_CTX").is_ok() && params.get("hook").and_then(Value::as_str) == Some("context") => success(
+                &id,
+                json!({ "action": "modify", "patch": { "messages": [{ "role": "user", "content": "CONTEXT REPLACED" }] } }),
+            ),
             "hook" => success(&id, json!({ "action": "continue" })),
             // UI mode: round-trip a ui/request confirm to the host, echoing the
             // negotiated caps in the prompt, and return the host's answer.
@@ -158,6 +225,14 @@ fn main() {
                 );
                 held_tool_call = Some(id);
                 continue;
+            }
+            // Phase 8: publish onto the inter-extension bus before replying.
+            "tool/execute" if std::env::var("SEP_ECHO_BUS_PUB").is_ok() => {
+                write_frame(
+                    &mut out,
+                    &json!({ "jsonrpc": "2.0", "id": 7001, "method": "bus/publish", "params": { "topic": "ping", "payload": { "n": 1 } } }),
+                );
+                success(&id, json!({ "content": "published" }))
             }
             "tool/execute" => {
                 let phrase = params.get("arguments").and_then(|a| a.get("phrase")).and_then(Value::as_str).unwrap_or("");

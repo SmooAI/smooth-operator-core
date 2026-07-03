@@ -275,12 +275,41 @@ pub struct Registrations {
     pub shortcuts: Vec<ShortcutRegistration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subscriptions: Vec<String>,
+    /// Intercept hooks the extension handles (Phase 8). Unlike `subscriptions`
+    /// (observe events), hooks are awaited request/response the host drives every
+    /// turn — declaring them lets the host skip the per-iteration `context` hook
+    /// (and future gated hooks) when no extension handles it. Backward-compatible:
+    /// an empty list means "unknown" and the host runs the hook to be safe, so a
+    /// pre-Phase-8 extension that hooks `tool_call` still fires (see
+    /// [`ExtensionHost::any_hook`](crate::extension::ExtensionHost::any_hook)).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<String>,
+    /// Declarative message renderers (Phase 8, pi's `registerMessageRenderer`
+    /// analog): a custom message `tag` → render-block template. The host stores
+    /// and surfaces these; `{{path}}` placeholder substitution + rendering are
+    /// frontend-side. Data-only — the engine never interprets the template.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub message_renderers: Vec<MessageRendererRegistration>,
     /// LLM providers the extension contributes to the host's model surface
     /// (Phase 7). Declarative: name + endpoint + models; the host proxies
     /// `provider/complete` back to the extension at the [`crate::llm_provider::LlmProvider`]
     /// seam. Also carried on `registry/update` for runtime registration.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderRegistration>,
+}
+
+/// Maps a custom message tag to a declarative render-block template (Phase 8).
+/// When a session entry carries this `tag`, the frontend renders `template`
+/// (with `{{path}}` placeholders resolved against the entry's `data`) instead
+/// of the raw text. Data-only: the host stores and surfaces these; substitution
+/// and rendering are frontend-side (SDK ships the substitution helper).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MessageRendererRegistration {
+    /// The custom message tag this renderer claims (e.g. `snake_board`).
+    pub tag: String,
+    /// The render-block template — a render-block Value whose string fields may
+    /// contain `{{path}}` placeholders resolved against the message's `data`.
+    pub template: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------

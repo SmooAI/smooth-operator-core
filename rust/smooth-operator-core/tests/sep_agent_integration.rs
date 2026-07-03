@@ -293,3 +293,60 @@ async fn non_blocking_extension_lets_tool_run_and_emits_turn_events() {
     );
     assert_eq!(convo.last_assistant_content(), Some("done"));
 }
+
+/// Phase 8: the `before_agent_start` hook rewrites the system prompt the LLM
+/// sees. The peer declares the hook + returns a Modify patch; the agent applies
+/// it once at run start (composing with, never bypassing, the config prompt).
+#[tokio::test]
+async fn before_agent_start_hook_rewrites_system_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest_ext(tmp.path(), &[("SEP_ECHO_SYSPROMPT", "1")], None);
+    let host = Arc::new(load_host(tmp.path()).await);
+
+    let mock = MockLlmClient::new();
+    mock.push_text("done");
+    let config = AgentConfig::new("t", "ORIGINAL SYSTEM", LlmConfig::openrouter("fake-key"));
+    let agent = Agent::new(config, ToolRegistry::new())
+        .with_llm_provider(Arc::new(mock.clone()))
+        .with_extension_host(host);
+
+    agent.run("go").await.expect("run");
+
+    let calls = mock.calls();
+    let system = calls[0]
+        .messages
+        .iter()
+        .find(|m| matches!(m.role, smooth_operator_core::conversation::Role::System))
+        .expect("a system message");
+    assert_eq!(
+        system.content, "REWRITTEN BY ECHO",
+        "before_agent_start should have rewritten the system prompt"
+    );
+}
+
+/// Phase 8: the `context` hook replaces the entire message array sent to the LLM
+/// for that iteration (pi's `context` middleware). The conversation itself is
+/// untouched — only what the model sees this turn changes.
+#[tokio::test]
+async fn context_hook_replaces_the_message_array() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest_ext(tmp.path(), &[("SEP_ECHO_CTX", "1")], None);
+    let host = Arc::new(load_host(tmp.path()).await);
+
+    let mock = MockLlmClient::new();
+    mock.push_text("done");
+    let config = AgentConfig::new("t", "system", LlmConfig::openrouter("fake-key"));
+    let agent = Agent::new(config, ToolRegistry::new())
+        .with_llm_provider(Arc::new(mock.clone()))
+        .with_extension_host(host);
+
+    agent.run("original user message").await.expect("run");
+
+    let calls = mock.calls();
+    assert_eq!(
+        calls[0].messages.len(),
+        1,
+        "context hook should have collapsed the array to its single replacement"
+    );
+    assert_eq!(calls[0].messages[0].content, "CONTEXT REPLACED");
+}
