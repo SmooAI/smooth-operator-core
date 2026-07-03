@@ -36,6 +36,7 @@ jobs:
               with:
                   node-version: 22
                   cache: 'pnpm'
+                  registry-url: 'https://registry.npmjs.org'
 
             - name: Install dependencies
               run: pnpm install
@@ -50,6 +51,7 @@ jobs:
                   createGithubReleases: true
               env:
                   GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+                  NODE_AUTH_TOKEN: ${{ secrets.SMOOAI_NPM_TOKEN }}
 
             - name: Auto-Merge Changeset PR
               run: |
