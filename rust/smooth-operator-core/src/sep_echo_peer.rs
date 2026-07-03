@@ -79,7 +79,9 @@ fn main() {
                                 "description": "Echo a phrase back.",
                                 "parameters": { "type": "object", "properties": { "phrase": { "type": "string" } }, "required": ["phrase"] }
                             }],
-                            "subscriptions": ["turn_start", "turn_end", "message_end"]
+                            "commands": [{ "name": "echo-cmd", "description": "Echo a slash-command back." }],
+                            "shortcuts": [{ "key": "ctrl+e", "command": "echo-cmd", "description": "Run echo-cmd" }],
+                            "subscriptions": ["turn_start", "turn_end", "message_end", "session_start", "session_shutdown"]
                         }
                     }),
                 )
@@ -145,6 +147,21 @@ fn main() {
             "tool/execute" => {
                 let phrase = params.get("arguments").and_then(|a| a.get("phrase")).and_then(Value::as_str).unwrap_or("");
                 success(&id, json!({ "content": phrase }))
+            }
+            // A command handler echoes its name + args back as content. The
+            // command-tier context arrives in params.context (the host minted it).
+            "command/execute" => {
+                let cmd = params.get("command").and_then(Value::as_str).unwrap_or("");
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                success(&id, json!({ "content": format!("ran {cmd} {args}") }))
+            }
+            // One static completion so the round-trip is observable.
+            "command/complete" => {
+                let partial = params.get("partial").and_then(Value::as_str).unwrap_or("");
+                success(
+                    &id,
+                    json!({ "completions": [{ "value": format!("{partial}-done"), "description": "echo completion" }] }),
+                )
             }
             "shutdown" => {
                 write_frame(&mut out, &success(&id, json!({})));
