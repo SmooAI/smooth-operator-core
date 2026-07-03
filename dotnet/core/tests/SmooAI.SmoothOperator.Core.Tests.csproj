@@ -29,6 +29,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- SEP conformance fixtures (vendored copy of spec/extension/conformance/fixtures.json) + the
+         Node echo peer for the live extension-host tests. Copied next to the test assembly so the
+         tests locate them regardless of the working directory. -->
+    <None Include="sep\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Using Include="Xunit" />
   </ItemGroup>
 
