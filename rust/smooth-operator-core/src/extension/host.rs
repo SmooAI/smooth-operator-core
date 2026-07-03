@@ -170,6 +170,14 @@ pub trait HostDelegate: Send + Sync {
         let _ = (ext, params);
         Err(RpcError::new(codes::NOT_TRUSTED, "exec/run is not permitted on the headless host"))
     }
+
+    /// A `tool/update` progress notification streamed by an extension during an
+    /// in-flight `tool/execute`, keyed by its `call_id`. Fire-and-forget. The
+    /// headless default only traces; a frontend/daemon overrides this to surface
+    /// progress (e.g. emit an [`AgentEvent::ToolCallUpdate`](crate::AgentEvent)).
+    fn tool_update(&self, ext: &str, params: Value) {
+        tracing::trace!(ext = %ext, ?params, "extension: tool/update progress (dropped by headless host)");
+    }
 }
 
 /// The engine's headless delegate: NoUI, JSON-file kv, exec denied.
@@ -232,7 +240,10 @@ impl InboundHandler for HostInbound {
     }
 
     fn handle_notification(&self, method_name: &str, params: Value) {
-        tracing::trace!(ext = %self.ext, method = %method_name, ?params, "ext→host notification");
+        match method_name {
+            method::TOOL_UPDATE => self.delegate.tool_update(&self.ext, params),
+            other => tracing::trace!(ext = %self.ext, method = %other, ?params, "ext→host notification"),
+        }
     }
 }
 

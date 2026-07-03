@@ -560,10 +560,21 @@ impl Agent {
     /// Attach a SEP [`ExtensionHost`](crate::extension::ExtensionHost). Purely
     /// additive: with no host attached (the default) the agent loop is
     /// unchanged. With a host, the agent runs the fail-closed `tool_call` hook
-    /// chain before executing tool calls (extensions may veto), and emits/fans
-    /// out turn events.
+    /// chain before executing tool calls (extensions may veto), emits/fans out
+    /// turn events, AND registers every extension tool into the agent's
+    /// [`ToolRegistry`](crate::ToolRegistry) as an ordinary tool named
+    /// `<extension>.<tool>`. Because they are ordinary registry tools, they are
+    /// visible to the LLM via `schemas()`, dispatched via `execute()`, and
+    /// filtered by the exact same `retain()` mechanism a server uses to enforce
+    /// its per-agent `enabled_tools` allow-list — no special casing anywhere.
     #[must_use]
     pub fn with_extension_host(mut self, host: Arc<crate::extension::ExtensionHost>) -> Self {
+        for tool in host.tools() {
+            self.tools.register_arc(tool);
+        }
+        for tool in host.deferred_tools() {
+            self.tools.register_deferred_arc(tool);
+        }
         self.extension_host = Some(host);
         self
     }
