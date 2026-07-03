@@ -15,7 +15,7 @@
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use smooth_operator_core::extension::protocol::{
-    HookOutcome, InitializeParams, InitializeResult, Message, ToolExecuteParams, ToolExecuteResult, ToolUpdateParams,
+    EventParams, HookOutcome, InitializeParams, InitializeResult, Message, ToolExecuteParams, ToolExecuteResult, ToolUpdateParams,
 };
 
 const FIXTURES: &str = include_str!("sep/fixtures.json");
@@ -70,6 +70,23 @@ fn lifecycle_method_fixtures_roundtrip_into_typed_structs() {
     assert_roundtrip::<HookOutcome>(&instance(&all, "hook_outcome_continue"));
     assert_roundtrip::<HookOutcome>(&instance(&all, "hook_outcome_block"));
     assert_roundtrip::<HookOutcome>(&instance(&all, "hook_outcome_modify"));
+    // Phase 2: seq-numbered event + the out-of-band events_lost marker (no seq).
+    assert_roundtrip::<EventParams>(&instance(&all, "event_params"));
+    assert_roundtrip::<EventParams>(&instance(&all, "event_events_lost"));
+}
+
+/// The seq-gap hardening, asserted on the wire shape: a normal event carries a
+/// `seq`; the `events_lost` marker carries a count and context but no `seq`.
+#[test]
+fn events_lost_marker_has_count_but_no_seq() {
+    let all = fixtures();
+    let normal: EventParams = serde_json::from_value(instance(&all, "event_params")).expect("event_params");
+    assert!(normal.seq.is_some(), "a dispatched event is seq-numbered");
+
+    let lost: EventParams = serde_json::from_value(instance(&all, "event_events_lost")).expect("events_lost");
+    assert_eq!(lost.event, "events_lost");
+    assert!(lost.seq.is_none(), "the events_lost marker is out-of-band (no seq)");
+    assert_eq!(lost.payload.and_then(|p| p.get("lost").and_then(serde_json::Value::as_u64)), Some(12));
 }
 
 #[test]

@@ -62,11 +62,32 @@
 
   "event_params": {
     "$schema_ref": "methods/event.schema.json#/$defs/Params",
-    "description": "A turn_start lifecycle event delivered to a subscribed extension.",
+    "description": "A turn_start lifecycle event delivered to a subscribed extension, carrying its per-connection sequence number.",
     "instance": {
       "event": "turn_start",
+      "seq": 41,
       "context": { "token": "epoch-7", "tier": "event" },
-      "payload": { "turn_id": "turn-42" }
+      "payload": { "agent_id": "agent-1" }
+    }
+  },
+
+  "event_events_lost": {
+    "$schema_ref": "methods/event.schema.json#/$defs/Params",
+    "description": "The out-of-band events_lost marker delivered after the bounded observe queue shed 12 oldest events. Carries the count and a context but NO seq.",
+    "instance": {
+      "event": "events_lost",
+      "context": { "token": "epoch-7", "tier": "event" },
+      "payload": { "lost": 12 }
+    }
+  },
+
+  "hook_params_tool_result": {
+    "$schema_ref": "methods/hook.schema.json#/$defs/Params",
+    "description": "A tool_result intercept (fail-open): the completed result is offered to the extension before it is pushed to the conversation.",
+    "instance": {
+      "hook": "tool_result",
+      "context": { "token": "epoch-7", "tier": "command" },
+      "input": { "tool": "bash", "arguments": { "command": "ls" }, "content": "total 0\n", "is_error": false }
     }
   },
 

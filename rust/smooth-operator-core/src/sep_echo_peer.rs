@@ -7,8 +7,10 @@
 //! handshake, answer `ping`, continue every `hook`, echo the `say` tool, and
 //! exit on `shutdown`.
 //!
-//! Two env-gated test modes:
+//! Three env-gated test modes:
 //! - `SEP_ECHO_BLOCK=1` — every `hook` vetoes (the tool_call-layering test).
+//! - `SEP_ECHO_HANG=1` — every `hook` hangs forever (never replies), driving the
+//!   fail-closed timeout path: the host times out, `$/cancel`s, and blocks.
 //! - `SEP_ECHO_SLOW=1` — `tool/execute` streams a `tool/update` progress
 //!   notification and then WITHHOLDS its reply until a `$/cancel` arrives for
 //!   that request, at which point it answers -32800 Cancelled. Exercises the
@@ -70,6 +72,19 @@ fn main() {
                 )
             }
             "ping" => success(&id, json!({})),
+            // `SEP_ECHO_HANG=1` makes every `hook` hang forever (never replies).
+            // Drives the fail-closed timeout path: the host must time out, send
+            // `$/cancel`, and BLOCK the tool without stalling the turn.
+            "hook" if std::env::var("SEP_ECHO_HANG").is_ok() => continue,
+            // `SEP_ECHO_PATCH=1` rewrites `tool_result` content via a Modify
+            // outcome (and continues `tool_call`) — the tool_result-hook test.
+            "hook" if std::env::var("SEP_ECHO_PATCH").is_ok() => {
+                if params.get("hook").and_then(Value::as_str) == Some("tool_result") {
+                    success(&id, json!({ "action": "modify", "patch": { "content": "[patched by echo]" } }))
+                } else {
+                    success(&id, json!({ "action": "continue" }))
+                }
+            }
             // `SEP_ECHO_BLOCK=1` turns the peer into a veto gate — used by the
             // host's tool_call-layering test.
             "hook" if std::env::var("SEP_ECHO_BLOCK").is_ok() => success(&id, json!({ "action": "block", "reason": "blocked by echo peer" })),

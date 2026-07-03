@@ -10,7 +10,7 @@
 //! bumped so a stale reader from the dead child can't resolve a request
 //! registered against the new child, and every in-flight request fails fast.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use super::protocol::{codes, method, Message, RpcError};
 
@@ -30,6 +30,68 @@ pub const RESTART_BACKOFFS: [Duration; 3] = [Duration::from_secs(1), Duration::f
 
 /// Idle interval after which the host should health-probe with `ping`.
 pub const PING_IDLE: Duration = Duration::from_secs(60);
+
+/// Bounded depth of the per-connection observe (`event`) lane. When a slow or
+/// stalled extension lets events pile past this, the OLDEST are shed and an
+/// `events_lost` marker is delivered on recovery — observe events are lossy by
+/// contract, so shedding beats unbounded memory growth. Requests (hook/tool/
+/// ping/shutdown) are NEVER shed; they ride the reliable control lane.
+pub const OBSERVE_QUEUE_CAP: usize = 1024;
+
+/// The per-connection observe lane: a bounded, oldest-shedding queue of `event`
+/// frames plus a monotonic sequence and a shed counter. Fire-and-forget events
+/// go here so a stuck child stdin can't grow host memory without bound.
+#[derive(Debug, Default)]
+struct ObserveLane {
+    queue: StdMutex<VecDeque<Message>>,
+    /// Per-connection monotonic event sequence (labels events so a subscriber
+    /// can detect a gap from shedding).
+    seq: AtomicU64,
+    /// Events shed since the last `events_lost` marker was drained.
+    lost: AtomicU64,
+    /// The dispatch context of the most recent event, reused on the out-of-band
+    /// `events_lost` marker so every delivered event carries a `context`.
+    last_context: StdMutex<Value>,
+    /// Signals the writer task that the queue has work.
+    notify: Notify,
+}
+
+impl ObserveLane {
+    /// Enqueue an `event` frame, shedding the oldest if at capacity.
+    fn push(&self, event: &str, context: &Value, payload: Value) {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        let frame = Message::notification(
+            method::EVENT,
+            serde_json::json!({ "event": event, "seq": seq, "context": context, "payload": payload }),
+        );
+        {
+            let mut q = self.queue.lock().expect("observe queue lock");
+            if q.len() >= OBSERVE_QUEUE_CAP {
+                q.pop_front();
+                self.lost.fetch_add(1, Ordering::SeqCst);
+            }
+            q.push_back(frame);
+        }
+        *self.last_context.lock().expect("observe ctx lock") = context.clone();
+        self.notify.notify_one();
+    }
+
+    /// Next frame for the writer to flush, or `None` when drained. Emits an
+    /// `events_lost` marker (no `seq` — it is out-of-band, a gap in the seq run
+    /// signals the loss; the marker carries the exact count) before the
+    /// surviving events whenever shedding happened since the last drain.
+    fn pop_for_write(&self) -> Option<Message> {
+        let lost = self.lost.swap(0, Ordering::SeqCst);
+        if lost > 0 {
+            let context = self.last_context.lock().expect("observe ctx lock").clone();
+            return Some(Message::notification(
+                method::EVENT,
+                serde_json::json!({ "event": "events_lost", "context": context, "payload": { "lost": lost } }),
+            ));
+        }
+        self.queue.lock().expect("observe queue lock").pop_front()
+    }
+}
 
 /// Backoff for restart `attempt` (0-indexed). `None` once attempts are
 /// exhausted — the caller transitions the extension to `Failed`.
@@ -80,6 +142,8 @@ type PendingMap = Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<Value, RpcErr
 /// reader/writer/stderr tasks. Replaced wholesale on `respawn`.
 struct Connection {
     outbound_tx: mpsc::UnboundedSender<Message>,
+    /// The bounded, lossy lane for fire-and-forget `event` frames.
+    observe: Arc<ObserveLane>,
     child: Child,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -164,22 +228,40 @@ impl ExtensionProcess {
         let stderr = child.stderr.take().ok_or_else(|| anyhow::anyhow!("no stderr pipe"))?;
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Message>();
+        let observe = Arc::new(ObserveLane::default());
 
-        // Writer task: drain outbound queue → child stdin as ndjson.
-        let writer = tokio::spawn(async move {
-            let mut stdin = stdin;
-            while let Some(msg) = outbound_rx.recv().await {
-                match serde_json::to_string(&msg) {
-                    Ok(mut line) => {
-                        line.push('\n');
-                        if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+        // Writer task: control frames (requests/responses/cancel) ride the
+        // reliable unbounded lane and always win; the bounded observe lane is
+        // drained whenever it signals or after each control write. A stalled
+        // child stdin blocks the write, but the observe lane sheds oldest under
+        // its own lock meanwhile, so host memory stays bounded regardless.
+        let writer = {
+            let observe = Arc::clone(&observe);
+            tokio::spawn(async move {
+                let mut stdin = stdin;
+                loop {
+                    let ctrl = tokio::select! {
+                        biased;
+                        frame = outbound_rx.recv() => match frame {
+                            Some(m) => Some(m),
+                            None => break, // control lane closed → connection torn down
+                        },
+                        () = observe.notify.notified() => None,
+                    };
+                    if let Some(msg) = ctrl {
+                        if !write_frame(&mut stdin, &msg).await {
                             break;
                         }
                     }
-                    Err(e) => tracing::warn!(error = %e, "extension: failed to serialize outbound frame"),
+                    // Flush the observe lane (events_lost marker first, if any).
+                    while let Some(msg) = observe.pop_for_write() {
+                        if !write_frame(&mut stdin, &msg).await {
+                            return;
+                        }
+                    }
                 }
-            }
-        });
+            })
+        };
 
         // stderr drain → tracing.
         let cmd_name = spec.command.clone();
@@ -217,6 +299,7 @@ impl ExtensionProcess {
 
         Ok(Connection {
             outbound_tx,
+            observe,
             child,
             tasks: vec![writer, reader, stderr_task],
         })
@@ -334,6 +417,21 @@ impl ExtensionProcess {
             .map_err(|_| anyhow::anyhow!("extension writer is gone"))
     }
 
+    /// Enqueue an observe `event` on the bounded, lossy lane. Assigns the frame
+    /// a per-connection sequence number; sheds the oldest queued event (tracked
+    /// for the next `events_lost` marker) rather than block or grow unbounded
+    /// when the extension is not draining its stdin. Never fails — a shed event
+    /// is the contract, not an error.
+    pub fn send_event(&self, event: &str, context: &Value, payload: Value) {
+        // Clone the Arc out from under the conn lock so the (brief) queue lock
+        // isn't nested inside it.
+        let observe = {
+            let conn = self.conn.lock().expect("conn lock");
+            Arc::clone(&conn.observe)
+        };
+        observe.push(event, context, payload);
+    }
+
     /// Whether the connection is currently believed alive.
     #[must_use]
     pub fn is_alive(&self) -> bool {
@@ -412,6 +510,21 @@ impl Drop for CancelGuard<'_> {
     }
 }
 
+/// Serialize a frame as ndjson to the child stdin. Returns `false` on any write
+/// error (the caller tears the connection down).
+async fn write_frame(stdin: &mut tokio::process::ChildStdin, msg: &Message) -> bool {
+    match serde_json::to_string(msg) {
+        Ok(mut line) => {
+            line.push('\n');
+            stdin.write_all(line.as_bytes()).await.is_ok() && stdin.flush().await.is_ok()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "extension: failed to serialize outbound frame");
+            true // a bad frame is not a broken pipe — keep the connection.
+        }
+    }
+}
+
 /// Fail every pending request with the same error message. Used on connection
 /// close and on respawn.
 fn fail_all_pending(pending: &PendingMap, reason: &str) {
@@ -435,6 +548,43 @@ mod tests {
     #[test]
     fn backoff_exhausts_after_three() {
         backoff_schedule();
+    }
+
+    #[test]
+    fn observe_lane_sheds_oldest_and_marks_loss() {
+        let lane = ObserveLane::default();
+        let ctx = serde_json::json!({ "token": "e", "tier": "event" });
+        // Overflow by 3: push CAP+3 events.
+        for i in 0..(OBSERVE_QUEUE_CAP + 3) {
+            lane.push("turn_start", &ctx, serde_json::json!({ "n": i }));
+        }
+        assert_eq!(lane.queue.lock().unwrap().len(), OBSERVE_QUEUE_CAP);
+        assert_eq!(lane.lost.load(Ordering::SeqCst), 3);
+        // seq advanced once per push, regardless of shedding.
+        assert_eq!(lane.seq.load(Ordering::SeqCst), (OBSERVE_QUEUE_CAP + 3) as u64);
+
+        // First drain frame is the events_lost marker carrying the shed count.
+        let marker = lane.pop_for_write().expect("marker");
+        let p = marker.params.unwrap();
+        assert_eq!(p["event"], "events_lost");
+        assert_eq!(p["payload"]["lost"], 3);
+        assert!(p.get("seq").is_none(), "marker is out-of-band, no seq");
+        assert!(p.get("context").is_some(), "marker carries context so it satisfies the event schema");
+        assert_eq!(lane.lost.load(Ordering::SeqCst), 0, "loss counter reset once marked");
+
+        // The surviving events are the NEWEST (oldest shed): first is n=3.
+        let first = lane.pop_for_write().expect("event");
+        assert_eq!(first.params.unwrap()["payload"]["n"], 3);
+    }
+
+    #[test]
+    fn observe_lane_no_marker_when_no_loss() {
+        let lane = ObserveLane::default();
+        let ctx = serde_json::json!({ "token": "e", "tier": "event" });
+        lane.push("turn_start", &ctx, serde_json::json!({}));
+        let f = lane.pop_for_write().expect("event");
+        assert_eq!(f.params.unwrap()["event"], "turn_start");
+        assert!(lane.pop_for_write().is_none());
     }
 
     #[tokio::test]

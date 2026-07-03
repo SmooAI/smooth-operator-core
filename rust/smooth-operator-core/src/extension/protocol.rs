@@ -333,6 +333,10 @@ pub struct CancelParams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EventParams {
     pub event: String,
+    /// Per-connection monotonic sequence. Absent on the out-of-band
+    /// `events_lost` marker (a gap in the run is itself the loss signal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
     pub context: Context,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
