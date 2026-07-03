@@ -139,6 +139,21 @@ pub fn fold_hook_chain(hook: HookType, input: Value, steps: &[HookStep]) -> Fold
     FoldedHook::Proceed(current)
 }
 
+/// Effective event subscriptions: what the extension asked for at handshake,
+/// clamped to what its manifest `[capabilities] events` declared. An empty
+/// declared list means "no declared filter" → trust the handshake as-is (keeps
+/// capability-less test peers working); a non-empty list is the outer bound the
+/// extension can never widen past.
+#[must_use]
+pub fn effective_subscriptions(declared: &[String], requested: &[String]) -> HashSet<String> {
+    if declared.is_empty() {
+        requested.iter().cloned().collect()
+    } else {
+        let declared: HashSet<&String> = declared.iter().collect();
+        requested.iter().filter(|s| declared.contains(*s)).cloned().collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Host delegate: the ext→host seam (ui / kv / exec / trust).
 // ---------------------------------------------------------------------------
@@ -350,7 +365,7 @@ impl ExtensionHost {
             .map_err(|e| anyhow::anyhow!("initialize: {e}"))?;
         let init: InitializeResult = serde_json::from_value(raw).map_err(|e| anyhow::anyhow!("bad initialize result: {e}"))?;
 
-        let subscriptions = init.registrations.subscriptions.iter().cloned().collect();
+        let subscriptions = effective_subscriptions(&ext.manifest.capabilities.events, &init.registrations.subscriptions);
         Ok(Loaded {
             name: ext.manifest.name.clone(),
             process,
@@ -406,15 +421,14 @@ impl ExtensionHost {
         if self.extensions.is_empty() {
             return;
         }
-        let ctx = self.context(Tier::Event);
+        let ctx = serde_json::to_value(self.context(Tier::Event)).unwrap_or(Value::Null);
         for ext in &self.extensions {
             if !ext.subscriptions.contains(event) {
                 continue;
             }
-            let params = json!({ "event": event, "context": ctx, "payload": payload });
-            if let Err(e) = ext.process.notify(method::EVENT, params) {
-                tracing::debug!(ext = %ext.name, error = %e, "extension: event dispatch failed");
-            }
+            // Bounded, lossy lane: a slow extension sheds oldest events (with an
+            // events_lost marker) instead of stalling the agent or leaking memory.
+            ext.process.send_event(event, &ctx, payload.clone());
         }
     }
 
@@ -525,6 +539,23 @@ mod tests {
     /// A host with no extensions — the zero-behavior-change default.
     fn empty_host() -> ExtensionHost {
         ExtensionHost::default()
+    }
+
+    #[test]
+    fn effective_subscriptions_intersects_or_passes_through() {
+        let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        // No declared filter → handshake as-is.
+        assert_eq!(
+            effective_subscriptions(&[], &s(&["turn_start", "turn_end"])),
+            HashSet::from(["turn_start".to_string(), "turn_end".to_string()])
+        );
+        // Declared list clamps: `tool_call` requested but not declared is dropped.
+        assert_eq!(
+            effective_subscriptions(&s(&["turn_start"]), &s(&["turn_start", "tool_call"])),
+            HashSet::from(["turn_start".to_string()])
+        );
+        // Declared but not requested → not subscribed.
+        assert!(effective_subscriptions(&s(&["turn_start", "turn_end"]), &s(&["turn_end"])).len() == 1);
     }
 
     #[test]

@@ -38,8 +38,14 @@ pub use tool_proxy::ExtensionTool;
 pub mod events {
     pub const TURN_START: &str = "turn_start";
     pub const TURN_END: &str = "turn_end";
+    pub const MESSAGE_START: &str = "message_start";
+    pub const MESSAGE_UPDATE: &str = "message_update";
     pub const MESSAGE_END: &str = "message_end";
-    pub const TOOL_CALL_UPDATE: &str = "tool_call_update";
-    /// Delivered when the bounded observe queue shed events.
+    // Names mirror pi's `tool_execution_*` (not `tool_call_*`) so pi extensions
+    // port their event subscriptions unchanged.
+    pub const TOOL_EXECUTION_START: &str = "tool_execution_start";
+    pub const TOOL_EXECUTION_UPDATE: &str = "tool_execution_update";
+    pub const TOOL_EXECUTION_END: &str = "tool_execution_end";
+    /// Delivered when the bounded observe queue shed events. Carries `{lost: N}`.
     pub const EVENTS_LOST: &str = "events_lost";
 }

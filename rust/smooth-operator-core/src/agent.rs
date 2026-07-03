@@ -409,6 +409,14 @@ pub enum AgentEvent {
     },
 }
 
+/// SEP `tool_call` plan: the (possibly arg-modified) calls to execute plus the
+/// set of vetoed call ids → reason. Built only when an extension host is
+/// attached (see [`Agent::sep_tool_call_plan`]).
+struct SepToolPlan {
+    calls: Vec<crate::tool::ToolCall>,
+    blocks: std::collections::HashMap<String, String>,
+}
+
 /// Configuration for a sub-agent spawned via delegation.
 #[derive(Debug, Clone)]
 pub struct SubAgentConfig {
@@ -821,9 +829,16 @@ impl Agent {
                     completion_tokens,
                     cached_tokens,
                 });
-                if let Some(host) = &self.extension_host {
+                if self.extension_host.is_some() {
                     let preview: String = response.content.chars().take(100).collect();
-                    host.dispatch_event(crate::extension::events::MESSAGE_END, serde_json::json!({ "content": response.content }));
+                    self.sep_dispatch(
+                        crate::extension::events::MESSAGE_END,
+                        serde_json::json!({ "iteration": iteration, "content": response.content }),
+                    );
+                    self.sep_dispatch(
+                        crate::extension::events::TURN_END,
+                        serde_json::json!({ "agent_id": self.id, "iterations": iteration }),
+                    );
                     self.emit(AgentEvent::MessageEnd {
                         iteration,
                         content_preview: preview,
@@ -836,92 +851,14 @@ impl Agent {
                 return Ok(conversation);
             }
 
-            // SEP: fail-closed `tool_call` hook chain. Extensions may veto a
-            // call BEFORE the registry runs it; the registry's own ToolHooks
-            // still veto inside `execute`/`execute_parallel` (clean layering).
-            // Empty + cheap when no extension host is attached, so the common
-            // parallel/sequential paths below stay byte-for-byte unchanged.
-            let sep_blocks = self.sep_tool_call_blocks(&response.tool_calls).await;
-            if !sep_blocks.is_empty() {
-                for tool_call in &response.tool_calls {
-                    self.emit(AgentEvent::ToolCallStart {
-                        iteration,
-                        tool_name: tool_call.name.clone(),
-                        arguments: tool_call.arguments.to_string(),
-                    });
-                    let start = std::time::Instant::now();
-                    let result = if let Some(reason) = sep_blocks.get(&tool_call.id) {
-                        crate::tool::ToolResult {
-                            tool_call_id: tool_call.id.clone(),
-                            content: format!("blocked by extension: {reason}"),
-                            is_error: true,
-                            details: None,
-                        }
-                    } else {
-                        self.tools.execute(tool_call).await
-                    };
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    let result_preview: String = result.content.chars().take(500).collect();
-                    self.emit(AgentEvent::ToolCallComplete {
-                        iteration,
-                        tool_name: tool_call.name.clone(),
-                        is_error: result.is_error,
-                        result: result_preview,
-                        duration_ms,
-                    });
-                    conversation.push(Message::tool_result_named(&tool_call.id, &tool_call.name, &result.content));
-                    self.maybe_checkpoint(&conversation, iteration, CheckpointEvent::ToolCallComplete);
-                }
-            } else if self.config.parallel_tools {
-                for tool_call in &response.tool_calls {
-                    self.emit(AgentEvent::ToolCallStart {
-                        iteration,
-                        tool_name: tool_call.name.clone(),
-                        arguments: tool_call.arguments.to_string(),
-                    });
-                }
-
-                let results = self.tools.execute_parallel(&response.tool_calls).await;
-
-                for (tool_call, result) in response.tool_calls.iter().zip(&results) {
-                    let result_preview: String = result.content.chars().take(500).collect();
-                    self.emit(AgentEvent::ToolCallComplete {
-                        iteration,
-                        tool_name: tool_call.name.clone(),
-                        is_error: result.is_error,
-                        result: result_preview.clone(),
-                        duration_ms: 0,
-                    });
-                    conversation.push(Message::tool_result_named(&tool_call.id, &tool_call.name, &result.content));
-                    self.maybe_checkpoint(&conversation, iteration, CheckpointEvent::ToolCallComplete);
-                }
-            } else {
-                for tool_call in &response.tool_calls {
-                    self.emit(AgentEvent::ToolCallStart {
-                        iteration,
-                        tool_name: tool_call.name.clone(),
-                        arguments: tool_call.arguments.to_string(),
-                    });
-
-                    let start = std::time::Instant::now();
-                    let result = self.tools.execute(tool_call).await;
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    let result_preview: String = result.content.chars().take(500).collect();
-
-                    self.emit(AgentEvent::ToolCallComplete {
-                        iteration,
-                        tool_name: tool_call.name.clone(),
-                        is_error: result.is_error,
-                        result: result_preview.clone(),
-                        duration_ms,
-                    });
-
-                    conversation.push(Message::tool_result_named(&tool_call.id, &tool_call.name, &result.content));
-
-                    // Maybe checkpoint after each tool call
-                    self.maybe_checkpoint(&conversation, iteration, CheckpointEvent::ToolCallComplete);
-                }
-            }
+            // SEP: fail-closed `tool_call` hook (Block vetoes, Modify rewrites
+            // args) BEFORE execution; the registry's own ToolHooks still veto
+            // inside `execute`/`execute_parallel` (clean layering). `None` when
+            // no host is attached → unchanged, allocation-free path.
+            let sep_plan = self.sep_tool_call_plan(&response.tool_calls).await;
+            let calls = sep_plan.as_ref().map_or(response.tool_calls.as_slice(), |p| p.calls.as_slice());
+            let blocks = sep_plan.as_ref().map(|p| &p.blocks);
+            self.sep_run_tool_calls(calls, blocks, iteration, &mut conversation, None).await;
         }
 
         self.emit(AgentEvent::MaxIterationsReached {
@@ -965,6 +902,10 @@ impl Agent {
         conversation.push(Message::user(user_msg));
 
         let _ = tx.send(AgentEvent::Started { agent_id: self.id.clone() });
+        if self.extension_host.is_some() {
+            self.sep_dispatch(crate::extension::events::TURN_START, serde_json::json!({ "agent_id": self.id }));
+            let _ = tx.send(AgentEvent::TurnStart { agent_id: self.id.clone() });
+        }
 
         let llm: Arc<dyn LlmProvider> = match &self.llm_provider {
             Some(provider) => Arc::clone(provider),
@@ -1168,55 +1109,34 @@ impl Agent {
                     completion_tokens,
                     cached_tokens,
                 });
+                if self.extension_host.is_some() {
+                    let preview: String = response.content.chars().take(100).collect();
+                    self.sep_dispatch(
+                        crate::extension::events::MESSAGE_END,
+                        serde_json::json!({ "iteration": iteration, "content": response.content }),
+                    );
+                    self.sep_dispatch(
+                        crate::extension::events::TURN_END,
+                        serde_json::json!({ "agent_id": self.id, "iterations": iteration }),
+                    );
+                    let _ = tx.send(AgentEvent::MessageEnd {
+                        iteration,
+                        content_preview: preview,
+                    });
+                    let _ = tx.send(AgentEvent::TurnEnd {
+                        agent_id: self.id.clone(),
+                        iterations: iteration,
+                    });
+                }
                 return Ok(conversation);
             }
 
-            if self.config.parallel_tools {
-                for tool_call in &response.tool_calls {
-                    let _ = tx.send(AgentEvent::ToolCallStart {
-                        iteration,
-                        tool_name: tool_call.name.clone(),
-                        arguments: tool_call.arguments.to_string(),
-                    });
-                }
-
-                let results = self.tools.execute_parallel(&response.tool_calls).await;
-
-                for (tool_call, result) in response.tool_calls.iter().zip(&results) {
-                    let _ = tx.send(AgentEvent::ToolCallComplete {
-                        iteration,
-                        tool_name: tool_call.name.clone(),
-                        is_error: result.is_error,
-                        result: result.content.chars().take(500).collect(),
-                        duration_ms: 0,
-                    });
-                    conversation.push(Message::tool_result_named(&tool_call.id, &tool_call.name, &result.content));
-                    self.maybe_checkpoint(&conversation, iteration, CheckpointEvent::ToolCallComplete);
-                }
-            } else {
-                for tool_call in &response.tool_calls {
-                    let _ = tx.send(AgentEvent::ToolCallStart {
-                        iteration,
-                        tool_name: tool_call.name.clone(),
-                        arguments: tool_call.arguments.to_string(),
-                    });
-
-                    let start = std::time::Instant::now();
-                    let result = self.tools.execute(tool_call).await;
-                    let duration_ms = start.elapsed().as_millis() as u64;
-
-                    let _ = tx.send(AgentEvent::ToolCallComplete {
-                        iteration,
-                        tool_name: tool_call.name.clone(),
-                        is_error: result.is_error,
-                        result: result.content.chars().take(500).collect(),
-                        duration_ms,
-                    });
-
-                    conversation.push(Message::tool_result_named(&tool_call.id, &tool_call.name, &result.content));
-                    self.maybe_checkpoint(&conversation, iteration, CheckpointEvent::ToolCallComplete);
-                }
-            }
+            // SEP tool_call hook (Block/Modify) + shared execution path — see
+            // `sep_run_tool_calls`. `None` plan → unchanged, allocation-free.
+            let sep_plan = self.sep_tool_call_plan(&response.tool_calls).await;
+            let calls = sep_plan.as_ref().map_or(response.tool_calls.as_slice(), |p| p.calls.as_slice());
+            let blocks = sep_plan.as_ref().map(|p| &p.blocks);
+            self.sep_run_tool_calls(calls, blocks, iteration, &mut conversation, Some(&tx)).await;
         }
 
         let _ = tx.send(AgentEvent::MaxIterationsReached {
@@ -1340,21 +1260,174 @@ impl Agent {
         }
     }
 
-    /// SEP: run the fail-closed `tool_call` hook chain over the pending calls,
-    /// returning a map of vetoed `tool_call.id` → reason. Empty (and cheap)
-    /// when no extension host is attached, so callers stay on the unchanged
-    /// execution path in the common case.
-    async fn sep_tool_call_blocks(&self, calls: &[crate::tool::ToolCall]) -> std::collections::HashMap<String, String> {
+    /// SEP: run the fail-closed `tool_call` hook chain over the pending calls.
+    /// Returns `None` when no extension host is attached, so callers stay on the
+    /// unchanged, allocation-free execution path. When a host is present, each
+    /// call is either vetoed (id → reason in `blocks`) or passed through with its
+    /// arguments possibly rewritten by a `Modify` outcome (in `calls`, same
+    /// order as the input). The registry's own `ToolHook`s still veto inside
+    /// `execute`/`execute_parallel` afterward — clean layering.
+    async fn sep_tool_call_plan(&self, calls: &[crate::tool::ToolCall]) -> Option<SepToolPlan> {
+        let host = self.extension_host.as_ref()?;
+        let mut out = Vec::with_capacity(calls.len());
         let mut blocks = std::collections::HashMap::new();
-        let Some(host) = &self.extension_host else {
-            return blocks;
-        };
         for call in calls {
-            if let crate::extension::FoldedHook::Blocked(reason) = host.run_tool_call_hook(&call.name, &call.arguments).await {
-                blocks.insert(call.id.clone(), reason);
+            match host.run_tool_call_hook(&call.name, &call.arguments).await {
+                crate::extension::FoldedHook::Blocked(reason) => {
+                    blocks.insert(call.id.clone(), reason);
+                    out.push(call.clone());
+                }
+                crate::extension::FoldedHook::Proceed(patched) => {
+                    let mut c = call.clone();
+                    // A `Modify` outcome replaces the hook input `{tool, arguments}`;
+                    // carry its `arguments` back onto the call before execution.
+                    if let Some(args) = patched.get("arguments") {
+                        c.arguments = args.clone();
+                    }
+                    out.push(c);
+                }
             }
         }
-        blocks
+        Some(SepToolPlan { calls: out, blocks })
+    }
+
+    /// SEP: run the fail-open `tool_result` hook over a completed tool result,
+    /// returning the possibly-patched result. Unchanged (and cheap) when no host
+    /// is attached. `tool_result` is fail-open, so a block/failure keeps the
+    /// original result rather than vetoing (the tool already ran).
+    async fn sep_tool_result(&self, call: &crate::tool::ToolCall, result: crate::tool::ToolResult) -> crate::tool::ToolResult {
+        let Some(host) = self.extension_host.as_ref() else {
+            return result;
+        };
+        let input = serde_json::json!({
+            "tool": call.name,
+            "arguments": call.arguments,
+            "content": result.content,
+            "is_error": result.is_error,
+        });
+        match host.run_hook(crate::extension::HookType::ToolResult, input).await {
+            crate::extension::FoldedHook::Proceed(patch) => {
+                let mut r = result;
+                if let Some(c) = patch.get("content").and_then(serde_json::Value::as_str) {
+                    r.content = c.to_string();
+                }
+                if let Some(e) = patch.get("is_error").and_then(serde_json::Value::as_bool) {
+                    r.is_error = e;
+                }
+                if let Some(d) = patch.get("details") {
+                    r.details = Some(d.clone());
+                }
+                r
+            }
+            crate::extension::FoldedHook::Blocked(_) => result,
+        }
+    }
+
+    /// SEP: fan an observe event out to subscribed extensions. No-op (and cheap)
+    /// when no host is attached or nobody subscribed — the `has_subscriber` gate
+    /// skips even building the payload's consumers.
+    fn sep_dispatch(&self, event: &str, payload: serde_json::Value) {
+        if let Some(host) = &self.extension_host {
+            if host.has_subscriber(event) {
+                host.dispatch_event(event, payload);
+            }
+        }
+    }
+
+    /// Execute a turn's tool calls, honoring the SEP plan, running the
+    /// `tool_result` hook on each result, and fanning `tool_execution_*` events
+    /// out to subscribed extensions. Shared by the closure-based [`Self::run`]
+    /// (`tx = None` → `self.emit`) and the streaming [`Self::run_with_channel`]
+    /// (`tx = Some` → channel), so SEP hooks fire identically on both — the
+    /// polyglot servers and the TUI all drive the streaming path.
+    ///
+    /// `blocks` (from [`Self::sep_tool_call_plan`]) forces the sequential path so
+    /// each call's veto is honored; without blocks the parallel fast path runs
+    /// when configured. `calls` may carry `Modify`-rewritten arguments.
+    async fn sep_run_tool_calls(
+        &self,
+        calls: &[crate::tool::ToolCall],
+        blocks: Option<&std::collections::HashMap<String, String>>,
+        iteration: u32,
+        conversation: &mut Conversation,
+        tx: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+    ) {
+        let send_ev = |ev: AgentEvent| match tx {
+            Some(tx) => {
+                let _ = tx.send(ev);
+            }
+            None => self.emit(ev),
+        };
+        let has_blocks = blocks.is_some_and(|b| !b.is_empty());
+
+        if !has_blocks && self.config.parallel_tools {
+            for c in calls {
+                send_ev(AgentEvent::ToolCallStart {
+                    iteration,
+                    tool_name: c.name.clone(),
+                    arguments: c.arguments.to_string(),
+                });
+                self.sep_dispatch(
+                    crate::extension::events::TOOL_EXECUTION_START,
+                    serde_json::json!({ "iteration": iteration, "tool": c.name }),
+                );
+            }
+            let results = self.tools.execute_parallel(calls).await;
+            for (c, result) in calls.iter().zip(results) {
+                let result = self.sep_tool_result(c, result).await;
+                send_ev(AgentEvent::ToolCallComplete {
+                    iteration,
+                    tool_name: c.name.clone(),
+                    is_error: result.is_error,
+                    result: result.content.chars().take(500).collect(),
+                    duration_ms: 0,
+                });
+                self.sep_dispatch(
+                    crate::extension::events::TOOL_EXECUTION_END,
+                    serde_json::json!({ "iteration": iteration, "tool": c.name, "is_error": result.is_error }),
+                );
+                conversation.push(Message::tool_result_named(&c.id, &c.name, &result.content));
+                self.maybe_checkpoint(conversation, iteration, CheckpointEvent::ToolCallComplete);
+            }
+        } else {
+            for c in calls {
+                send_ev(AgentEvent::ToolCallStart {
+                    iteration,
+                    tool_name: c.name.clone(),
+                    arguments: c.arguments.to_string(),
+                });
+                self.sep_dispatch(
+                    crate::extension::events::TOOL_EXECUTION_START,
+                    serde_json::json!({ "iteration": iteration, "tool": c.name }),
+                );
+                let start = std::time::Instant::now();
+                let result = if let Some(reason) = blocks.and_then(|b| b.get(&c.id)) {
+                    crate::tool::ToolResult {
+                        tool_call_id: c.id.clone(),
+                        content: format!("blocked by extension: {reason}"),
+                        is_error: true,
+                        details: None,
+                    }
+                } else {
+                    let r = self.tools.execute(c).await;
+                    self.sep_tool_result(c, r).await
+                };
+                let duration_ms = start.elapsed().as_millis() as u64;
+                send_ev(AgentEvent::ToolCallComplete {
+                    iteration,
+                    tool_name: c.name.clone(),
+                    is_error: result.is_error,
+                    result: result.content.chars().take(500).collect(),
+                    duration_ms,
+                });
+                self.sep_dispatch(
+                    crate::extension::events::TOOL_EXECUTION_END,
+                    serde_json::json!({ "iteration": iteration, "tool": c.name, "is_error": result.is_error }),
+                );
+                conversation.push(Message::tool_result_named(&c.id, &c.name, &result.content));
+                self.maybe_checkpoint(conversation, iteration, CheckpointEvent::ToolCallComplete);
+            }
+        }
     }
 
     /// Decide whether the latest `LlmResponse` warrants an
