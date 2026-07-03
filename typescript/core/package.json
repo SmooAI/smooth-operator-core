@@ -17,6 +17,10 @@
         ".": {
             "types": "./dist/index.d.ts",
             "import": "./dist/index.js"
+        },
+        "./extension": {
+            "types": "./dist/extension/index.d.ts",
+            "import": "./dist/extension/index.js"
         }
     },
     "files": [
@@ -28,7 +32,8 @@
         "test": "vitest run"
     },
     "dependencies": {
-        "openai": "^4.77.0"
+        "openai": "^4.77.0",
+        "smol-toml": "^1.7.0"
     },
     "devDependencies": {
         "@types/node": "^25.9.2",
