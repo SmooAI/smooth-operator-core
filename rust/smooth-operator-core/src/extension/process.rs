@@ -290,15 +290,37 @@ impl ExtensionProcess {
             }
         }
 
+        // If this future is dropped (task cancelled) or times out before the
+        // peer answers, tell the peer to stop working on the request via
+        // `$/cancel` and clear the pending slot. Disarmed once the peer replies.
+        let mut guard = CancelGuard { proc: self, id, armed: true };
+
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(Ok(value))) => Ok(value),
-            Ok(Ok(Err(rpc))) => Err(anyhow::anyhow!(rpc)),
-            Ok(Err(_recv)) => anyhow::bail!("extension dropped the request channel"),
-            Err(_elapsed) => {
-                self.pending.lock().expect("pending lock").remove(&id);
-                anyhow::bail!("extension request `{method}` timed out after {timeout:?}");
+            Ok(Ok(Ok(value))) => {
+                guard.armed = false;
+                Ok(value)
             }
+            Ok(Ok(Err(rpc))) => {
+                guard.armed = false;
+                Err(anyhow::anyhow!(rpc))
+            }
+            Ok(Err(_recv)) => {
+                guard.armed = false;
+                anyhow::bail!("extension dropped the request channel")
+            }
+            // Leave the guard armed: its Drop clears pending and sends `$/cancel`.
+            Err(_elapsed) => anyhow::bail!("extension request `{method}` timed out after {timeout:?}"),
         }
+    }
+
+    /// Best-effort `$/cancel` for an in-flight request `id`. The peer SHOULD
+    /// stop work and reply to the original request with -32800 Cancelled; a
+    /// cancel for an already-answered id is a harmless no-op the peer ignores.
+    ///
+    /// # Errors
+    /// Returns an error only if the writer channel is closed.
+    pub fn cancel(&self, id: u64) -> anyhow::Result<()> {
+        self.notify(method::CANCEL, serde_json::json!({ "id": id }))
     }
 
     /// Send a fire-and-forget notification.
@@ -368,6 +390,25 @@ impl Drop for ExtensionProcess {
         if let Ok(mut conn) = self.conn.lock() {
             conn.abort();
         }
+    }
+}
+
+/// Sends `$/cancel` for an in-flight request if the awaiting future is dropped
+/// or times out before the peer answers. Disarmed on a peer reply. Also clears
+/// the pending slot so a late reply resolves to nothing instead of leaking.
+struct CancelGuard<'a> {
+    proc: &'a ExtensionProcess,
+    id: u64,
+    armed: bool,
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.proc.pending.lock().expect("pending lock").remove(&self.id);
+        let _ = self.proc.cancel(self.id);
     }
 }
 

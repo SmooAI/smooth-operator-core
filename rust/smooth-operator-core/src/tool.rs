@@ -203,6 +203,15 @@ impl ToolRegistry {
         self.deferred.insert(schema.name, Arc::new(tool));
     }
 
+    /// Register a pre-wrapped tool as deferred. The `Arc` sibling of
+    /// [`register_deferred`], mirroring [`register_arc`](Self::register_arc) —
+    /// used when the tool is already `Arc<dyn Tool>` (e.g. SEP extension tool
+    /// proxies handed over from an [`ExtensionHost`](crate::extension::ExtensionHost)).
+    pub fn register_deferred_arc(&mut self, tool: Arc<dyn Tool>) {
+        let schema = tool.schema();
+        self.deferred.insert(schema.name, tool);
+    }
+
     /// Promote a deferred tool so its schema appears in the next
     /// `schemas()` call and the LLM can invoke it. Returns `false`
     /// if the name doesn't match a registered deferred tool —

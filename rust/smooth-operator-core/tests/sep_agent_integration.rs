@@ -125,6 +125,78 @@ async fn no_extension_host_is_zero_behavior_change() {
     assert_eq!(convo.last_assistant_content(), Some("done"));
 }
 
+/// The Phase 1 headline: a scripted LLM calls an extension-registered tool
+/// (`echo.say`) through the real ExtensionHost, and the extension's reply flows
+/// back as the tool result. This is the full schema-on-wire → execute
+/// round-trip the plan requires ("LLM calls hello.greet through a real turn").
+#[tokio::test]
+async fn llm_calls_extension_registered_tool_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest(tmp.path(), false); // continue every hook
+    let host = Arc::new(load_host(tmp.path()).await);
+
+    // The extension registered `say`; the host exposes it as `echo.say`.
+    let tool_names: Vec<_> = host.tools().iter().map(|t| t.schema().name).collect();
+    assert!(tool_names.contains(&"echo.say".to_string()), "expected echo.say tool, got {tool_names:?}");
+
+    let mock = MockLlmClient::new();
+    mock.push_tool_call("c1", "echo.say", serde_json::json!({ "phrase": "hello from the LLM" }));
+    mock.push_text("done");
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let ev = Arc::clone(&events);
+    let config = AgentConfig::new("t", "system", LlmConfig::openrouter("fake-key"));
+    let agent = Agent::new(config, ToolRegistry::new())
+        .with_llm_provider(Arc::new(mock))
+        .with_event_handler(move |e| ev.lock().unwrap().push(e))
+        .with_extension_host(host);
+
+    let convo = agent.run("go").await.expect("run");
+
+    // The extension tool executed and echoed the phrase back as the result.
+    let evs = events.lock().unwrap();
+    let echoed = evs.iter().any(|e| {
+        matches!(e, AgentEvent::ToolCallComplete { is_error, result, tool_name, .. }
+            if !is_error && tool_name == "echo.say" && result.contains("hello from the LLM"))
+    });
+    assert!(echoed, "expected echo.say to return the phrase, got: {evs:?}");
+    assert_eq!(convo.last_assistant_content(), Some("done"));
+}
+
+/// Extension tools are ordinary registry tools, so the same `retain` filter a
+/// server uses to enforce a per-agent `enabled_tools` allow-list drops them by
+/// their dotted name exactly as it drops native tools. (The server never sees
+/// an ExtensionHost until a later phase; this proves the composition holds at
+/// the registry seam it will use.)
+#[tokio::test]
+async fn extension_tools_are_filtered_by_registry_retain() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest(tmp.path(), false);
+    let host = load_host(tmp.path()).await;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(DangerTool {
+        ran: Arc::new(AtomicBool::new(false)),
+    });
+    for tool in host.tools() {
+        registry.register_arc(tool);
+    }
+
+    let before: Vec<_> = registry.schemas().into_iter().map(|s| s.name).collect();
+    assert!(before.contains(&"danger".to_string()));
+    assert!(
+        before.contains(&"echo.say".to_string()),
+        "ext tool should be visible before filtering: {before:?}"
+    );
+
+    // Enforce an allow-list that excludes the extension tool.
+    registry.retain(|name| name != "echo.say");
+
+    let after: Vec<_> = registry.schemas().into_iter().map(|s| s.name).collect();
+    assert!(after.contains(&"danger".to_string()), "native tool survives the allow-list");
+    assert!(!after.contains(&"echo.say".to_string()), "ext tool filtered out exactly like a native tool");
+}
+
 #[tokio::test]
 async fn non_blocking_extension_lets_tool_run_and_emits_turn_events() {
     let tmp = tempfile::tempdir().unwrap();

@@ -6,6 +6,13 @@
 //! possible reference SEP extension. Behavior mirrors the spec's `echo.mjs`:
 //! handshake, answer `ping`, continue every `hook`, echo the `say` tool, and
 //! exit on `shutdown`.
+//!
+//! Two env-gated test modes:
+//! - `SEP_ECHO_BLOCK=1` — every `hook` vetoes (the tool_call-layering test).
+//! - `SEP_ECHO_SLOW=1` — `tool/execute` streams a `tool/update` progress
+//!   notification and then WITHHOLDS its reply until a `$/cancel` arrives for
+//!   that request, at which point it answers -32800 Cancelled. Exercises the
+//!   tool/update + $/cancel wire path deterministically.
 
 use std::io::{BufRead, Write};
 
@@ -16,6 +23,11 @@ fn main() {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
+    let slow = std::env::var("SEP_ECHO_SLOW").is_ok();
+    // In slow mode, the JSON-RPC id of a `tool/execute` whose reply we are
+    // holding back until a matching `$/cancel` arrives.
+    let mut held_tool_call: Option<Value> = None;
+
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -25,10 +37,18 @@ fn main() {
             continue;
         };
 
-        // Notifications (no id) are observed and dropped.
-        let Some(id) = msg.get("id").cloned() else { continue };
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+        // Notifications (no id). `$/cancel` releases a held tool/execute.
+        let Some(id) = msg.get("id").cloned() else {
+            if method == "$/cancel" {
+                if let Some(held) = held_tool_call.take() {
+                    write_frame(&mut out, &error(&held, -32800, "cancelled"));
+                }
+            }
+            continue;
+        };
 
         let reply = match method {
             "initialize" => {
@@ -54,6 +74,16 @@ fn main() {
             // host's tool_call-layering test.
             "hook" if std::env::var("SEP_ECHO_BLOCK").is_ok() => success(&id, json!({ "action": "block", "reason": "blocked by echo peer" })),
             "hook" => success(&id, json!({ "action": "continue" })),
+            // Slow mode: stream progress, then hold the reply for a $/cancel.
+            "tool/execute" if slow => {
+                let call_id = params.get("call_id").and_then(Value::as_str).unwrap_or("");
+                write_frame(
+                    &mut out,
+                    &notification("tool/update", json!({ "call_id": call_id, "message": "started", "progress": 0.0 })),
+                );
+                held_tool_call = Some(id);
+                continue;
+            }
             "tool/execute" => {
                 let phrase = params.get("arguments").and_then(|a| a.get("phrase")).and_then(Value::as_str).unwrap_or("");
                 success(&id, json!({ "content": phrase }))
@@ -66,6 +96,10 @@ fn main() {
         };
         write_frame(&mut out, &reply);
     }
+}
+
+fn notification(method: &str, params: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "method": method, "params": params })
 }
 
 fn success(id: &Value, result: Value) -> Value {
