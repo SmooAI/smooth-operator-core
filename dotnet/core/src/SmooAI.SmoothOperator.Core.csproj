@@ -45,6 +45,9 @@
          abstraction, ChatMessage/AIFunction/FunctionCallContent the conversation +
          tool types. Any MEAI provider plugs in; a normal C# method becomes a tool. -->
     <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="9.7.1" />
+    <!-- extension.toml manifest parsing for the SEP extension host (Extensions/). Tomlyn is the
+         idiomatic managed .NET TOML parser — inline tables + arrays the manifest uses, no hand-rolled parser. -->
+    <PackageReference Include="Tomlyn" Version="0.19.0" />
   </ItemGroup>
 
 </Project>
