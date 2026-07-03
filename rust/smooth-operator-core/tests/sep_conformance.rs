@@ -15,7 +15,8 @@
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use smooth_operator_core::extension::protocol::{
-    EventParams, HookOutcome, InitializeParams, InitializeResult, Message, ToolExecuteParams, ToolExecuteResult, ToolUpdateParams,
+    EventParams, HookOutcome, InitializeParams, InitializeResult, Message, ProviderCompleteParams, ProviderCompleteResult, ProviderCredentials,
+    ProviderDeltaParams, Registrations, SessionSetModelParams, ToolExecuteParams, ToolExecuteResult, ToolUpdateParams,
 };
 
 const FIXTURES: &str = include_str!("sep/fixtures.json");
@@ -73,6 +74,30 @@ fn lifecycle_method_fixtures_roundtrip_into_typed_structs() {
     // Phase 2: seq-numbered event + the out-of-band events_lost marker (no seq).
     assert_roundtrip::<EventParams>(&instance(&all, "event_params"));
     assert_roundtrip::<EventParams>(&instance(&all, "event_events_lost"));
+}
+
+/// Phase 7: the provider registration + proxied-streaming + set_model fixtures
+/// deserialize into the Rust host's typed view. `ProviderCompleteResult` has no
+/// `PartialEq` (ToolCall/Usage don't), so it's checked by deserialize + field
+/// assertion rather than `assert_roundtrip`.
+#[test]
+fn provider_method_fixtures_agree_with_the_rust_types() {
+    let all = fixtures();
+    assert_roundtrip::<Registrations>(&instance(&all, "registrations_with_provider"));
+    assert_roundtrip::<ProviderCompleteParams>(&instance(&all, "provider_complete_params"));
+    assert_roundtrip::<ProviderDeltaParams>(&instance(&all, "provider_delta_params"));
+    assert_roundtrip::<ProviderCredentials>(&instance(&all, "provider_credentials"));
+    assert_roundtrip::<SessionSetModelParams>(&instance(&all, "session_set_model_params_provider"));
+
+    let plain: ProviderCompleteResult = serde_json::from_value(instance(&all, "provider_complete_result")).expect("complete_result");
+    assert_eq!(plain.content, "Hello there.");
+    assert_eq!(plain.finish_reason, "stop");
+    assert_eq!(plain.resolved_model.as_deref(), Some("corp-gpt-4o-2026"));
+
+    let with_calls: ProviderCompleteResult = serde_json::from_value(instance(&all, "provider_complete_result_tool_calls")).expect("tool_calls result");
+    assert_eq!(with_calls.tool_calls.len(), 1);
+    assert_eq!(with_calls.tool_calls[0].name, "get_weather");
+    assert_eq!(with_calls.finish_reason, "tool_calls");
 }
 
 /// The seq-gap hardening, asserted on the wire shape: a normal event carries a

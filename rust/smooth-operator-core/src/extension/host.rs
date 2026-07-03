@@ -19,9 +19,11 @@ use super::manifest::{DiscoveredExtension, Scope};
 use super::process::{ExtensionProcess, InboundHandler, SpawnSpec};
 use super::protocol::{
     codes, method, CommandCompleteResult, CommandExecuteResult, CommandRegistration, Completion, Context, HookOutcome, HostInfo, InitializeParams,
-    InitializeResult, RpcError, ShortcutRegistration, Tier, WorkspaceInfo,
+    InitializeResult, ProviderCredentials, ProviderDeltaParams, ProviderRegistration, RpcError, ShortcutRegistration, Tier, WorkspaceInfo,
 };
+use super::provider_proxy::{ExtensionLlmProvider, ProviderStreams};
 use super::tool_proxy::ExtensionTool;
+use crate::llm_provider::LlmProvider;
 use crate::tool::Tool;
 
 /// The SEP protocol version this host implements.
@@ -241,6 +243,18 @@ pub trait HostDelegate: Send + Sync {
         Err(RpcError::new(codes::CAPABILITY_DISABLED, "session actions are unavailable on this host"))
     }
 
+    /// `session/set_model` — switch the active model (Phase 7), optionally to an
+    /// extension-registered provider, optionally with a reasoning level. Context
+    /// pre-validated. The engine has no session, so the default reports the
+    /// capability unavailable; a frontend that owns the active provider (smooth-
+    /// code, the operative, the daemon) overrides this to rebuild its
+    /// [`crate::llm_provider::LlmProvider`] — for an extension model, from
+    /// [`ExtensionHost::provider_for`].
+    async fn session_set_model(&self, ext: &str, params: Value) -> Result<Value, RpcError> {
+        let _ = (ext, params);
+        Err(RpcError::new(codes::CAPABILITY_DISABLED, "session actions are unavailable on this host"))
+    }
+
     /// A `tool/update` progress notification streamed by an extension during an
     /// in-flight `tool/execute`, keyed by its `call_id`. Fire-and-forget. The
     /// headless default only traces; a frontend/daemon overrides this to surface
@@ -288,6 +302,9 @@ struct HostInbound {
     ext: String,
     delegate: Arc<dyn HostDelegate>,
     epoch: Arc<AtomicU64>,
+    /// Shared delta-routing registry: `provider/delta` notifications land here,
+    /// keyed by their in-flight `provider/complete` request_id.
+    streams: ProviderStreams,
 }
 
 #[async_trait]
@@ -311,6 +328,10 @@ impl InboundHandler for HostInbound {
                 validate_command_context(&params, self.epoch.load(Ordering::SeqCst))?;
                 self.delegate.session_append_entry(&self.ext, params).await
             }
+            method::SESSION_SET_MODEL => {
+                validate_command_context(&params, self.epoch.load(Ordering::SeqCst))?;
+                self.delegate.session_set_model(&self.ext, params).await
+            }
             "kv/get" => {
                 let key = params.get("key").and_then(Value::as_str).unwrap_or_default();
                 Ok(json!({ "value": self.delegate.kv_get(&self.ext, key).await? }))
@@ -328,6 +349,10 @@ impl InboundHandler for HostInbound {
     fn handle_notification(&self, method_name: &str, params: Value) {
         match method_name {
             method::TOOL_UPDATE => self.delegate.tool_update(&self.ext, params),
+            method::PROVIDER_DELTA => match serde_json::from_value::<ProviderDeltaParams>(params) {
+                Ok(delta) => self.streams.route_delta(&delta.request_id, delta.event),
+                Err(e) => tracing::warn!(ext = %self.ext, error = %e, "extension: malformed provider/delta, dropping"),
+            },
             other => tracing::trace!(ext = %self.ext, method = %other, ?params, "ext→host notification"),
         }
     }
@@ -357,6 +382,10 @@ pub struct ExtensionHost {
     /// Shared with every [`HostInbound`] so a session-action's context can be
     /// checked against the live epoch (a reload bumps it, invalidating tokens).
     epoch: Arc<AtomicU64>,
+    /// Shared `provider/complete` delta-routing registry (Phase 7): each
+    /// [`HostInbound`] writes `provider/delta` chunks here; each
+    /// [`ExtensionLlmProvider`] reads its stream out.
+    provider_streams: ProviderStreams,
     /// The handshake context, retained so [`reload`](Self::reload) can re-send
     /// `initialize` with the same host/workspace/mode/ui_capabilities.
     host: HostInfo,
@@ -388,6 +417,7 @@ impl ExtensionHost {
         let mut extensions = Vec::new();
         let mut failures = Vec::new();
         let epoch = Arc::new(AtomicU64::new(1));
+        let provider_streams = ProviderStreams::new();
 
         for ext in discovered {
             let name = ext.manifest.name.clone();
@@ -399,7 +429,7 @@ impl ExtensionHost {
                 continue;
             }
 
-            match Self::load_one(&ext, &host, &workspace, mode, &ui_capabilities, &delegate, &epoch).await {
+            match Self::load_one(&ext, &host, &workspace, mode, &ui_capabilities, &delegate, &epoch, &provider_streams).await {
                 Ok(loaded) => extensions.push(loaded),
                 Err(e) => {
                     tracing::warn!(%name, error = %e, "extension: failed to load");
@@ -412,6 +442,7 @@ impl ExtensionHost {
             Self {
                 extensions,
                 epoch,
+                provider_streams,
                 host,
                 workspace,
                 mode: mode.to_string(),
@@ -421,6 +452,7 @@ impl ExtensionHost {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn load_one(
         ext: &DiscoveredExtension,
         host: &HostInfo,
@@ -429,6 +461,7 @@ impl ExtensionHost {
         ui_capabilities: &[String],
         delegate: &Arc<dyn HostDelegate>,
         epoch: &Arc<AtomicU64>,
+        streams: &ProviderStreams,
     ) -> anyhow::Result<Loaded> {
         let spec = SpawnSpec {
             command: ext.manifest.run.command.clone(),
@@ -440,6 +473,7 @@ impl ExtensionHost {
             ext: ext.manifest.name.clone(),
             delegate: Arc::clone(delegate),
             epoch: Arc::clone(epoch),
+            streams: streams.clone(),
         });
         let process = Arc::new(ExtensionProcess::spawn(spec, handler)?);
 
@@ -668,6 +702,87 @@ impl ExtensionHost {
         out
     }
 
+    /// Every LLM provider registered across all extensions, paired with the
+    /// owning extension name. The host merges these into its model surface
+    /// (`th cast models`, model pickers). Provider names are namespaced by the
+    /// consumer if it needs collision safety (mirroring `<ext>.<tool>`).
+    #[must_use]
+    pub fn providers(&self) -> Vec<(String, ProviderRegistration)> {
+        let mut out = Vec::new();
+        for ext in &self.extensions {
+            for p in &ext.init.read().expect("init lock").registrations.providers {
+                out.push((ext.name.clone(), p.clone()));
+            }
+        }
+        out
+    }
+
+    /// Find the extension process that registered a provider named `provider`.
+    fn provider_owner(&self, provider: &str) -> Option<Arc<ExtensionProcess>> {
+        for ext in &self.extensions {
+            if ext.init.read().expect("init lock").registrations.providers.iter().any(|p| p.name == provider) {
+                return Some(Arc::clone(&ext.process));
+            }
+        }
+        None
+    }
+
+    /// Build an [`LlmProvider`] that proxies `model` through the extension-
+    /// registered provider named `provider`. `thinking` sets the reasoning level
+    /// applied to every completion. Returns `None` if no loaded extension
+    /// registered that provider. A frontend calls this from `session/set_model`
+    /// (or at startup) and hands the result to its [`crate::Agent`].
+    #[must_use]
+    pub fn provider_for(&self, provider: &str, model: &str, thinking: Option<String>) -> Option<Arc<dyn LlmProvider>> {
+        let process = self.provider_owner(provider)?;
+        let p = ExtensionLlmProvider::new(process, self.provider_streams.clone(), provider, model, self.context(Tier::Command)).with_thinking(thinking);
+        Some(Arc::new(p))
+    }
+
+    /// Run the OAuth login handshake for `provider` through its extension. The
+    /// extension drives any user interaction over the `ui/*` surface and returns
+    /// the resulting [`ProviderCredentials`]. The generous timeout accommodates a
+    /// human completing a browser flow.
+    ///
+    /// # Errors
+    /// `-32601` if no loaded extension registered `provider`; otherwise the
+    /// extension's own error (or a timeout).
+    pub async fn provider_oauth_login(&self, provider: &str) -> Result<ProviderCredentials, RpcError> {
+        self.provider_oauth(
+            provider,
+            method::PROVIDER_OAUTH_LOGIN,
+            json!({ "provider": provider, "context": self.context(Tier::Command) }),
+        )
+        .await
+    }
+
+    /// Refresh `provider`'s credentials via its extension, presenting the current
+    /// `refresh_token`. Same ownership/error semantics as
+    /// [`provider_oauth_login`](Self::provider_oauth_login).
+    ///
+    /// # Errors
+    /// `-32601` if no loaded extension registered `provider`; otherwise the
+    /// extension's own error.
+    pub async fn provider_oauth_refresh(&self, provider: &str, refresh_token: &str) -> Result<ProviderCredentials, RpcError> {
+        self.provider_oauth(
+            provider,
+            method::PROVIDER_OAUTH_REFRESH,
+            json!({ "provider": provider, "refresh_token": refresh_token, "context": self.context(Tier::Command) }),
+        )
+        .await
+    }
+
+    async fn provider_oauth(&self, provider: &str, rpc_method: &str, params: Value) -> Result<ProviderCredentials, RpcError> {
+        let process = self
+            .provider_owner(provider)
+            .ok_or_else(|| RpcError::new(codes::METHOD_NOT_FOUND, format!("no extension registered provider `{provider}`")))?;
+        let raw = process
+            .request(rpc_method, params, Duration::from_secs(300))
+            .await
+            .map_err(|e| RpcError::new(codes::INTERNAL_ERROR, format!("{rpc_method}: {e}")))?;
+        serde_json::from_value(raw).map_err(|e| RpcError::new(codes::INTERNAL_ERROR, format!("bad {rpc_method} result: {e}")))
+    }
+
     /// Find the extension process that registered `command` (optionally scoped to
     /// a specific extension when the name was namespaced `<ext>.<cmd>`).
     fn command_owner(&self, ext_name: Option<&str>, command: &str) -> Option<Arc<ExtensionProcess>> {
@@ -770,6 +885,7 @@ impl Default for ExtensionHost {
         Self {
             extensions: Vec::new(),
             epoch: Arc::new(AtomicU64::new(1)),
+            provider_streams: ProviderStreams::new(),
             host: HostInfo {
                 name: "smooth-operator-core".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -938,6 +1054,7 @@ mod tests {
             ext: "e".into(),
             delegate: Arc::new(DefaultHostDelegate),
             epoch: Arc::new(AtomicU64::new(1)),
+            streams: ProviderStreams::new(),
         };
         assert!(inbound.handle_request(method::PING, Value::Null).await.is_ok());
         inbound.handle_request("kv/set", json!({"key": "a", "value": 5})).await.unwrap();
@@ -1024,6 +1141,31 @@ mod tests {
             self.hits.lock().unwrap().push("append_entry".into());
             Ok(json!({}))
         }
+        async fn session_set_model(&self, _ext: &str, _params: Value) -> Result<Value, RpcError> {
+            self.hits.lock().unwrap().push("set_model".into());
+            Ok(json!({}))
+        }
+    }
+
+    #[tokio::test]
+    async fn host_inbound_set_model_is_tier_guarded() {
+        let delegate = Arc::new(RecordingDelegate::default());
+        let inbound = HostInbound {
+            ext: "e".into(),
+            delegate: Arc::clone(&delegate) as Arc<dyn HostDelegate>,
+            epoch: Arc::new(AtomicU64::new(1)),
+            streams: ProviderStreams::new(),
+        };
+        // Event-tier set_model is rejected BEFORE the delegate (like every session action).
+        let params = json!({ "context": { "tier": "event", "token": "epoch-1" }, "model": "m" });
+        let err = inbound.handle_request(method::SESSION_SET_MODEL, params).await.unwrap_err();
+        assert_eq!(err.code, codes::CONTEXT_VIOLATION);
+        assert!(delegate.hits.lock().unwrap().is_empty());
+
+        // Command-tier + current epoch reaches the delegate.
+        let ok = json!({ "context": { "tier": "command", "token": "epoch-1" }, "model": "m", "provider": "p" });
+        inbound.handle_request(method::SESSION_SET_MODEL, ok).await.expect("valid set_model");
+        assert_eq!(&*delegate.hits.lock().unwrap(), &["set_model"]);
     }
 
     #[tokio::test]
@@ -1034,6 +1176,7 @@ mod tests {
             ext: "e".into(),
             delegate: Arc::clone(&delegate) as Arc<dyn HostDelegate>,
             epoch: Arc::clone(&epoch),
+            streams: ProviderStreams::new(),
         };
 
         // Valid: command tier + current epoch → delegate is hit.

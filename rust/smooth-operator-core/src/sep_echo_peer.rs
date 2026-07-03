@@ -32,6 +32,12 @@ fn main() {
 
     let slow = std::env::var("SEP_ECHO_SLOW").is_ok();
     let ui = std::env::var("SEP_ECHO_UI").is_ok();
+    // `SEP_ECHO_PROVIDER=1` — register an LLM provider and answer `provider/*`
+    // (Phase 7). `provider/complete` streams two `provider/delta` chunks ("Hel",
+    // "lo") when `stream` is set, then replies "Hello"; `provider/oauth_login`
+    // returns a canned credential bundle. Exercises the proxied-streaming +
+    // OAuth wire deterministically.
+    let provider = std::env::var("SEP_ECHO_PROVIDER").is_ok();
     // In slow mode, the JSON-RPC id of a `tool/execute` whose reply we are
     // holding back until a matching `$/cancel` arrives.
     let mut held_tool_call: Option<Value> = None;
@@ -81,6 +87,15 @@ fn main() {
                             }],
                             "commands": [{ "name": "echo-cmd", "description": "Echo a slash-command back." }],
                             "shortcuts": [{ "key": "ctrl+e", "command": "echo-cmd", "description": "Run echo-cmd" }],
+                            "providers": if provider {
+                                json!([{
+                                    "name": "echo-provider",
+                                    "base_url": "https://echo.example/v1",
+                                    "api_key_env": "ECHO_KEY",
+                                    "oauth": true,
+                                    "models": [{ "id": "echo-1", "display_name": "Echo One" }]
+                                }])
+                            } else { json!([]) },
                             "subscriptions": ["turn_start", "turn_end", "message_end", "session_start", "session_shutdown"]
                         }
                     }),
@@ -147,6 +162,42 @@ fn main() {
             "tool/execute" => {
                 let phrase = params.get("arguments").and_then(|a| a.get("phrase")).and_then(Value::as_str).unwrap_or("");
                 success(&id, json!({ "content": phrase }))
+            }
+            // Provider proxy: stream two delta chunks (when asked) then reply
+            // with the assembled content. `request_id` keys the delta stream.
+            "provider/complete" => {
+                let request_id = params.get("request_id").and_then(Value::as_str).unwrap_or("").to_string();
+                let stream = params.get("stream").and_then(Value::as_bool).unwrap_or(false);
+                if stream {
+                    for chunk in ["Hel", "lo"] {
+                        write_frame(
+                            &mut out,
+                            &notification(
+                                "provider/delta",
+                                json!({ "request_id": request_id, "event": { "type": "Delta", "content": chunk } }),
+                            ),
+                        );
+                    }
+                }
+                success(
+                    &id,
+                    json!({
+                        "content": "Hello",
+                        "finish_reason": "stop",
+                        "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 },
+                        "resolved_model": "echo-1"
+                    }),
+                )
+            }
+            // OAuth: the extension would drive a real handshake (ui/* callbacks);
+            // the peer just returns a canned bundle so the wire is exercised.
+            "provider/oauth_login" => success(
+                &id,
+                json!({ "api_key": "sk-echo-oauth", "refresh_token": "rt-echo", "expires_at": 1_900_000_000i64 }),
+            ),
+            "provider/oauth_refresh" => {
+                let rt = params.get("refresh_token").and_then(Value::as_str).unwrap_or("");
+                success(&id, json!({ "api_key": "sk-echo-refreshed", "refresh_token": rt }))
             }
             // A command handler echoes its name + args back as content. The
             // command-tier context arrives in params.context (the host minted it).
