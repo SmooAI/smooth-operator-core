@@ -15,6 +15,11 @@
 //!   notification and then WITHHOLDS its reply until a `$/cancel` arrives for
 //!   that request, at which point it answers -32800 Cancelled. Exercises the
 //!   tool/update + $/cancel wire path deterministically.
+//! - `SEP_ECHO_UI=1` — `tool/execute` sends an ext→host `ui/request` (a
+//!   `confirm`) whose prompt echoes the `ui_capabilities` the host declared at
+//!   `initialize`, waits for the host's reply, and returns `confirmed=<…>` as
+//!   the tool content. Exercises the ui/request seam and proves ui_capabilities
+//!   threading end-to-end (answered value or `error:-32001` when headless).
 
 use std::io::{BufRead, Write};
 
@@ -26,11 +31,16 @@ fn main() {
     let mut out = stdout.lock();
 
     let slow = std::env::var("SEP_ECHO_SLOW").is_ok();
+    let ui = std::env::var("SEP_ECHO_UI").is_ok();
     // In slow mode, the JSON-RPC id of a `tool/execute` whose reply we are
     // holding back until a matching `$/cancel` arrives.
     let mut held_tool_call: Option<Value> = None;
+    // ui_capabilities the host declared at `initialize`; SEP_ECHO_UI echoes them
+    // back through the ui/request prompt so a test can prove they were threaded.
+    let mut ui_caps: Vec<String> = Vec::new();
 
-    for line in stdin.lock().lines() {
+    let mut lines = stdin.lock().lines();
+    while let Some(line) = lines.next() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
@@ -55,6 +65,9 @@ fn main() {
         let reply = match method {
             "initialize" => {
                 let their_version = params.get("protocol_version").and_then(Value::as_u64).unwrap_or(1);
+                if let Some(caps) = params.get("ui_capabilities").and_then(Value::as_array) {
+                    ui_caps = caps.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                }
                 success(
                     &id,
                     json!({
@@ -89,6 +102,36 @@ fn main() {
             // host's tool_call-layering test.
             "hook" if std::env::var("SEP_ECHO_BLOCK").is_ok() => success(&id, json!({ "action": "block", "reason": "blocked by echo peer" })),
             "hook" => success(&id, json!({ "action": "continue" })),
+            // UI mode: round-trip a ui/request confirm to the host, echoing the
+            // negotiated caps in the prompt, and return the host's answer.
+            "tool/execute" if ui => {
+                let req_id = json!(9001);
+                write_frame(
+                    &mut out,
+                    &json!({
+                        "jsonrpc": "2.0", "id": req_id, "method": "ui/request",
+                        "params": { "kind": "confirm", "prompt": format!("caps={}", ui_caps.join(",")) }
+                    }),
+                );
+                // Read frames until the host's reply to req_id arrives.
+                let mut confirmed = String::from("no-reply");
+                for inner in lines.by_ref() {
+                    let Ok(inner) = inner else { break };
+                    let Ok(v): Result<Value, _> = serde_json::from_str(&inner) else { continue };
+                    if v.get("id") == Some(&req_id) {
+                        confirmed = if let Some(err) = v.get("error") {
+                            format!("error:{}", err.get("code").and_then(Value::as_i64).unwrap_or(0))
+                        } else {
+                            v.get("result")
+                                .and_then(|r| r.get("confirmed"))
+                                .and_then(Value::as_bool)
+                                .map_or_else(|| "none".to_string(), |b| b.to_string())
+                        };
+                        break;
+                    }
+                }
+                success(&id, json!({ "content": format!("confirmed={confirmed}") }))
+            }
             // Slow mode: stream progress, then hold the reply for a $/cancel.
             "tool/execute" if slow => {
                 let call_id = params.get("call_id").and_then(Value::as_str).unwrap_or("");

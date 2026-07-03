@@ -298,6 +298,7 @@ impl ExtensionHost {
         host: HostInfo,
         workspace: WorkspaceInfo,
         mode: &str,
+        ui_capabilities: Vec<String>,
         delegate: Arc<dyn HostDelegate>,
     ) -> (Self, Vec<(String, String)>) {
         let mut extensions = Vec::new();
@@ -313,7 +314,7 @@ impl ExtensionHost {
                 continue;
             }
 
-            match Self::load_one(&ext, &host, &workspace, mode, &delegate).await {
+            match Self::load_one(&ext, &host, &workspace, mode, &ui_capabilities, &delegate).await {
                 Ok(loaded) => extensions.push(loaded),
                 Err(e) => {
                     tracing::warn!(%name, error = %e, "extension: failed to load");
@@ -336,6 +337,7 @@ impl ExtensionHost {
         host: &HostInfo,
         workspace: &WorkspaceInfo,
         mode: &str,
+        ui_capabilities: &[String],
         delegate: &Arc<dyn HostDelegate>,
     ) -> anyhow::Result<Loaded> {
         let spec = SpawnSpec {
@@ -356,7 +358,7 @@ impl ExtensionHost {
             workspace: workspace.clone(),
             session: None,
             mode: mode.to_string(),
-            ui_capabilities: Vec::new(),
+            ui_capabilities: ui_capabilities.to_vec(),
             capabilities_enabled: None,
         };
         let raw = process

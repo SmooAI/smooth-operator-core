@@ -70,6 +70,7 @@ async fn load_host(global: &std::path::Path) -> ExtensionHost {
             trusted: true,
         },
         "headless",
+        Vec::new(),
         Arc::new(DefaultHostDelegate),
     )
     .await;
