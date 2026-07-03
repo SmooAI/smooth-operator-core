@@ -296,6 +296,53 @@ fn kv_file_store(ext: &str, map: &serde_json::Map<String, Value>) -> Result<(), 
     std::fs::write(&path, text).map_err(|e| RpcError::new(codes::INTERNAL_ERROR, format!("kv write: {e}")))
 }
 
+/// Shared fanout table for the inter-extension bus (Phase 8). Every loaded
+/// extension's inbound reader holds a clone; when one sends `bus/publish` the
+/// host re-emits it as a [`events::BUS_EVENT`](super::events::BUS_EVENT) observe
+/// event to every *other* extension subscribed to it. Entries share the same
+/// `Arc<ExtensionProcess>` + subscription handle the [`Loaded`] records hold, so
+/// a hot reload's subscription swap is reflected here with no re-registration.
+#[derive(Clone, Default)]
+struct BusRegistry {
+    entries: Arc<std::sync::RwLock<Vec<BusEntry>>>,
+}
+
+struct BusEntry {
+    name: String,
+    /// `Weak` on purpose: the process holds its handler which holds a
+    /// `BusRegistry` clone, so a strong ref here would cycle and leak the
+    /// process on host drop. A dropped process simply fails to upgrade → skipped.
+    process: std::sync::Weak<ExtensionProcess>,
+    subscriptions: Arc<std::sync::RwLock<HashSet<String>>>,
+}
+
+impl BusRegistry {
+    fn register(&self, name: String, process: &Arc<ExtensionProcess>, subscriptions: Arc<std::sync::RwLock<HashSet<String>>>) {
+        self.entries.write().expect("bus lock").push(BusEntry {
+            name,
+            process: Arc::downgrade(process),
+            subscriptions,
+        });
+    }
+
+    /// Fan a published message out to every other extension subscribed to
+    /// `bus/event`, skipping the publisher. Fire-and-forget through each
+    /// process's bounded lossy lane — a slow subscriber never stalls the sender.
+    fn publish(&self, from: &str, ctx: &Value, payload: Value) {
+        for entry in self.entries.read().expect("bus lock").iter() {
+            if entry.name == from {
+                continue;
+            }
+            if !entry.subscriptions.read().expect("subscriptions lock").contains(super::events::BUS_EVENT) {
+                continue;
+            }
+            if let Some(process) = entry.process.upgrade() {
+                process.send_event(super::events::BUS_EVENT, ctx, payload.clone());
+            }
+        }
+    }
+}
+
 /// Bridges the process reader's ext→host requests to the [`HostDelegate`]. Holds
 /// the host's shared epoch so it can reject stale/event-tier session actions.
 struct HostInbound {
@@ -305,6 +352,9 @@ struct HostInbound {
     /// Shared delta-routing registry: `provider/delta` notifications land here,
     /// keyed by their in-flight `provider/complete` request_id.
     streams: ProviderStreams,
+    /// Inter-extension bus fanout table (Phase 8): a `bus/publish` from this
+    /// extension is re-emitted to the others through here.
+    bus: BusRegistry,
 }
 
 #[async_trait]
@@ -342,6 +392,20 @@ impl InboundHandler for HostInbound {
                 self.delegate.kv_set(&self.ext, &key, value).await?;
                 Ok(json!({}))
             }
+            // Inter-extension bus (Phase 8): re-emit to subscribers of bus/event,
+            // never back to the publisher. Best-effort, so it always acks OK.
+            method::BUS_PUBLISH => {
+                let topic = params.get("topic").and_then(Value::as_str).unwrap_or_default();
+                let payload = params.get("payload").cloned().unwrap_or(Value::Null);
+                let ctx = serde_json::to_value(Context {
+                    token: format!("epoch-{}", self.epoch.load(Ordering::SeqCst)),
+                    tier: Tier::Event,
+                })
+                .unwrap_or(Value::Null);
+                self.bus
+                    .publish(&self.ext, &ctx, json!({ "from": self.ext, "topic": topic, "payload": payload }));
+                Ok(json!({}))
+            }
             other => Err(RpcError::new(codes::METHOD_NOT_FOUND, format!("method not found: {other}"))),
         }
     }
@@ -369,7 +433,10 @@ struct Loaded {
     name: String,
     process: Arc<ExtensionProcess>,
     init: std::sync::RwLock<InitializeResult>,
-    subscriptions: std::sync::RwLock<HashSet<String>>,
+    /// `Arc` so the inter-extension bus registry (Phase 8) shares the exact same
+    /// subscription set — a hot reload's swap (see [`ExtensionHost::reload`]) is
+    /// then visible to the bus with no re-registration.
+    subscriptions: Arc<std::sync::RwLock<HashSet<String>>>,
     /// The manifest's declared event allow-list — the clamp `subscriptions` can
     /// never widen past, re-applied on reload so a restart can't escalate.
     declared_events: Vec<String>,
@@ -418,6 +485,7 @@ impl ExtensionHost {
         let mut failures = Vec::new();
         let epoch = Arc::new(AtomicU64::new(1));
         let provider_streams = ProviderStreams::new();
+        let bus = BusRegistry::default();
 
         for ext in discovered {
             let name = ext.manifest.name.clone();
@@ -429,7 +497,7 @@ impl ExtensionHost {
                 continue;
             }
 
-            match Self::load_one(&ext, &host, &workspace, mode, &ui_capabilities, &delegate, &epoch, &provider_streams).await {
+            match Self::load_one(&ext, &host, &workspace, mode, &ui_capabilities, &delegate, &epoch, &provider_streams, &bus).await {
                 Ok(loaded) => extensions.push(loaded),
                 Err(e) => {
                     tracing::warn!(%name, error = %e, "extension: failed to load");
@@ -462,6 +530,7 @@ impl ExtensionHost {
         delegate: &Arc<dyn HostDelegate>,
         epoch: &Arc<AtomicU64>,
         streams: &ProviderStreams,
+        bus: &BusRegistry,
     ) -> anyhow::Result<Loaded> {
         let spec = SpawnSpec {
             command: ext.manifest.run.command.clone(),
@@ -474,16 +543,19 @@ impl ExtensionHost {
             delegate: Arc::clone(delegate),
             epoch: Arc::clone(epoch),
             streams: streams.clone(),
+            bus: bus.clone(),
         });
         let process = Arc::new(ExtensionProcess::spawn(spec, handler)?);
 
         let init = Self::initialize(&process, host, workspace, mode, ui_capabilities).await?;
         let subscriptions = effective_subscriptions(&ext.manifest.capabilities.events, &init.registrations.subscriptions);
+        let subscriptions = Arc::new(std::sync::RwLock::new(subscriptions));
+        bus.register(ext.manifest.name.clone(), &process, Arc::clone(&subscriptions));
         Ok(Loaded {
             name: ext.manifest.name.clone(),
             process,
             init: std::sync::RwLock::new(init),
-            subscriptions: std::sync::RwLock::new(subscriptions),
+            subscriptions,
             declared_events: ext.manifest.capabilities.events.clone(),
             hook_timeout: ext.manifest.hook_timeout_ms.map(Duration::from_millis),
         })
@@ -572,6 +644,44 @@ impl ExtensionHost {
             // events_lost marker) instead of stalling the agent or leaking memory.
             ext.process.send_event(event, &ctx, payload.clone());
         }
+    }
+
+    /// Route a keypress to a specific extension's active render-block v2 widget
+    /// (Phase 8). A *targeted* host→ext notification — unlike [`Self::dispatch_event`]
+    /// it addresses one extension by name and bypasses the observe subscription
+    /// filter (the widget's owner always receives its own keys). Fire-and-forget;
+    /// an unknown name is a no-op. `payload` carries `{widget_id?, key}`.
+    pub fn dispatch_widget_key(&self, ext: &str, payload: Value) {
+        let ctx = serde_json::to_value(self.context(Tier::Event)).unwrap_or(Value::Null);
+        if let Some(e) = self.extensions.iter().find(|e| e.name == ext) {
+            e.process.send_event(super::events::WIDGET_KEY, &ctx, payload);
+        }
+    }
+
+    /// True if any loaded extension might handle `hook`. An extension that
+    /// declared its `hooks` list is consulted exactly; one that declared none
+    /// (a pre-Phase-8 wire, or a test peer) is assumed to handle everything, so
+    /// gating on this never drops a hook an older extension actually implements.
+    /// Lets a caller skip the per-turn `context` serialization when nobody hooks
+    /// it (the hot path when extensions are loaded only for tools/events).
+    #[must_use]
+    pub fn any_hook(&self, hook: HookType) -> bool {
+        let name = hook.as_str();
+        self.extensions.iter().any(|e| {
+            let hooks = &e.init.read().expect("init lock").registrations.hooks;
+            hooks.is_empty() || hooks.iter().any(|h| h == name)
+        })
+    }
+
+    /// Declarative message renderers registered across all extensions (Phase 8),
+    /// in load order. The frontend queries this to map a custom message `tag` to
+    /// its render template. Data-only — the host never interprets the template.
+    #[must_use]
+    pub fn message_renderers(&self) -> Vec<super::protocol::MessageRendererRegistration> {
+        self.extensions
+            .iter()
+            .flat_map(|e| e.init.read().expect("init lock").registrations.message_renderers.clone())
+            .collect()
     }
 
     /// Run a hook across every extension in load order, folding the chain. Each
@@ -1055,6 +1165,7 @@ mod tests {
             delegate: Arc::new(DefaultHostDelegate),
             epoch: Arc::new(AtomicU64::new(1)),
             streams: ProviderStreams::new(),
+            bus: BusRegistry::default(),
         };
         assert!(inbound.handle_request(method::PING, Value::Null).await.is_ok());
         inbound.handle_request("kv/set", json!({"key": "a", "value": 5})).await.unwrap();
@@ -1155,6 +1266,7 @@ mod tests {
             delegate: Arc::clone(&delegate) as Arc<dyn HostDelegate>,
             epoch: Arc::new(AtomicU64::new(1)),
             streams: ProviderStreams::new(),
+            bus: BusRegistry::default(),
         };
         // Event-tier set_model is rejected BEFORE the delegate (like every session action).
         let params = json!({ "context": { "tier": "event", "token": "epoch-1" }, "model": "m" });
@@ -1177,6 +1289,7 @@ mod tests {
             delegate: Arc::clone(&delegate) as Arc<dyn HostDelegate>,
             epoch: Arc::clone(&epoch),
             streams: ProviderStreams::new(),
+            bus: BusRegistry::default(),
         };
 
         // Valid: command tier + current epoch → delegate is hit.

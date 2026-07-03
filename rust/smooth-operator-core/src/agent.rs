@@ -417,6 +417,31 @@ struct SepToolPlan {
     blocks: std::collections::HashMap<String, String>,
 }
 
+/// The lowercase wire name for a role in the SEP `context` hook's `{role, content}`
+/// message shape.
+fn role_wire_name(role: &Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
+}
+
+/// Rebuild a [`Message`] from a `context`-hook `{role, content}` wire object,
+/// filling the engine-owned `id`/`timestamp`. Missing/blank `content` is fine
+/// (an empty message); a missing `role` or a non-object entry is dropped. Any
+/// role outside system/user/assistant collapses to user.
+fn wire_message_to_message(v: &serde_json::Value) -> Option<Message> {
+    let role = v.get("role").and_then(serde_json::Value::as_str)?;
+    let content = v.get("content").and_then(serde_json::Value::as_str).unwrap_or_default();
+    Some(match role {
+        "system" => Message::system(content),
+        "assistant" => Message::assistant(content),
+        _ => Message::user(content),
+    })
+}
+
 /// Configuration for a sub-agent spawned via delegation.
 #[derive(Debug, Clone)]
 pub struct SubAgentConfig {
@@ -661,6 +686,7 @@ impl Agent {
     #[allow(clippy::too_many_lines)]
     pub async fn run(&self, user_message: impl Into<String>) -> anyhow::Result<Conversation> {
         let mut conversation = self.resume_or_new()?;
+        self.sep_before_agent_start(&mut conversation).await;
         let user_msg: String = user_message.into();
 
         // Pre-seed prior session turns (pearl th-422b93) before
@@ -725,7 +751,13 @@ impl Agent {
 
             // Observe: get context window
             let context = conversation.context_window();
-            let context_refs: Vec<&Message> = context.into_iter().collect();
+            // SEP `context` hook may replace the whole message array before the
+            // LLM sees it; `None` keeps the borrowed, zero-copy path (unhooked).
+            let context_rewrite = self.sep_context_rewrite(&context).await;
+            let context_refs: Vec<&Message> = match &context_rewrite {
+                Some(msgs) => msgs.iter().collect(),
+                None => context.to_vec(),
+            };
 
             self.emit(AgentEvent::LlmRequest {
                 iteration,
@@ -880,6 +912,7 @@ impl Agent {
     #[allow(clippy::too_many_lines)]
     pub async fn run_with_channel(&self, user_message: impl Into<String>, tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>) -> anyhow::Result<Conversation> {
         let mut conversation = self.resume_or_new()?;
+        self.sep_before_agent_start(&mut conversation).await;
         let user_msg: String = user_message.into();
 
         // Pre-seed prior session turns (pearl th-422b93) before
@@ -942,7 +975,13 @@ impl Agent {
             }
 
             let context = conversation.context_window();
-            let context_refs: Vec<&Message> = context.into_iter().collect();
+            // SEP `context` hook may replace the whole message array before the
+            // LLM sees it; `None` keeps the borrowed, zero-copy path (unhooked).
+            let context_rewrite = self.sep_context_rewrite(&context).await;
+            let context_refs: Vec<&Message> = match &context_rewrite {
+                Some(msgs) => msgs.iter().collect(),
+                None => context.to_vec(),
+            };
 
             let _ = tx.send(AgentEvent::LlmRequest {
                 iteration,
@@ -1332,6 +1371,60 @@ impl Agent {
                 host.dispatch_event(event, payload);
             }
         }
+    }
+
+    /// SEP: run the fail-open `before_agent_start` hook once at run start, letting
+    /// extensions rewrite the system prompt. Applied AFTER `resume_or_new` so it
+    /// composes with (never replaces) the resolved persona/system prompt. No-op
+    /// when no host is attached. The rewrite is folded across extensions in load
+    /// order; a block/failure leaves the prompt unchanged (fail-open).
+    async fn sep_before_agent_start(&self, conversation: &mut Conversation) {
+        let Some(host) = self.extension_host.as_ref() else {
+            return;
+        };
+        let Some(current) = conversation.messages.iter().find(|m| m.role == Role::System).map(|m| m.content.clone()) else {
+            return;
+        };
+        let rewritten = host.before_agent_start(&current).await;
+        if rewritten != current {
+            if let Some(msg) = conversation.messages.iter_mut().find(|m| m.role == Role::System) {
+                msg.content = rewritten;
+            }
+        }
+    }
+
+    /// SEP: run the fail-open `context` hook, letting extensions replace the
+    /// entire message array sent to the LLM this iteration (pi's `context`
+    /// middleware analog). Returns `None` — and the caller keeps its borrowed,
+    /// zero-copy context — when no host is attached or no extension hooks
+    /// `context`; `Some(replacement)` when a hook rewrote it. Fail-open: a
+    /// block, failure, or unparseable replacement keeps the original messages.
+    ///
+    /// Wire shape is the pi-friendly `{role, content}` (the engine's full
+    /// `Message` — with its `id`/`timestamp`/`tool_calls` — is deliberately not
+    /// exposed so an extension can synthesize messages without forging those
+    /// fields). A returned `role` outside system/user/assistant maps to user.
+    async fn sep_context_rewrite(&self, context: &[&Message]) -> Option<Vec<Message>> {
+        let host = self.extension_host.as_ref()?;
+        if !host.any_hook(crate::extension::HookType::Context) {
+            return None;
+        }
+        let wire: Vec<serde_json::Value> = context
+            .iter()
+            .map(|m| serde_json::json!({ "role": role_wire_name(&m.role), "content": m.content }))
+            .collect();
+        let input = serde_json::json!({ "messages": wire });
+        let crate::extension::FoldedHook::Proceed(patch) = host.run_hook(crate::extension::HookType::Context, input).await else {
+            return None;
+        };
+        let arr = patch.get("messages")?.as_array()?;
+        let out: Vec<Message> = arr.iter().filter_map(wire_message_to_message).collect();
+        // A non-empty array that parsed to nothing is a malformed rewrite →
+        // fail-open (keep the originals). An intentional empty array passes.
+        if out.is_empty() && !arr.is_empty() {
+            return None;
+        }
+        Some(out)
     }
 
     /// Execute a turn's tool calls, honoring the SEP plan, running the
