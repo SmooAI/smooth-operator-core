@@ -25,7 +25,10 @@ pub mod tool_proxy;
 pub use host::{fold_hook_chain, DefaultHostDelegate, ExtensionHost, FoldedHook, HookStep, HookType, HostDelegate, PROTOCOL_VERSION};
 pub use manifest::{discover, Capabilities, DiscoveredExtension, ExtensionManifest, Resources, RunSpec, Scope};
 pub use process::{backoff_for, DefaultInboundHandler, ExtensionProcess, InboundHandler, SpawnSpec, PING_IDLE, RESTART_BACKOFFS};
-pub use protocol::{Context, HookOutcome, Message, RpcError, Tier};
+pub use protocol::{
+    CommandCompleteResult, CommandExecuteResult, CommandRegistration, Completion, Context, DeliverAs, HookOutcome, Message, RpcError, ShortcutRegistration,
+    Tier,
+};
 pub use tool_proxy::ExtensionTool;
 
 /// Canonical SEP event names the host dispatches to subscribed extensions.

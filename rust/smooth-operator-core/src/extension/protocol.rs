@@ -218,6 +218,11 @@ pub struct InitializeParams {
     pub mode: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui_capabilities: Vec<String>,
+    /// Parsed values for the flags the extension declares (name → value). A host
+    /// with a CLI surface fills this; hosts without one send it empty. The
+    /// extension reads its flag values here at startup.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub flags: serde_json::Map<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities_enabled: Option<serde_json::Value>,
 }
@@ -243,6 +248,18 @@ pub struct CommandRegistration {
     pub description: String,
 }
 
+/// A keyboard shortcut an extension binds to one of its commands. Frontends
+/// that have a key surface (the TUI) honor these; headless hosts ignore them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ShortcutRegistration {
+    /// A human-typed chord, e.g. `ctrl+p` or `f2`. The frontend parses it.
+    pub key: String,
+    /// The registered command name this chord invokes (no leading `/`).
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Registrations {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -251,6 +268,8 @@ pub struct Registrations {
     pub commands: Vec<CommandRegistration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shortcuts: Vec<ShortcutRegistration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subscriptions: Vec<String>,
 }
@@ -350,6 +369,104 @@ pub struct LogParams {
     pub fields: Option<serde_json::Value>,
 }
 
+// ---------------------------------------------------------------------------
+// command/execute + command/complete (host→ext)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommandExecuteParams {
+    /// The registered command name (no leading `/`, no `<ext>.` prefix).
+    pub command: String,
+    /// COMMAND-tier context: a command handler may take session-mutating actions.
+    pub context: Context,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CommandExecuteResult {
+    /// Optional text surfaced back into the session by the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommandCompleteParams {
+    pub command: String,
+    pub context: Context,
+    /// The partial argument text typed so far.
+    #[serde(default)]
+    pub partial: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Completion {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CommandCompleteResult {
+    #[serde(default)]
+    pub completions: Vec<Completion>,
+}
+
+// ---------------------------------------------------------------------------
+// session/* (ext→host) — all require COMMAND tier
+// ---------------------------------------------------------------------------
+
+/// How a `session/send_user_message` is delivered relative to the current turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliverAs {
+    /// Interrupt the in-flight turn with the new user message.
+    Steer,
+    /// Queue after the current turn completes.
+    FollowUp,
+    /// Deliver at the start of the next turn.
+    NextTurn,
+}
+
+impl DeliverAs {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeliverAs::Steer => "steer",
+            DeliverAs::FollowUp => "follow_up",
+            DeliverAs::NextTurn => "next_turn",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionSendMessageParams {
+    pub context: Context,
+    pub text: String,
+    /// `user` or `assistant`; defaults to `assistant`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionSendUserMessageParams {
+    pub context: Context,
+    pub text: String,
+    #[serde(default = "default_deliver_as")]
+    pub deliver_as: DeliverAs,
+}
+
+fn default_deliver_as() -> DeliverAs {
+    DeliverAs::FollowUp
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionAppendEntryParams {
+    pub context: Context,
+    /// An opaque transcript entry, persisted but NOT sent to the model.
+    pub entry: serde_json::Value,
+}
+
 /// SEP method names, centralized so the host and tests never spell one wrong.
 pub mod method {
     pub const INITIALIZE: &str = "initialize";
@@ -360,6 +477,7 @@ pub mod method {
     pub const TOOL_EXECUTE: &str = "tool/execute";
     pub const TOOL_UPDATE: &str = "tool/update";
     pub const COMMAND_EXECUTE: &str = "command/execute";
+    pub const COMMAND_COMPLETE: &str = "command/complete";
     pub const CANCEL: &str = "$/cancel";
     pub const REGISTRY_UPDATE: &str = "registry/update";
     pub const TOOLS_SET_ACTIVE: &str = "tools/set_active";
@@ -367,6 +485,9 @@ pub mod method {
     pub const UI_REQUEST: &str = "ui/request";
     pub const LOG: &str = "log";
     pub const BUS_PUBLISH: &str = "bus/publish";
+    pub const SESSION_SEND_MESSAGE: &str = "session/send_message";
+    pub const SESSION_SEND_USER_MESSAGE: &str = "session/send_user_message";
+    pub const SESSION_APPEND_ENTRY: &str = "session/append_entry";
 }
 
 #[cfg(test)]
@@ -444,6 +565,7 @@ mod tests {
             session: Some(SessionInfo { id: Some("s1".into()) }),
             mode: "headless".into(),
             ui_capabilities: vec!["confirm".into()],
+            flags: serde_json::Map::new(),
             capabilities_enabled: Some(json!({"tools": true})),
         };
         assert_eq!(roundtrip(&p), p);
