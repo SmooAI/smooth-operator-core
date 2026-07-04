@@ -641,6 +641,23 @@ impl Agent {
             // the default wait before an unanswered ask fails closed.
             permission_hook = permission_hook.with_approver(tx, rx, std::time::Duration::from_secs(300));
         }
+        // Wire the persistent allow-list (pearl th-22bfc1): approvals are
+        // remembered across runs so an `Ask` matching a stored grant
+        // auto-approves without re-prompting. Load stacks the user file
+        // (`~/.smooth/wonk-allow.toml`) under the project file
+        // (`<cwd>/.smooth/wonk-allow.toml`, project wins); `ApprovedAlways`
+        // persists new grants to the user file. A missing home dir (rare CI)
+        // just leaves the allow-list off — every `Ask` still prompts.
+        if let Some(user_path) = crate::permission_grants::user_grants_path() {
+            let project_path = std::env::current_dir().ok().map(|cwd| crate::permission_grants::project_grants_path(&cwd));
+            match crate::permission_grants::PermissionGrants::load_layered(Some(&user_path), project_path.as_deref()) {
+                Ok(grants) => {
+                    permission_hook = permission_hook.with_grants(crate::permission_grants::SharedGrants::new(grants), user_path);
+                }
+                // A malformed allow-list must fail loud, not silently grant nothing.
+                Err(e) => tracing::warn!("permission allow-list disabled — {e}"),
+            }
+        }
         self.tools.add_hook(permission_hook);
         // Then scan the calls that clear the permission gate for secrets +
         // prompt injection (pearl th-5f7227). Extension arguments went to the

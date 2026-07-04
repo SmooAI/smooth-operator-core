@@ -31,8 +31,17 @@ pub enum HumanRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum HumanResponse {
-    /// The human approved the action.
+    /// The human approved the action, once.
     Approved,
+    /// The human approved the action **and** asked never to be prompted for it
+    /// again — the [`PermissionHook`](crate::permission::PermissionHook)
+    /// persists a matching grant to `wonk-allow.toml` so a later identical
+    /// `Ask` auto-approves silently. Treated exactly like [`Approved`] by the
+    /// plain [`ConfirmationHook`], which has no grant store. Additive variant
+    /// (pearl th-22bfc1) — existing serialized payloads stay valid.
+    ///
+    /// [`Approved`]: HumanResponse::Approved
+    ApprovedAlways,
     /// The human denied the action, with an optional reason.
     Denied { reason: String },
     /// The human provided free-form input.
@@ -101,7 +110,8 @@ impl ToolHook for ConfirmationHook {
         // Wait for response with timeout.
         let mut rx = self.rx.lock().await;
         match tokio::time::timeout(self.timeout, rx.recv()).await {
-            Ok(Some(HumanResponse::Approved)) => Ok(()),
+            // ConfirmationHook has no grant store, so "approve always" is just an approval here.
+            Ok(Some(HumanResponse::Approved | HumanResponse::ApprovedAlways)) => Ok(()),
             Ok(Some(HumanResponse::Denied { reason })) => {
                 anyhow::bail!("User denied: {reason}")
             }
@@ -202,6 +212,7 @@ mod tests {
 
         let responses = vec![
             HumanResponse::Approved,
+            HumanResponse::ApprovedAlways,
             HumanResponse::Denied { reason: "no".into() },
             HumanResponse::Input { content: "hello".into() },
             HumanResponse::Timeout,

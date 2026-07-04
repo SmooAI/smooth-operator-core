@@ -22,6 +22,7 @@ pub mod llm_provider;
 pub mod memory;
 pub mod narc;
 pub mod permission;
+pub mod permission_grants;
 pub mod providers;
 pub mod quirks;
 pub mod resolution;
@@ -48,6 +49,7 @@ pub use narc::{NarcHook, Severity};
 // at the crate root because `cast::PermissionHook` (role clearance) already
 // owns that name. Reach it via `smooth_operator_core::permission::PermissionHook`.
 pub use permission::{AutoMode, Verdict};
+pub use permission_grants::{append_grant, project_grants_path, user_grants_path, GrantQuery, PermissionGrants, SharedGrants};
 pub use providers::{Activity, ModelRouting, ModelSlot, ProviderConfig, ProviderRegistry};
 pub use tool::{Tool, ToolCall, ToolRegistry, ToolResult, ToolSchema};
 pub use workflow::{EdgeTarget, FnNode, Node, State, Workflow, WorkflowBuilder};

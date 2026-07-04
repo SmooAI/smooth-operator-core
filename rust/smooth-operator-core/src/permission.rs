@@ -21,14 +21,15 @@
 //! exhaustively tested below, including adversarial compound-command and
 //! credential-path inputs.
 //!
-//! ## What is NOT ported (deliberate MVP scope)
+//! ## Persisted allow-list (pearl th-22bfc1)
 //!
-//! smooth's engine also layers persisted user/project allow-lists
-//! (`wonk-allow.toml`) on top of [`decide`], so a human approval can be
-//! remembered across runs. This crate has no such persistence yet: every `Ask`
-//! is a one-shot prompt (approve-once), not "approve and don't ask again".
-//! Porting the allow-list store is tracked as a follow-up.
+//! Ported from smooth's `wonk-allow.toml`: an `Ask` that matches a stored grant
+//! is auto-approved **without prompting**, and answering "approve always"
+//! ([`HumanResponse::ApprovedAlways`]) persists a new grant so the next
+//! identical `Ask` is silent. A grant can only upgrade an `Ask` — it can
+//! **never** waive a `Deny` circuit-breaker. See [`crate::permission_grants`].
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +38,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
 
 use crate::human::{HumanRequest, HumanResponse};
+use crate::permission_grants::{append_grant, GrantQuery, PermissionGrants, SharedGrants};
 use crate::tool::{ToolCall, ToolHook};
 
 /// How aggressively the hook enforces. Mirrors smooth's `AutoMode` (a trimmed
@@ -620,6 +622,87 @@ pub fn decide(mode: AutoMode, tool_name: &str, args: &serde_json::Value) -> Verd
 }
 
 // ---------------------------------------------------------------------------
+// Grant derivation (pearl th-22bfc1) — map an `Ask` to a persistable grant and
+// check whether a stored grant already covers it. Never derives from a `Deny`:
+// circuit-breakers are not grantable, so `grant_query` returns `None` for them.
+// ---------------------------------------------------------------------------
+
+/// The grant that "approve always" would persist for this tool call — i.e. the
+/// resource the *first unresolved* `Ask` is about. `None` when the call is not
+/// an `Ask` (already allowed, or a non-grantable `Deny`).
+fn grant_query(tool_name: &str, args: &serde_json::Value) -> Option<GrantQuery> {
+    match tool_category(tool_name) {
+        Category::Bash => {
+            let cmd = args.get("cmd").or_else(|| args.get("command")).and_then(|v| v.as_str()).unwrap_or("").trim();
+            for sub in split_compound(cmd) {
+                match decide_bash_subcommand(&sub) {
+                    Verdict::Ask(_) => return Some(bash_segment_grant(&sub)),
+                    Verdict::Deny(_) => return None, // a deny sinks the line; nothing grantable
+                    Verdict::Allow => {}
+                }
+            }
+            None
+        }
+        Category::Network => {
+            let url = args.get("url").or_else(|| args.get("host")).and_then(|v| v.as_str()).unwrap_or("");
+            let host = host_from_token(url).unwrap_or_else(|| url.to_string());
+            (!host.is_empty()).then_some(GrantQuery::Network(host))
+        }
+        // Write / Unknown tools grant by their full (possibly dotted) name.
+        Category::Write | Category::Unknown => Some(GrantQuery::Tool(tool_name.to_string())),
+        Category::Safe => None,
+    }
+}
+
+/// The grant a single asking bash subcommand maps to: a network host if it's a
+/// net tool, else a `<bin> ` command prefix.
+fn bash_segment_grant(sub: &str) -> GrantQuery {
+    if let Some(host) = extract_hosts(sub).into_iter().next() {
+        GrantQuery::Network(host)
+    } else {
+        let bin = command_bin(sub).unwrap_or_default();
+        GrantQuery::Bash(format!("{bin} "))
+    }
+}
+
+/// Is this whole tool call already covered by stored grants — so the `Ask` can
+/// be auto-approved without prompting? For compound bash, **every** asking
+/// segment must be granted (a granted first segment must not silently waive an
+/// ungranted second one).
+fn covered_by_grants(grants: &PermissionGrants, tool_name: &str, args: &serde_json::Value) -> bool {
+    match tool_category(tool_name) {
+        Category::Bash => {
+            let cmd = args.get("cmd").or_else(|| args.get("command")).and_then(|v| v.as_str()).unwrap_or("").trim();
+            let subs = split_compound(cmd);
+            if subs.is_empty() {
+                return false;
+            }
+            subs.iter().all(|sub| match decide_bash_subcommand(sub) {
+                Verdict::Allow => true,
+                Verdict::Deny(_) => false, // never auto-allow a deny
+                Verdict::Ask(_) => bash_segment_granted(sub, grants),
+            })
+        }
+        Category::Network => {
+            let url = args.get("url").or_else(|| args.get("host")).and_then(|v| v.as_str()).unwrap_or("");
+            let host = host_from_token(url).unwrap_or_else(|| url.to_string());
+            !host.is_empty() && grants.matches_host(&host)
+        }
+        Category::Write | Category::Unknown => grants.matches_tool(tool_name),
+        Category::Safe => false,
+    }
+}
+
+/// Is a single asking bash subcommand covered by a stored grant?
+fn bash_segment_granted(sub: &str, grants: &PermissionGrants) -> bool {
+    if let Some(host) = extract_hosts(sub).into_iter().next() {
+        grants.matches_host(&host)
+    } else {
+        grants.matches_bash(sub)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The hook
 // ---------------------------------------------------------------------------
 
@@ -636,10 +719,18 @@ struct Approver {
     timeout: Duration,
 }
 
+/// How the human approved an `Ask` — once, or "always" (persist a grant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Approval {
+    Once,
+    Always,
+}
+
 impl Approver {
     /// Send a [`HumanRequest::Confirm`] and block on the human's answer.
-    /// Fails closed on denial, timeout, or a dropped channel.
-    async fn request(&self, call: &ToolCall, reason: &str) -> anyhow::Result<()> {
+    /// Fails closed on denial, timeout, or a dropped channel. On approval,
+    /// reports whether the human wants the grant remembered ([`Approval::Always`]).
+    async fn request(&self, call: &ToolCall, reason: &str) -> anyhow::Result<Approval> {
         let request = HumanRequest::Confirm {
             tool_name: call.name.clone(),
             arguments: call.arguments.clone(),
@@ -650,7 +741,8 @@ impl Approver {
         }
         let mut rx = self.rx.lock().await;
         match tokio::time::timeout(self.timeout, rx.recv()).await {
-            Ok(Some(HumanResponse::Approved)) => Ok(()),
+            Ok(Some(HumanResponse::Approved)) => Ok(Approval::Once),
+            Ok(Some(HumanResponse::ApprovedAlways)) => Ok(Approval::Always),
             Ok(Some(HumanResponse::Denied { reason })) => anyhow::bail!("user denied: {reason}"),
             Ok(Some(HumanResponse::Timeout)) | Err(_) => anyhow::bail!("permission approval timed out; failing closed"),
             Ok(Some(HumanResponse::Input { .. })) => anyhow::bail!("unexpected Input response to a permission Confirm"),
@@ -673,6 +765,12 @@ impl Approver {
 pub struct PermissionHook {
     mode: AutoMode,
     approver: Option<Approver>,
+    /// Live merged allow-list consulted before prompting. `None` disables
+    /// persistence — every `Ask` prompts (approve-once).
+    grants: Option<SharedGrants>,
+    /// Where an `ApprovedAlways` grant is written (the user-scope file). `None`
+    /// means approve-always degrades to approve-once (no place to persist).
+    persist_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for PermissionHook {
@@ -680,6 +778,7 @@ impl std::fmt::Debug for PermissionHook {
         f.debug_struct("PermissionHook")
             .field("mode", &self.mode)
             .field("interactive", &self.approver.is_some())
+            .field("grants", &self.grants.is_some())
             .finish()
     }
 }
@@ -689,7 +788,12 @@ impl PermissionHook {
     /// fails closed until [`with_approver`](Self::with_approver) is called).
     #[must_use]
     pub fn new(mode: AutoMode) -> Self {
-        Self { mode, approver: None }
+        Self {
+            mode,
+            approver: None,
+            grants: None,
+            persist_path: None,
+        }
     }
 
     /// Build a hook reading the mode from `SMOOTH_AUTO_MODE` (default `Ask`).
@@ -709,10 +813,44 @@ impl PermissionHook {
         self
     }
 
+    /// Wire the persistent allow-list (pearl th-22bfc1). `grants` is the live
+    /// merged view (user + project) consulted on every `Ask` *before* prompting
+    /// — a matching grant auto-approves silently. `persist_path` is where an
+    /// [`Approval::Always`] answer writes the new grant (the user-scope file);
+    /// after writing, the fresh grant is merged back into `grants` so the very
+    /// next identical `Ask` is silent too.
+    #[must_use]
+    pub fn with_grants(mut self, grants: SharedGrants, persist_path: PathBuf) -> Self {
+        self.grants = Some(grants);
+        self.persist_path = Some(persist_path);
+        self
+    }
+
     /// The mode this hook enforces.
     #[must_use]
     pub fn mode(&self) -> AutoMode {
         self.mode
+    }
+
+    /// Persist an approve-always grant to disk and merge it into the live view.
+    /// Best-effort: a persistence failure is logged, not fatal — the human
+    /// already approved, so the call still proceeds (approve-always just
+    /// degrades to approve-once this run).
+    fn persist_grant(&self, call: &ToolCall) {
+        let (Some(grants), Some(path)) = (&self.grants, &self.persist_path) else {
+            return;
+        };
+        let Some(query) = grant_query(&call.name, &call.arguments) else {
+            return; // nothing grantable (shouldn't happen for an Ask)
+        };
+        match append_grant(path, query.clone()) {
+            Ok(()) => {
+                let mut fresh = PermissionGrants::new();
+                fresh.add(query);
+                grants.merge_in(fresh);
+            }
+            Err(e) => tracing::warn!("failed to persist permission grant to {}: {e}", path.display()),
+        }
     }
 }
 
@@ -727,13 +865,27 @@ impl ToolHook for PermissionHook {
     async fn pre_call(&self, call: &ToolCall) -> anyhow::Result<()> {
         match decide(self.mode, &call.name, &call.arguments) {
             Verdict::Allow => Ok(()),
-            // Deny is a circuit-breaker — never routed to a human.
+            // Deny is a circuit-breaker — never routed to a human, never grantable.
             Verdict::Deny(reason) => anyhow::bail!("permission denied: {reason}"),
-            Verdict::Ask(reason) => match &self.approver {
-                Some(approver) => approver.request(call, &reason).await,
-                // Fail closed: no interactive approver wired.
-                None => anyhow::bail!("permission requires approval (fail-closed, no approver): {reason}"),
-            },
+            Verdict::Ask(reason) => {
+                // Consult the persisted allow-list FIRST — a stored grant
+                // auto-approves silently (no prompt).
+                if let Some(grants) = &self.grants {
+                    if covered_by_grants(&grants.snapshot(), &call.name, &call.arguments) {
+                        return Ok(());
+                    }
+                }
+                match &self.approver {
+                    Some(approver) => {
+                        if approver.request(call, &reason).await? == Approval::Always {
+                            self.persist_grant(call);
+                        }
+                        Ok(())
+                    }
+                    // Fail closed: no interactive approver wired.
+                    None => anyhow::bail!("permission requires approval (fail-closed, no approver): {reason}"),
+                }
+            }
         }
     }
 }
@@ -1174,5 +1326,154 @@ mod tests {
         assert!(!ok.is_error, "content: {}", ok.content);
         assert_eq!(ok.content, "ran");
         assert_eq!(runs.load(Ordering::SeqCst), 1, "allowed tool must execute exactly once");
+    }
+
+    // ── persisted allow-list (pearl th-22bfc1) ─────────────────────
+
+    use crate::permission_grants::{append_grant, GrantQuery, PermissionGrants, SharedGrants};
+
+    // grant_query maps an Ask to what "approve always" would store.
+    #[test]
+    fn grant_query_maps_ask_shapes() {
+        assert_eq!(grant_query("bash", &bash("npm install x")), Some(GrantQuery::Bash("npm ".into())));
+        assert_eq!(
+            grant_query("bash", &bash("curl https://new.example.com/x")),
+            Some(GrantQuery::Network("new.example.com".into()))
+        );
+        assert_eq!(
+            grant_query("web_fetch", &json!({"url": "https://new.example.com/x"})),
+            Some(GrantQuery::Network("new.example.com".into()))
+        );
+        assert_eq!(
+            grant_query("file_write", &json!({"path": "/tmp/x"})),
+            Some(GrantQuery::Tool("file_write".into()))
+        );
+        assert_eq!(grant_query("mystery_tool", &json!({})), Some(GrantQuery::Tool("mystery_tool".into())));
+        // Not an Ask → nothing to grant.
+        assert_eq!(grant_query("bash", &bash("ls")), None);
+        // A Deny is never grantable.
+        assert_eq!(grant_query("bash", &bash("rm -rf /")), None);
+        assert_eq!(grant_query("read_file", &json!({})), None);
+    }
+
+    // A stored grant auto-allows a matching Ask with NO prompt to the human.
+    #[tokio::test]
+    async fn stored_grant_auto_allows_without_prompting() {
+        let ch = human_channel();
+        let mut req_rx = ch.request_rx;
+        // An approver that would DENY if ever asked — proves we never asked.
+        let resp_tx = ch.response_tx;
+        tokio::spawn(async move {
+            if req_rx.recv().await.is_some() {
+                let _ = resp_tx.send(HumanResponse::Denied {
+                    reason: "should not be asked".into(),
+                });
+            }
+        });
+
+        let mut grants = PermissionGrants::new();
+        grants.add(GrantQuery::Bash("npm ".into()));
+        let tmp = tempfile::tempdir().unwrap();
+        let hook = PermissionHook::new(AutoMode::Ask)
+            .with_approver(ch.request_tx, ch.response_rx, Duration::from_secs(5))
+            .with_grants(SharedGrants::new(grants), tmp.path().join("wonk-allow.toml"));
+
+        assert!(
+            hook.pre_call(&call("bash", bash("npm install left-pad"))).await.is_ok(),
+            "granted command must auto-allow"
+        );
+    }
+
+    // "Approve always" persists a grant, and a SECOND identical Ask auto-allows.
+    #[tokio::test]
+    async fn approve_always_persists_then_second_ask_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wonk-allow.toml");
+        let shared = SharedGrants::new(PermissionGrants::new());
+
+        // First call: human answers ApprovedAlways exactly once.
+        let ch = human_channel();
+        let mut req_rx = ch.request_rx;
+        let resp_tx = ch.response_tx;
+        tokio::spawn(async move {
+            let _ = req_rx.recv().await.expect("first ask should prompt");
+            resp_tx.send(HumanResponse::ApprovedAlways).expect("send approve-always");
+            // If asked again, the test's second hook (no approver) will fail —
+            // this task only answers once.
+        });
+        let hook1 = PermissionHook::new(AutoMode::Ask)
+            .with_approver(ch.request_tx, ch.response_rx, Duration::from_secs(5))
+            .with_grants(shared.clone(), path.clone());
+        assert!(hook1.pre_call(&call("bash", bash("npm install x"))).await.is_ok());
+
+        // Grant persisted to disk…
+        let on_disk = PermissionGrants::load_from_path(&path).unwrap();
+        assert!(on_disk.matches_bash("npm install x"), "grant should be on disk");
+        // …and merged into the live view.
+        assert!(shared.snapshot().matches_bash("npm run build"));
+
+        // Second call: NO approver at all — must still pass via the persisted grant.
+        let hook2 = PermissionHook::new(AutoMode::Ask).with_grants(shared.clone(), path.clone());
+        assert!(
+            hook2.pre_call(&call("bash", bash("npm run build"))).await.is_ok(),
+            "second identical-prefix ask must auto-allow from the persisted grant"
+        );
+    }
+
+    // A grant can NEVER waive a Deny circuit-breaker.
+    #[tokio::test]
+    async fn stored_grant_cannot_waive_a_deny() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wonk-allow.toml");
+        // Deliberately try to pre-grant the `rm ` prefix.
+        let mut grants = PermissionGrants::new();
+        grants.add(GrantQuery::Bash("rm ".into()));
+        grants.add(GrantQuery::Network("pastebin.com".into()));
+        let hook = PermissionHook::new(AutoMode::Ask).with_grants(SharedGrants::new(grants), path);
+
+        // rm -rf / stays denied despite the `rm ` grant.
+        let err = hook.pre_call(&call("bash", bash("rm -rf /"))).await.unwrap_err().to_string();
+        assert!(err.contains("permission denied"), "got: {err}");
+        // A dangerous-domain deny is not waived by a host grant either.
+        assert!(hook.pre_call(&call("bash", bash("curl https://pastebin.com/raw/x"))).await.is_err());
+    }
+
+    // Approve-always with no persist path degrades gracefully to approve-once.
+    #[tokio::test]
+    async fn approve_always_without_grants_is_just_approve_once() {
+        let ch = human_channel();
+        let mut req_rx = ch.request_rx;
+        let resp_tx = ch.response_tx;
+        tokio::spawn(async move {
+            let _ = req_rx.recv().await.expect("ask");
+            resp_tx.send(HumanResponse::ApprovedAlways).expect("send");
+        });
+        // No .with_grants() — persist_path is None.
+        let hook = PermissionHook::new(AutoMode::Ask).with_approver(ch.request_tx, ch.response_rx, Duration::from_secs(5));
+        assert!(hook.pre_call(&call("bash", bash("npm install x"))).await.is_ok());
+    }
+
+    // Compound bash: a granted first segment must NOT silently waive an
+    // ungranted second one — the call still needs a prompt.
+    #[tokio::test]
+    async fn partial_compound_grant_still_prompts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut grants = PermissionGrants::new();
+        grants.add(GrantQuery::Bash("npm ".into())); // only npm granted
+                                                     // No approver → an Ask fails closed. If coverage wrongly returned true
+                                                     // this would pass; it must not.
+        let hook = PermissionHook::new(AutoMode::Ask).with_grants(SharedGrants::new(grants), tmp.path().join("w.toml"));
+        assert!(
+            hook.pre_call(&call("bash", bash("npm install x && yarn build"))).await.is_err(),
+            "ungranted second segment must still require approval"
+        );
+    }
+
+    #[test]
+    fn append_grant_persists_for_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wonk-allow.toml");
+        append_grant(&path, GrantQuery::Tool("web_search".into())).unwrap();
+        assert!(PermissionGrants::load_from_path(&path).unwrap().matches_tool("web_search"));
     }
 }
