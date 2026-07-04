@@ -20,6 +20,7 @@ pub mod knowledge;
 pub mod llm;
 pub mod llm_provider;
 pub mod memory;
+pub mod narc;
 pub mod permission;
 pub mod providers;
 pub mod quirks;
@@ -41,6 +42,7 @@ pub use human::{human_channel, ConfirmationHook, HumanChannelPair, HumanRequest,
 pub use knowledge::{Document, DocumentType, InMemoryKnowledge, KnowledgeBase, KnowledgeResult};
 pub use llm::{accumulate_stream_events, LlmClient, LlmConfig, LlmResponse, ResponseFormat, StreamEvent};
 pub use memory::{InMemoryMemory, Memory, MemoryEntry, MemoryType};
+pub use narc::{NarcHook, Severity};
 // `permission::PermissionHook` is the dangerous-command classifier gate for
 // SEP extension (and native) tool calls; it is intentionally NOT re-exported
 // at the crate root because `cast::PermissionHook` (role clearance) already
