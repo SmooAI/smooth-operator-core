@@ -547,6 +547,11 @@ pub struct Agent {
     /// the `tool_call` hook chain before executing tool calls and fans turn
     /// events out to subscribed extensions.
     extension_host: Option<Arc<crate::extension::ExtensionHost>>,
+    /// Posture for the permission gate installed by [`with_extension_host`](Self::with_extension_host).
+    /// Defaults to [`AutoMode::from_env`] (reads `SMOOTH_AUTO_MODE`, default
+    /// `Ask`). Override via [`with_permission_mode`](Self::with_permission_mode)
+    /// *before* attaching the host. Pearl th-d32ce6.
+    permission_mode: crate::permission::AutoMode,
 }
 
 impl Agent {
@@ -562,7 +567,21 @@ impl Agent {
             last_resolved_model: std::sync::Mutex::new(None),
             llm_provider: None,
             extension_host: None,
+            permission_mode: crate::permission::AutoMode::from_env(),
         }
+    }
+
+    /// Set the [`AutoMode`](crate::permission::AutoMode) posture for the
+    /// permission gate. Call this **before** [`with_extension_host`](Self::with_extension_host),
+    /// which reads the mode when it installs the hook. Consumers with an
+    /// interactive approver (or that trust their extensions) opt into
+    /// [`AutoMode::Bypass`](crate::permission::AutoMode::Bypass) here — the hard
+    /// circuit-breakers (credential paths, `rm -rf /`, pipe-to-shell, dangerous
+    /// domains, env dumps) still fire in every mode. Pearl th-d32ce6.
+    #[must_use]
+    pub fn with_permission_mode(mut self, mode: crate::permission::AutoMode) -> Self {
+        self.permission_mode = mode;
+        self
     }
 
     /// Attach a SEP [`ExtensionHost`](crate::extension::ExtensionHost). Purely
@@ -583,6 +602,14 @@ impl Agent {
         for tool in host.deferred_tools() {
             self.tools.register_deferred_arc(tool);
         }
+        // Gate every tool call on this registry — extension-contributed tools
+        // in particular had no permission check (pearl th-d32ce6). The
+        // classifier returns allow / ask / deny; `ask` fails closed (no
+        // interactive approver in the engine), `deny` blocks. Mode from
+        // `SMOOTH_AUTO_MODE` (default `Ask`). Added last so it runs after any
+        // role-clearance `PermissionHook` already installed — a `deny` from
+        // either blocks, so ordering only affects which reason surfaces first.
+        self.tools.add_hook(crate::permission::PermissionHook::new(self.permission_mode));
         self.extension_host = Some(host);
         self
     }
