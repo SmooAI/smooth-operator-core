@@ -79,6 +79,11 @@ pub struct AgentConfig {
     /// `Message`; tool calls / tool results are not preserved at
     /// this layer (prose only — that's a future extension).
     pub prior_messages: Vec<Message>,
+    /// Image attachments to attach to the CURRENT user message (the one
+    /// pushed at the start of `run`/`run_with_channel`). Set by a host
+    /// that received a multimodal chat turn; consumed once, on that turn.
+    /// Empty for text-only turns. Pearl th-25ce5c.
+    pub next_user_images: Vec<crate::conversation::ImageContent>,
 }
 
 /// A message injected into a running agent's conversation from outside the loop.
@@ -120,7 +125,17 @@ impl AgentConfig {
             human_rx: None,
             chat_rx: None,
             prior_messages: Vec::new(),
+            next_user_images: Vec::new(),
         }
+    }
+
+    /// Attach image(s) to the current turn's user message. The host sets
+    /// this when a chat turn carried image attachments; the agent emits
+    /// them as OpenAI `image_url` content parts on that one turn. Pearl
+    /// th-25ce5c.
+    pub fn with_user_images(mut self, images: Vec<crate::conversation::ImageContent>) -> Self {
+        self.next_user_images = images;
+        self
     }
 
     /// Pre-seed the agent's conversation with prior turns. Pushed
@@ -748,7 +763,14 @@ impl Agent {
             conversation.push(msg);
         }
 
-        conversation.push(Message::user(user_msg));
+        // Attach any pending image content to this turn's user message
+        // (a multimodal turn). Consumed on this turn only. Pearl th-25ce5c.
+        let user_message = if self.config.next_user_images.is_empty() {
+            Message::user(user_msg)
+        } else {
+            Message::user_with_images(user_msg, self.config.next_user_images.clone())
+        };
+        conversation.push(user_message);
 
         self.emit(AgentEvent::Started { agent_id: self.id.clone() });
         if let Some(host) = &self.extension_host {
@@ -974,7 +996,14 @@ impl Agent {
             conversation.push(msg);
         }
 
-        conversation.push(Message::user(user_msg));
+        // Attach any pending image content to this turn's user message
+        // (a multimodal turn). Consumed on this turn only. Pearl th-25ce5c.
+        let user_message = if self.config.next_user_images.is_empty() {
+            Message::user(user_msg)
+        } else {
+            Message::user_with_images(user_msg, self.config.next_user_images.clone())
+        };
+        conversation.push(user_message);
 
         let _ = tx.send(AgentEvent::Started { agent_id: self.id.clone() });
         if self.extension_host.is_some() {
@@ -1765,6 +1794,20 @@ mod tests {
 
         let config = test_config();
         assert!(!config.parallel_tools);
+    }
+
+    #[test]
+    fn agent_config_with_user_images_sets_pending_images() {
+        // Pearl th-25ce5c: a host with a multimodal chat turn stages the
+        // images on the config; the agent attaches them to the current
+        // user message. Default is empty (text-only turns unchanged).
+        use crate::conversation::ImageContent;
+        let bare = test_config();
+        assert!(bare.next_user_images.is_empty(), "default must be text-only");
+
+        let config = test_config().with_user_images(vec![ImageContent::new("data:image/png;base64,AAAA")]);
+        assert_eq!(config.next_user_images.len(), 1);
+        assert_eq!(config.next_user_images[0].url, "data:image/png;base64,AAAA");
     }
 
     #[test]
