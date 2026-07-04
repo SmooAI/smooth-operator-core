@@ -48,6 +48,11 @@ fn main() {
     // returns a canned credential bundle. Exercises the proxied-streaming +
     // OAuth wire deterministically.
     let provider = std::env::var("SEP_ECHO_PROVIDER").is_ok();
+    // `SEP_ECHO_ENV=1` — report a slice of the child's *observed* environment in
+    // the initialize result so an integration test can prove the host scrubbed
+    // the ambient host env (th-210910): a host-side secret must be ABSENT while
+    // PATH (allow-listed) and the manifest's own vars pass through.
+    let env_report = std::env::var("SEP_ECHO_ENV").is_ok();
     // In slow mode, the JSON-RPC id of a `tool/execute` whose reply we are
     // holding back until a matching `$/cancel` arrives.
     let mut held_tool_call: Option<Value> = None;
@@ -133,6 +138,16 @@ fn main() {
                     json!({
                         "protocol_version": their_version.min(1),
                         "extension": { "name": "echo", "version": "0.1.0" },
+                        // th-210910: not part of the SEP InitializeResult schema (the
+                        // host ignores it); an integration test reads it off the raw
+                        // reply to prove the child env was scrubbed.
+                        "env_report": if env_report {
+                            json!({
+                                "AWS_SECRET_ACCESS_KEY": std::env::var("AWS_SECRET_ACCESS_KEY").ok(),
+                                "PATH_present": std::env::var("PATH").is_ok(),
+                                "SEP_ECHO_ENV": std::env::var("SEP_ECHO_ENV").ok(),
+                            })
+                        } else { Value::Null },
                         "registrations": {
                             "tools": [{
                                 "name": "say",

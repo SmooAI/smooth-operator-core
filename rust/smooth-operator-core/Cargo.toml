@@ -40,6 +40,7 @@ uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 regex = "1"
 toml = "0.8"
+sha2 = "0.10"
 bytes = "1"
 futures-core = "0.3"
 futures-util = "0.3"

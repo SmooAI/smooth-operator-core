@@ -104,6 +104,7 @@ mod tests {
             args: vec![],
             env: HashMap::new(),
             cwd: None,
+            sha256: None,
         };
         Arc::new(ExtensionProcess::spawn(spec, Arc::new(DefaultInboundHandler)).expect("spawn cat"))
     }

@@ -11,6 +11,7 @@
 //! registered against the new child, and every in-flight request fails fast.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -18,6 +19,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -127,13 +129,129 @@ impl InboundHandler for DefaultInboundHandler {}
 
 /// How to launch the subprocess. Deliberately small — the manifest owns the
 /// full shape; this is just what `spawn` needs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SpawnSpec {
     pub command: String,
     pub args: Vec<String>,
+    /// Extra env vars the extension legitimately needs (its manifest `[run] env`,
+    /// SEP-protocol vars). These are the ONLY env the child sees beyond the small
+    /// [`ENV_PASSTHROUGH`] allow-list — the host's full environment is scrubbed
+    /// (`.env_clear()`) so ambient secrets can't leak in (the lethal-trifecta
+    /// concern). See [`build_child_env`].
     pub env: HashMap<String, String>,
     /// Working directory for the child (the extension's root).
     pub cwd: Option<std::path::PathBuf>,
+    /// Optional pinned SHA-256 (lowercase hex) of the resolved `command` binary.
+    /// `Some` → the child is refused to spawn unless the on-disk binary hashes to
+    /// exactly this. `None` → TOFU: the observed hash is logged so it can be
+    /// pinned. See [`verify_integrity`].
+    pub sha256: Option<String>,
+}
+
+/// The ONLY host environment variables passed through to an extension
+/// subprocess. Everything else is scrubbed (`.env_clear()` in
+/// [`start_connection`]) so ambient secrets — cloud creds (`AWS_SECRET_ACCESS_KEY`),
+/// API tokens, `GITHUB_TOKEN`, … — can never leak into an extension via inherited
+/// env (the lethal-trifecta concern from the guardrail work).
+///
+/// These are launch essentials only, and none is secret:
+/// - `PATH` — resolve a bare-name interpreter (`node`, `python3`) and its own
+///   subprocess lookups. Without it a non-absolute `command` won't even start.
+/// - `HOME` — interpreters (node, python) read user config/caches from it and
+///   some abort without it.
+/// - `LANG` / `LC_ALL` / `LC_CTYPE` — locale; python3 in particular errors on
+///   non-ASCII I/O when unset.
+/// - `TMPDIR` — where the child writes temp files (macOS/BSD).
+/// - `TERM` — interpreters that probe for a tty degrade gracefully with it.
+/// - `SystemRoot` — Windows: `node.exe`/`python.exe` fail to start without it.
+///
+/// SEP-protocol vars and anything else an extension legitimately needs come
+/// through its manifest `[run] env` (carried in [`SpawnSpec::env`]), NOT from
+/// here — so adding a var is a deliberate, per-extension act, never ambient.
+pub const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "SystemRoot"];
+
+/// Build the exact environment an extension child sees: the [`ENV_PASSTHROUGH`]
+/// allow-list pulled from the host (via `lookup`), then `explicit` (the manifest
+/// env) overlaid on top so an extension can still *set* — but never silently
+/// *inherit* — any var. `lookup` is injected so this is a pure, exhaustively
+/// testable function (the caller passes `|k| std::env::var(k).ok()`).
+fn build_child_env<F: Fn(&str) -> Option<String>>(lookup: F, explicit: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = ENV_PASSTHROUGH.iter().filter_map(|k| lookup(k).map(|v| ((*k).to_string(), v))).collect();
+    // Manifest env wins on collision (an extension may legitimately override PATH).
+    env.extend(explicit.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env
+}
+
+/// Lowercase-hex encode `bytes` (no `hex` crate — one fold).
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Resolve `command` to the file that will actually execute: an absolute or
+/// relative path is used verbatim (if it exists); a bare name is searched on
+/// `PATH` (first existing file wins — the same rule the OS applies). `None` when
+/// nothing matches (a bare name not on PATH would fail at spawn anyway).
+fn resolve_command_path(command: &str) -> Option<PathBuf> {
+    let p = Path::new(command);
+    if p.is_absolute() || p.components().count() > 1 {
+        return p.exists().then(|| p.to_path_buf());
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).map(|dir| dir.join(command)).find(|c| c.is_file())
+}
+
+/// SHA-256 (lowercase hex) of a file's bytes.
+fn file_sha256(path: &Path) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(std::fs::read(path)?);
+    Ok(to_hex(&hasher.finalize()))
+}
+
+/// Compare an `observed` hash against an optional pinned `expected` (integrity
+/// verification's decision core — kept pure so it can be tested exhaustively).
+///
+/// - `expected` is `None` → `Ok` (TOFU: the caller logs `observed` so a consumer
+///   can pin it).
+/// - `expected` matches (case-insensitive hex) → `Ok`.
+/// - `expected` mismatches → `Err` with a clear, non-leaky message.
+fn verify_integrity(observed: &str, expected: Option<&str>) -> Result<(), String> {
+    match expected {
+        None => Ok(()),
+        Some(want) if want.eq_ignore_ascii_case(observed) => Ok(()),
+        Some(want) => Err(format!(
+            "extension integrity check FAILED: expected sha256 {}, but the binary on disk hashes to {observed} — refusing to spawn",
+            want.to_ascii_lowercase()
+        )),
+    }
+}
+
+/// Enforce the integrity gate for `spec` before spawning: hash the resolved
+/// command binary and compare to the pin. A pinned-but-mismatching binary is
+/// refused; an unpinned one is allowed and its hash logged (TOFU). An
+/// unresolvable command with a pin is refused (can't verify what we can't find);
+/// without a pin it's left to fail at spawn with the OS's own error.
+fn enforce_integrity(spec: &SpawnSpec) -> anyhow::Result<()> {
+    let Some(path) = resolve_command_path(&spec.command) else {
+        if spec.sha256.is_some() {
+            anyhow::bail!(
+                "extension `{}`: integrity pin set but the command binary could not be resolved to verify",
+                spec.command
+            );
+        }
+        return Ok(());
+    };
+    let observed = file_sha256(&path).map_err(|e| anyhow::anyhow!("hashing `{}` for integrity check: {e}", path.display()))?;
+    verify_integrity(&observed, spec.sha256.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+    if spec.sha256.is_none() {
+        tracing::info!(command = %spec.command, path = %path.display(), sha256 = %observed, "extension: no integrity pin — record this sha256 in the manifest `[run] sha256` to pin it (TOFU)");
+    } else {
+        tracing::debug!(command = %spec.command, sha256 = %observed, "extension: integrity verified against pinned sha256");
+    }
+    Ok(())
 }
 
 type PendingMap = Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>>;
@@ -211,12 +329,22 @@ impl ExtensionProcess {
         alive: &Arc<AtomicBool>,
         my_generation: u64,
     ) -> anyhow::Result<Connection> {
+        // Integrity gate (th-210910): even an allow-listed extension binary must
+        // match its recorded hash before we spawn it. Refuses on mismatch.
+        enforce_integrity(spec)?;
+
         let mut cmd = Command::new(&spec.command);
         cmd.args(&spec.args)
-            .envs(&spec.env)
+            // Scrub the host environment: the child starts from nothing and sees
+            // only the ENV_PASSTHROUGH launch essentials + the manifest's explicit
+            // env. Ambient secrets (cloud creds, tokens) never inherit through.
+            .env_clear()
+            .envs(build_child_env(|k| std::env::var(k).ok(), &spec.env))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Only the three stdio pipes are handed to the child; Rust sets
+            // CLOEXEC on every other host fd, so nothing extra leaks in.
             .kill_on_drop(true);
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);
@@ -548,6 +676,131 @@ mod tests {
     #[test]
     fn backoff_exhausts_after_three() {
         backoff_schedule();
+    }
+
+    // ---- subprocess hardening (th-210910), exhaustively ----
+
+    #[test]
+    fn build_child_env_scrubs_ambient_secrets_keeps_allowlist_and_explicit() {
+        // A fake host env: two allow-listed vars + a secret that must NOT pass.
+        let host: HashMap<&str, &str> = HashMap::from([
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/home/tester"),
+            ("AWS_SECRET_ACCESS_KEY", "super-secret"),
+            ("GITHUB_TOKEN", "ghp_leak"),
+            ("SOME_RANDOM_VAR", "x"),
+        ]);
+        let lookup = |k: &str| host.get(k).map(|v| (*v).to_string());
+        let explicit = HashMap::from([("SEP_PROTO".to_string(), "1".to_string())]);
+
+        let env = build_child_env(lookup, &explicit);
+
+        // Allow-listed launch essentials pass through.
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin:/bin"));
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/tester"));
+        // The manifest's explicit (SEP-protocol) var passes through.
+        assert_eq!(env.get("SEP_PROTO").map(String::as_str), Some("1"));
+        // The lethal-trifecta concern: ambient secrets are SCRUBBED.
+        assert!(!env.contains_key("AWS_SECRET_ACCESS_KEY"), "secret must not inherit");
+        assert!(!env.contains_key("GITHUB_TOKEN"), "token must not inherit");
+        assert!(!env.contains_key("SOME_RANDOM_VAR"), "non-allowlisted host var must not inherit");
+    }
+
+    #[test]
+    fn build_child_env_explicit_overrides_passthrough() {
+        let host: HashMap<&str, &str> = HashMap::from([("PATH", "/host/path")]);
+        let explicit = HashMap::from([("PATH".to_string(), "/ext/path".to_string())]);
+        let env = build_child_env(|k: &str| host.get(k).map(|v| (*v).to_string()), &explicit);
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/ext/path"), "manifest env wins on collision");
+    }
+
+    #[test]
+    fn build_child_env_missing_passthrough_absent() {
+        // Host has none of the allow-list set → child env is just the explicit map.
+        let env = build_child_env(|_: &str| None, &HashMap::from([("A".to_string(), "b".to_string())]));
+        assert_eq!(env.len(), 1);
+        assert_eq!(env.get("A").map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn verify_integrity_none_is_tofu_ok() {
+        assert!(verify_integrity("deadbeef", None).is_ok());
+    }
+
+    #[test]
+    fn verify_integrity_match_allows_case_insensitive() {
+        assert!(verify_integrity("abcDEF123", Some("ABCdef123")).is_ok());
+    }
+
+    #[test]
+    fn verify_integrity_mismatch_refuses() {
+        let err = verify_integrity("aaaa", Some("bbbb")).unwrap_err();
+        assert!(err.contains("integrity check FAILED"), "{err}");
+        assert!(err.contains("refusing to spawn"), "{err}");
+    }
+
+    #[test]
+    fn to_hex_encodes_lowercase() {
+        assert_eq!(to_hex(&[0x00, 0x0f, 0xff, 0xa5]), "000fffa5");
+        assert_eq!(to_hex(&[]), "");
+    }
+
+    #[test]
+    fn file_sha256_matches_known_vector() {
+        // sha256("abc") — the canonical NIST test vector.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(file_sha256(&path).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn resolve_command_path_absolute_existing_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bin");
+        std::fs::write(&path, b"x").unwrap();
+        assert_eq!(resolve_command_path(path.to_str().unwrap()), Some(path.clone()));
+        assert_eq!(resolve_command_path(dir.path().join("nope").to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn enforce_integrity_refuses_wrong_pin_allows_right_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ext-bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let real = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        let good = SpawnSpec {
+            command: path.to_string_lossy().into_owned(),
+            sha256: Some(real.to_string()),
+            ..Default::default()
+        };
+        assert!(enforce_integrity(&good).is_ok(), "correct pin spawns");
+
+        let bad = SpawnSpec {
+            command: path.to_string_lossy().into_owned(),
+            sha256: Some("00".repeat(32)),
+            ..Default::default()
+        };
+        assert!(enforce_integrity(&bad).is_err(), "wrong pin refuses");
+
+        // No pin → TOFU, allowed.
+        let tofu = SpawnSpec {
+            command: path.to_string_lossy().into_owned(),
+            sha256: None,
+            ..Default::default()
+        };
+        assert!(enforce_integrity(&tofu).is_ok(), "unpinned is allowed (TOFU)");
+    }
+
+    #[test]
+    fn enforce_integrity_pin_but_unresolvable_command_refuses() {
+        let spec = SpawnSpec {
+            command: "/no/such/binary/xyz".to_string(),
+            sha256: Some("00".repeat(32)),
+            ..Default::default()
+        };
+        assert!(enforce_integrity(&spec).is_err(), "can't verify an unresolvable pinned command → refuse");
     }
 
     #[test]
