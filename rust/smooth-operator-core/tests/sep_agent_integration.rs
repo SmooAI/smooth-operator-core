@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use smooth_operator_core::extension::protocol::{HostInfo, WorkspaceInfo};
 use smooth_operator_core::extension::{discover, DefaultHostDelegate, ExtensionHost};
 use smooth_operator_core::llm_provider::MockLlmClient;
+use smooth_operator_core::permission::AutoMode;
 use smooth_operator_core::{Agent, AgentConfig, AgentEvent, LlmConfig, Tool, ToolRegistry, ToolSchema};
 
 /// A native tool that records whether it actually executed.
@@ -92,7 +93,10 @@ fn agent_with(ran: Arc<AtomicBool>, events: Arc<Mutex<Vec<AgentEvent>>>, host: O
         .with_llm_provider(Arc::new(mock))
         .with_event_handler(move |e| ev.lock().unwrap().push(e));
     if let Some(host) = host {
-        agent = agent.with_extension_host(host);
+        // Bypass the permission gate: these tests exercise the SEP hook-chain
+        // veto, not the th-d32ce6 classifier. Bypass keeps the hard
+        // circuit-breakers but lets ordinary tool calls through.
+        agent = agent.with_permission_mode(AutoMode::Bypass).with_extension_host(host);
     }
     agent
 }
@@ -163,6 +167,9 @@ async fn llm_calls_extension_registered_tool_end_to_end() {
     let agent = Agent::new(config, ToolRegistry::new())
         .with_llm_provider(Arc::new(mock))
         .with_event_handler(move |e| ev.lock().unwrap().push(e))
+        // Bypass the th-d32ce6 permission gate (hard circuit-breakers still
+        // fire) — this test checks the extension tool executes end-to-end.
+        .with_permission_mode(AutoMode::Bypass)
         .with_extension_host(host);
 
     let convo = agent.run("go").await.expect("run");

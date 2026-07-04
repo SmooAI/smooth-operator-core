@@ -20,6 +20,7 @@ pub mod knowledge;
 pub mod llm;
 pub mod llm_provider;
 pub mod memory;
+pub mod permission;
 pub mod providers;
 pub mod quirks;
 pub mod resolution;
@@ -40,6 +41,11 @@ pub use human::{human_channel, ConfirmationHook, HumanChannelPair, HumanRequest,
 pub use knowledge::{Document, DocumentType, InMemoryKnowledge, KnowledgeBase, KnowledgeResult};
 pub use llm::{accumulate_stream_events, LlmClient, LlmConfig, LlmResponse, ResponseFormat, StreamEvent};
 pub use memory::{InMemoryMemory, Memory, MemoryEntry, MemoryType};
+// `permission::PermissionHook` is the dangerous-command classifier gate for
+// SEP extension (and native) tool calls; it is intentionally NOT re-exported
+// at the crate root because `cast::PermissionHook` (role clearance) already
+// owns that name. Reach it via `smooth_operator_core::permission::PermissionHook`.
+pub use permission::{AutoMode, Verdict};
 pub use providers::{Activity, ModelRouting, ModelSlot, ProviderConfig, ProviderRegistry};
 pub use tool::{Tool, ToolCall, ToolRegistry, ToolResult, ToolSchema};
 pub use workflow::{EdgeTarget, FnNode, Node, State, Workflow, WorkflowBuilder};
