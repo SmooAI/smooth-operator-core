@@ -428,6 +428,29 @@ enum ChatContent {
     /// `cache_control_injection_points` config forwards these through
     /// to Anthropic.
     Blocks(Vec<ChatTextBlock>),
+    /// OpenAI multimodal content parts — a text part plus one or more
+    /// `image_url` parts. Emitted only when a user message carries
+    /// images (pearl th-25ce5c). Every model we route vision to
+    /// (gemini-flash, gpt-4o, mimo-vl) speaks this standard shape.
+    Parts(Vec<ContentPart>),
+}
+
+/// One part of an OpenAI multimodal `content` array. Serializes as
+/// `{"type":"text","text":...}` or `{"type":"image_url","image_url":{...}}`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrlPart },
+}
+
+/// The `image_url` object inside an `image_url` content part. `url` is a
+/// `data:`/`https` URL; `detail` is the optional OpenAI vision hint.
+#[derive(Debug, Clone, Serialize)]
+struct ImageUrlPart {
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 /// One block in a `ChatContent::Blocks` array. We currently only emit
@@ -472,6 +495,13 @@ impl ChatContent {
             // when verifying the cache-control wire shape; the
             // serialization assertions cover the JSON itself.
             Self::Blocks(blocks) => blocks.first().map(|b| b.text.as_str()),
+            // Multimodal content: return the first text part's text (the
+            // image parts have no plain-text form). Enough for the
+            // as_text-based assertions; the parts JSON is checked directly.
+            Self::Parts(parts) => parts.iter().find_map(|p| match p {
+                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::ImageUrl { .. } => None,
+            }),
         }
     }
 }
@@ -2462,6 +2492,11 @@ fn wrap_with_cache_control(existing: &ChatContent) -> ChatContent {
     let text = match existing {
         ChatContent::Text(Some(s)) => s.clone(),
         ChatContent::Text(None) => return ChatContent::Text(None),
+        // Multimodal messages carry image parts that MUST NOT be flattened
+        // into a text block (that would silently drop the images). Prompt
+        // caching only applies to text prefixes anyway, so pass the parts
+        // through unchanged. Pearl th-25ce5c.
+        ChatContent::Parts(parts) => return ChatContent::Parts(parts.clone()),
         ChatContent::Blocks(blocks) => {
             // Already in block form (re-marking case). Re-emit with
             // cache_control on the last block.
@@ -2517,7 +2552,27 @@ fn to_chat_message(msg: &Message) -> ChatMessage {
     //      always present. OpenAI / Anthropic-compat / Gemini-compat /
     //      LiteLLM all accept this shape; the providers that historically
     //      rejected empty-string content seem to have relaxed since.
-    let content = ChatContent::Text(Some(msg.content.clone()));
+    // Multimodal turn: a user message with image attachments emits an
+    // OpenAI content-parts array (text part first, then one image_url part
+    // per image). Text-only messages keep the plain-string form so every
+    // non-vision turn is byte-identical to before (pearl th-25ce5c).
+    let content = if msg.role == Role::User && !msg.images.is_empty() {
+        let mut parts: Vec<ContentPart> = Vec::with_capacity(msg.images.len() + 1);
+        if !msg.content.is_empty() {
+            parts.push(ContentPart::Text { text: msg.content.clone() });
+        }
+        for img in &msg.images {
+            parts.push(ContentPart::ImageUrl {
+                image_url: ImageUrlPart {
+                    url: img.url.clone(),
+                    detail: img.detail.clone(),
+                },
+            });
+        }
+        ChatContent::Parts(parts)
+    } else {
+        ChatContent::Text(Some(msg.content.clone()))
+    };
 
     // Tool-result messages must carry the originating tool's `name` so that
     // strict OpenAI-compat upstreams (notably Gemini, when the gateway
@@ -2606,6 +2661,7 @@ fn convert_messages_to_anthropic(messages: &[&Message]) -> (Option<String>, Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::ImageContent;
 
     #[test]
     fn anthropic_config() {
@@ -2628,6 +2684,74 @@ mod tests {
         assert_eq!(chat.role, "user");
         assert_eq!(chat.content.as_text(), Some("Hello"));
         assert!(chat.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn to_chat_message_text_only_stays_plain_string() {
+        // Regression: a normal (image-free) user message must serialize
+        // its content as a plain JSON string, byte-identical to before the
+        // multimodal field existed — never a parts array. Pearl th-25ce5c.
+        let msg = Message::user("just text");
+        let chat = to_chat_message(&msg);
+        let json = serde_json::to_string(&chat).expect("serialize");
+        assert!(json.contains(r#""content":"just text""#), "text-only must be a string: {json}");
+        assert!(!json.contains(r#""image_url""#), "text-only must not emit image parts: {json}");
+    }
+
+    #[test]
+    fn to_chat_message_user_with_images_emits_image_url_parts() {
+        // A user message with an image serializes to the OpenAI multimodal
+        // content-parts array: a text part followed by an image_url part
+        // carrying the data-URL. Pearl th-25ce5c.
+        let msg = Message::user_with_images(
+            "what is this?",
+            vec![ImageContent {
+                url: "data:image/png;base64,AAAA".into(),
+                detail: Some("high".into()),
+            }],
+        );
+        let chat = to_chat_message(&msg);
+        let json = serde_json::to_value(&chat).expect("serialize");
+        let parts = json["content"].as_array().expect("content must be an array of parts");
+        assert_eq!(parts.len(), 2, "text part + one image part: {json}");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "what is this?");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(parts[1]["image_url"]["detail"], "high");
+    }
+
+    #[test]
+    fn to_chat_message_image_only_omits_text_part() {
+        // An image with no accompanying text emits only the image part —
+        // no empty text part (some vision shims reject an empty text block).
+        let msg = Message::user_with_images("", vec![ImageContent::new("https://x/y.jpg")]);
+        let chat = to_chat_message(&msg);
+        let json = serde_json::to_value(&chat).expect("serialize");
+        let parts = json["content"].as_array().expect("array");
+        assert_eq!(parts.len(), 1, "only the image part: {json}");
+        assert_eq!(parts[0]["type"], "image_url");
+        // detail omitted when None (skip_serializing_if)
+        assert!(parts[0]["image_url"].get("detail").is_none(), "detail must be omitted when unset: {json}");
+    }
+
+    #[test]
+    fn wrap_with_cache_control_preserves_image_parts() {
+        // The prompt-cache marker path must NEVER flatten a multimodal
+        // message into a text block — that would silently drop the images.
+        // The last message in a vision turn IS the image-bearing user
+        // message, so this is the exact path that runs live. Pearl th-25ce5c.
+        let msg = Message::user_with_images("look", vec![ImageContent::new("data:image/png;base64,ZZZZ")]);
+        let content = to_chat_message(&msg).content;
+        let wrapped = wrap_with_cache_control(&content);
+        let json = serde_json::to_value(&wrapped).expect("serialize");
+        let parts = json.as_array().expect("still a parts array after wrapping");
+        assert!(
+            parts
+                .iter()
+                .any(|p| p["type"] == "image_url" && p["image_url"]["url"] == "data:image/png;base64,ZZZZ"),
+            "image survived cache-control wrapping: {json}"
+        );
     }
 
     #[test]

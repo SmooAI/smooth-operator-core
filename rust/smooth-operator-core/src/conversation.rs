@@ -93,6 +93,25 @@ pub enum Role {
     Tool,
 }
 
+/// An image attachment on a user message (multimodal turns). `url` is a
+/// `data:` URL (`data:image/png;base64,...`) or a remote `https` URL; the
+/// LLM client emits it as an OpenAI `image_url` content part. `detail`
+/// (`"low"`/`"high"`/`"auto"`) is an optional OpenAI vision hint, omitted
+/// when absent. Pearl th-25ce5c.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageContent {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ImageContent {
+    /// Construct from a `data:`/`https` URL with no detail hint.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self { url: url.into(), detail: None }
+    }
+}
+
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -121,6 +140,12 @@ pub struct Message {
     /// the chat request as a parallel field on the assistant message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Image attachments on a user message (multimodal turns). Emitted as
+    /// OpenAI `image_url` content parts by the LLM client. Empty for the
+    /// text-only common case — `skip_serializing_if` keeps text turns
+    /// byte-identical to before this field existed. Pearl th-25ce5c.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageContent>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -134,6 +159,7 @@ impl Message {
             tool_name: None,
             tool_calls: vec![],
             reasoning_content: None,
+            images: vec![],
             timestamp: Utc::now(),
         }
     }
@@ -147,6 +173,23 @@ impl Message {
             tool_name: None,
             tool_calls: vec![],
             reasoning_content: None,
+            images: vec![],
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// User message carrying image attachments (a multimodal turn). The
+    /// text may be empty when the user sends images alone. Pearl th-25ce5c.
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageContent>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            role: Role::User,
+            content: content.into(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: vec![],
+            reasoning_content: None,
+            images,
             timestamp: Utc::now(),
         }
     }
@@ -160,6 +203,7 @@ impl Message {
             tool_name: None,
             tool_calls: vec![],
             reasoning_content: None,
+            images: vec![],
             timestamp: Utc::now(),
         }
     }
@@ -173,6 +217,7 @@ impl Message {
             tool_name: None,
             tool_calls: vec![],
             reasoning_content: None,
+            images: vec![],
             timestamp: Utc::now(),
         }
     }
@@ -191,6 +236,7 @@ impl Message {
             tool_name: Some(name.into()),
             tool_calls: vec![],
             reasoning_content: None,
+            images: vec![],
             timestamp: Utc::now(),
         }
     }
@@ -699,6 +745,26 @@ mod tests {
         let parsed: Message = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.role, Role::User);
         assert_eq!(parsed.content, "Hello");
+        // Text-only messages must not carry an `images` key (skip_serializing_if)
+        // so persisted/streamed history is unchanged for the common case.
+        assert!(!json.contains("images"), "text-only message must omit images field: {json}");
+    }
+
+    #[test]
+    fn message_with_images_round_trips() {
+        let msg = Message::user_with_images(
+            "caption",
+            vec![ImageContent {
+                url: "data:image/png;base64,QQ".into(),
+                detail: Some("low".into()),
+            }],
+        );
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains("\"images\""), "image message must carry images field: {json}");
+        let parsed: Message = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.images.len(), 1);
+        assert_eq!(parsed.images[0].url, "data:image/png;base64,QQ");
+        assert_eq!(parsed.images[0].detail.as_deref(), Some("low"));
     }
 
     #[test]
