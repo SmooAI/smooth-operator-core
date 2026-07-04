@@ -629,12 +629,19 @@ impl Agent {
         }
         // Gate every tool call on this registry — extension-contributed tools
         // in particular had no permission check (pearl th-d32ce6). The
-        // classifier returns allow / ask / deny; `ask` fails closed (no
-        // interactive approver in the engine), `deny` blocks. Mode from
-        // `SMOOTH_AUTO_MODE` (default `Ask`). Added last so it runs after any
-        // role-clearance `PermissionHook` already installed — a `deny` from
-        // either blocks, so ordering only affects which reason surfaces first.
-        self.tools.add_hook(crate::permission::PermissionHook::new(self.permission_mode));
+        // classifier returns allow / ask / deny; `deny` blocks. An `ask` is
+        // routed to a human when a human channel is wired (via
+        // `with_human_channel`, pearl th-6b3ab4) and fails closed otherwise.
+        // Mode from `SMOOTH_AUTO_MODE` (default `Ask`). Added last so it runs
+        // after any role-clearance `PermissionHook` already installed — a `deny`
+        // from either blocks, so ordering only affects which reason surfaces first.
+        let mut permission_hook = crate::permission::PermissionHook::new(self.permission_mode);
+        if let (Some(tx), Some(rx)) = (self.config.human_tx.clone(), self.config.human_rx.clone()) {
+            // ponytail: 5-min approval window; consumer sets the channel, this is
+            // the default wait before an unanswered ask fails closed.
+            permission_hook = permission_hook.with_approver(tx, rx, std::time::Duration::from_secs(300));
+        }
+        self.tools.add_hook(permission_hook);
         // Then scan the calls that clear the permission gate for secrets +
         // prompt injection (pearl th-5f7227). Extension arguments went to the
         // subprocess unscanned and results came back verbatim; this Narc-style
