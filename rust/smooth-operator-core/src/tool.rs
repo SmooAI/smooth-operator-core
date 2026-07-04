@@ -59,8 +59,14 @@ pub trait ToolHook: Send + Sync {
         let _ = call;
         Ok(())
     }
-    /// Called after tool execution with the result.
-    async fn post_call(&self, call: &ToolCall, result: &ToolResult) -> anyhow::Result<()> {
+    /// Called after tool execution with a **mutable** result.
+    ///
+    /// The `&mut ToolResult` makes this a redaction seam, not just an
+    /// observation point: a hook may rewrite `result.content` (e.g.
+    /// [`NarcHook`](crate::narc::NarcHook) redacting a leaked secret) and the
+    /// mutation is what downstream consumers — and the LLM/conversation — see.
+    /// The default impl is a no-op.
+    async fn post_call(&self, call: &ToolCall, result: &mut ToolResult) -> anyhow::Result<()> {
         let _ = (call, result);
         Ok(())
     }
@@ -365,7 +371,7 @@ impl ToolRegistry {
 
         // Find and execute tool. `tool_by_name` resolves both eager
         // and promoted-deferred tools (pearl th-cfa1fb).
-        let result = match self.tool_by_name(&call.name) {
+        let mut result = match self.tool_by_name(&call.name) {
             Some(tool) => match tool.execute(call.arguments.clone()).await {
                 Ok(content) => ToolResult {
                     tool_call_id: call.id.clone(),
@@ -388,9 +394,11 @@ impl ToolRegistry {
             },
         };
 
-        // Run post-hooks (don't block on failure)
+        // Run post-hooks. They may redact `result` in place (mutable seam).
+        // A hook's `Err` is logged, not surfaced — the (possibly redacted)
+        // result still reaches the caller.
         for hook in &self.hooks {
-            if let Err(e) = hook.post_call(call, &result).await {
+            if let Err(e) = hook.post_call(call, &mut result).await {
                 tracing::warn!(error = %e, tool = %call.name, "post-hook failed");
             }
         }
@@ -423,7 +431,7 @@ impl ToolRegistry {
         }
 
         // Find and execute tool
-        let result = match tools.get(&call.name) {
+        let mut result = match tools.get(&call.name) {
             Some(tool) => match tool.execute(call.arguments.clone()).await {
                 Ok(content) => ToolResult {
                     tool_call_id: call.id.clone(),
@@ -446,9 +454,9 @@ impl ToolRegistry {
             },
         };
 
-        // Run post-hooks (don't block on failure)
+        // Run post-hooks. They may redact `result` in place (mutable seam).
         for hook in hooks {
-            if let Err(e) = hook.post_call(call, &result).await {
+            if let Err(e) = hook.post_call(call, &mut result).await {
                 tracing::warn!(error = %e, tool = %call.name, "post-hook failed");
             }
         }
@@ -749,6 +757,36 @@ mod tests {
         let result = registry.execute(&call).await;
         assert!(result.is_error);
         assert!(result.content.contains("blocked by hook"));
+    }
+
+    /// A post_call hook that rewrites result.content must have its mutation
+    /// reflected in what `execute` returns to the caller (redaction seam,
+    /// pearl th-10eb50).
+    #[tokio::test]
+    async fn post_call_hook_redacts_result() {
+        struct RedactHook;
+
+        #[async_trait]
+        impl ToolHook for RedactHook {
+            async fn post_call(&self, _call: &ToolCall, result: &mut ToolResult) -> anyhow::Result<()> {
+                result.content = result.content.replace("secret", "[REDACTED]");
+                Ok(())
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        registry.add_hook(RedactHook);
+
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "echo".into(),
+            arguments: serde_json::json!({"text": "the secret is here"}),
+        };
+
+        let result = registry.execute(&call).await;
+        assert!(!result.is_error);
+        assert_eq!(result.content, "the [REDACTED] is here", "post_call mutation must reach the caller");
     }
 
     #[tokio::test]
