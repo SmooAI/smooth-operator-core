@@ -647,8 +647,8 @@ impl Agent {
         // subprocess unscanned and results came back verbatim; this Narc-style
         // hook blocks arguments carrying an exfiltration payload and surveils
         // (detect + alert) everything else. Added after the permission gate so
-        // allow/ask/deny is decided first. Detection-only on results — the
-        // `post_call` seam is immutable, so it cannot redact a leaked secret.
+        // allow/ask/deny is decided first. On results it redacts leaked secrets
+        // in place (mutable `post_call` seam, pearl th-10eb50).
         self.tools.add_hook(crate::narc::NarcHook::new());
         self.extension_host = Some(host);
         self

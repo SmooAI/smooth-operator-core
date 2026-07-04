@@ -425,7 +425,7 @@ impl ToolHook for PermissionHook {
         }
     }
 
-    async fn post_call(&self, _call: &ToolCall, _result: &ToolResult) -> anyhow::Result<()> {
+    async fn post_call(&self, _call: &ToolCall, _result: &mut ToolResult) -> anyhow::Result<()> {
         Ok(())
     }
 }
