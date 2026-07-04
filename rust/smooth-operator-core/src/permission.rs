@@ -9,8 +9,10 @@
 //!
 //! [`PermissionHook`] is a [`ToolHook`] that closes that gap. It runs the pure,
 //! deterministic [`decide`] classifier on every tool call and returns `Err`
-//! (blocking the call) on a **Deny** or — fail-closed — on an **Ask** that has
-//! no interactive approver.
+//! (blocking the call) on a **Deny**. An **Ask** is routed to a human when the
+//! hook has an interactive approver wired (see [`PermissionHook::with_approver`],
+//! pearl th-6b3ab4) — matching smooth's `AccessStore` ask channel — and
+//! **fails closed** (blocks) when it does not.
 //!
 //! The classification model is ported natively from smooth's
 //! `smooth-bigsmooth::auto_mode` (which cannot be imported here — it lives in
@@ -21,14 +23,20 @@
 //!
 //! ## What is NOT ported (deliberate MVP scope)
 //!
-//! smooth's engine layers user/project allow-lists (`wonk-allow.toml`) and an
-//! interactive `AccessStore` ask channel on top of [`decide`]. Neither exists
-//! in this crate, so an `Ask` verdict **fails closed**: with no human to
-//! approve it, the call is blocked. Threading an interactive confirm bridge
-//! through the hook is tracked as a follow-up (see pearl filed with th-d32ce6).
+//! smooth's engine also layers persisted user/project allow-lists
+//! (`wonk-allow.toml`) on top of [`decide`], so a human approval can be
+//! remembered across runs. This crate has no such persistence yet: every `Ask`
+//! is a one-shot prompt (approve-once), not "approve and don't ask again".
+//! Porting the allow-list store is tracked as a follow-up.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Mutex;
 
+use crate::human::{HumanRequest, HumanResponse};
 use crate::tool::{ToolCall, ToolHook};
 
 /// How aggressively the hook enforces. Mirrors smooth's `AutoMode` (a trimmed
@@ -615,30 +623,90 @@ pub fn decide(mode: AutoMode, tool_name: &str, args: &serde_json::Value) -> Verd
 // The hook
 // ---------------------------------------------------------------------------
 
+/// Interactive approver: the channel a [`PermissionHook`] uses to route an
+/// `Ask` verdict to a human, mirroring the bridge [`ConfirmationHook`] already
+/// uses. A `Deny` is a hard circuit-breaker and is **never** routed here — only
+/// `Ask` verdicts are.
+///
+/// [`ConfirmationHook`]: crate::human::ConfirmationHook
+#[derive(Clone)]
+struct Approver {
+    tx: UnboundedSender<HumanRequest>,
+    rx: Arc<Mutex<UnboundedReceiver<HumanResponse>>>,
+    timeout: Duration,
+}
+
+impl Approver {
+    /// Send a [`HumanRequest::Confirm`] and block on the human's answer.
+    /// Fails closed on denial, timeout, or a dropped channel.
+    async fn request(&self, call: &ToolCall, reason: &str) -> anyhow::Result<()> {
+        let request = HumanRequest::Confirm {
+            tool_name: call.name.clone(),
+            arguments: call.arguments.clone(),
+            prompt: format!("Permission: {reason}. Allow `{}`?", call.name),
+        };
+        if self.tx.send(request).is_err() {
+            anyhow::bail!("permission approval channel closed; failing closed");
+        }
+        let mut rx = self.rx.lock().await;
+        match tokio::time::timeout(self.timeout, rx.recv()).await {
+            Ok(Some(HumanResponse::Approved)) => Ok(()),
+            Ok(Some(HumanResponse::Denied { reason })) => anyhow::bail!("user denied: {reason}"),
+            Ok(Some(HumanResponse::Timeout)) | Err(_) => anyhow::bail!("permission approval timed out; failing closed"),
+            Ok(Some(HumanResponse::Input { .. })) => anyhow::bail!("unexpected Input response to a permission Confirm"),
+            Ok(None) => anyhow::bail!("permission approval channel closed; failing closed"),
+        }
+    }
+}
+
 /// [`ToolHook`] that enforces [`decide`] on every tool call. Install it on the
 /// [`ToolRegistry`] that runs extension (and native) tool calls; it gates
 /// before the tool executes.
 ///
-/// **Fail-closed `Ask`**: this crate has no interactive approver, so an `Ask`
-/// verdict blocks the call (returns `Err`) in every mode except [`AutoMode::Bypass`]
-/// / [`AutoMode::AcceptEdits`] (which downgrade eligible asks to allow inside
-/// [`decide`]). A `Deny` always blocks.
-#[derive(Debug, Clone)]
+/// **`Ask` routing**: with an approver wired via [`PermissionHook::with_approver`],
+/// an `Ask` verdict prompts a human and blocks until they approve; with no
+/// approver it **fails closed** (returns `Err`). [`AutoMode::Bypass`] /
+/// [`AutoMode::AcceptEdits`] downgrade eligible asks to allow inside [`decide`]
+/// before they reach the approver. A `Deny` always blocks and is never routed
+/// to the human — circuit-breakers are not waivable.
+#[derive(Clone)]
 pub struct PermissionHook {
     mode: AutoMode,
+    approver: Option<Approver>,
+}
+
+impl std::fmt::Debug for PermissionHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PermissionHook")
+            .field("mode", &self.mode)
+            .field("interactive", &self.approver.is_some())
+            .finish()
+    }
 }
 
 impl PermissionHook {
-    /// Build a hook with an explicit mode.
+    /// Build a hook with an explicit mode and no interactive approver (an `Ask`
+    /// fails closed until [`with_approver`](Self::with_approver) is called).
     #[must_use]
     pub fn new(mode: AutoMode) -> Self {
-        Self { mode }
+        Self { mode, approver: None }
     }
 
     /// Build a hook reading the mode from `SMOOTH_AUTO_MODE` (default `Ask`).
     #[must_use]
     pub fn from_env() -> Self {
-        Self { mode: AutoMode::from_env() }
+        Self::new(AutoMode::from_env())
+    }
+
+    /// Wire an interactive approver. When set, an `Ask` verdict sends a
+    /// [`HumanRequest::Confirm`] on `tx` and blocks (up to `timeout`) on the
+    /// [`HumanResponse`] from `rx` — approve lets the call run, anything else
+    /// (deny / timeout / dropped channel) blocks it. This is the same channel
+    /// pair produced by [`human_channel`](crate::human::human_channel).
+    #[must_use]
+    pub fn with_approver(mut self, tx: UnboundedSender<HumanRequest>, rx: Arc<Mutex<UnboundedReceiver<HumanResponse>>>, timeout: Duration) -> Self {
+        self.approver = Some(Approver { tx, rx, timeout });
+        self
     }
 
     /// The mode this hook enforces.
@@ -659,9 +727,13 @@ impl ToolHook for PermissionHook {
     async fn pre_call(&self, call: &ToolCall) -> anyhow::Result<()> {
         match decide(self.mode, &call.name, &call.arguments) {
             Verdict::Allow => Ok(()),
+            // Deny is a circuit-breaker — never routed to a human.
             Verdict::Deny(reason) => anyhow::bail!("permission denied: {reason}"),
-            // Fail closed: no interactive approver in this crate.
-            Verdict::Ask(reason) => anyhow::bail!("permission requires approval (fail-closed, no approver): {reason}"),
+            Verdict::Ask(reason) => match &self.approver {
+                Some(approver) => approver.request(call, &reason).await,
+                // Fail closed: no interactive approver wired.
+                None => anyhow::bail!("permission requires approval (fail-closed, no approver): {reason}"),
+            },
         }
     }
 }
@@ -988,6 +1060,76 @@ mod tests {
         assert!(hook.pre_call(&call("bash", bash("npm install x"))).await.is_ok());
         // …but still blocks a circuit-breaker.
         assert!(hook.pre_call(&call("bash", bash("cat ~/.ssh/id_rsa"))).await.is_err());
+    }
+
+    // ── interactive Ask routing (pearl th-6b3ab4) ──────────────────
+
+    use crate::human::human_channel;
+
+    #[tokio::test]
+    async fn approver_approves_lets_ask_through() {
+        let ch = human_channel();
+        let hook = PermissionHook::new(AutoMode::Ask).with_approver(ch.request_tx, ch.response_rx, Duration::from_secs(5));
+
+        // Human approves whatever request arrives.
+        let mut req_rx = ch.request_rx;
+        let resp_tx = ch.response_tx;
+        tokio::spawn(async move {
+            let got = req_rx.recv().await.expect("a confirm request");
+            assert!(matches!(got, HumanRequest::Confirm { .. }));
+            resp_tx.send(HumanResponse::Approved).expect("send approval");
+        });
+
+        assert!(hook.pre_call(&call("bash", bash("npm install x"))).await.is_ok(), "approved ask must pass");
+    }
+
+    #[tokio::test]
+    async fn approver_denies_blocks_ask() {
+        let ch = human_channel();
+        let hook = PermissionHook::new(AutoMode::Ask).with_approver(ch.request_tx, ch.response_rx, Duration::from_secs(5));
+
+        let mut req_rx = ch.request_rx;
+        let resp_tx = ch.response_tx;
+        tokio::spawn(async move {
+            let _ = req_rx.recv().await.expect("a confirm request");
+            resp_tx.send(HumanResponse::Denied { reason: "nope".into() }).expect("send denial");
+        });
+
+        let err = hook.pre_call(&call("bash", bash("npm install x"))).await.unwrap_err().to_string();
+        assert!(err.contains("user denied"), "got: {err}");
+        assert!(err.contains("nope"), "reason should surface, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn approver_timeout_fails_closed() {
+        let ch = human_channel();
+        // Nobody answers; short timeout.
+        let hook = PermissionHook::new(AutoMode::Ask).with_approver(ch.request_tx, ch.response_rx, Duration::from_millis(50));
+        let _keep = ch.request_rx; // hold the request side open so send() succeeds
+        let err = hook.pre_call(&call("bash", bash("npm install x"))).await.unwrap_err().to_string();
+        assert!(err.contains("timed out"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn deny_is_never_routed_to_human() {
+        // An approver that would approve anything must NOT be able to waive a
+        // circuit-breaker: `rm -rf /` stays denied and no request is even sent.
+        let ch = human_channel();
+        let hook = PermissionHook::new(AutoMode::Ask).with_approver(ch.request_tx, ch.response_rx, Duration::from_secs(5));
+        let mut req_rx = ch.request_rx;
+
+        let err = hook.pre_call(&call("bash", bash("rm -rf /"))).await.unwrap_err().to_string();
+        assert!(err.contains("permission denied"), "got: {err}");
+        // Nothing should have been sent to the human.
+        assert!(req_rx.try_recv().is_err(), "a Deny must not prompt the human");
+    }
+
+    #[tokio::test]
+    async fn approver_channel_closed_fails_closed() {
+        let ch = human_channel();
+        let hook = PermissionHook::new(AutoMode::Ask).with_approver(ch.request_tx, ch.response_rx, Duration::from_secs(5));
+        drop(ch.request_rx); // UI is gone → send() fails → block.
+        assert!(hook.pre_call(&call("bash", bash("npm install x"))).await.is_err());
     }
 
     /// Integration: the hook, installed on a real [`ToolRegistry`], blocks a
