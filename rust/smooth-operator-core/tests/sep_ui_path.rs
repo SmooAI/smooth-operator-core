@@ -20,6 +20,7 @@ fn ui_peer_spec() -> SpawnSpec {
         args: vec![],
         env: HashMap::from([("SEP_ECHO_UI".to_string(), "1".to_string())]),
         cwd: None,
+        sha256: None,
     }
 }
 

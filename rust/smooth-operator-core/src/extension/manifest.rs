@@ -46,6 +46,13 @@ pub struct RunSpec {
     /// Extra env vars; values may reference `${env:VAR}`.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Optional pinned SHA-256 (lowercase hex) of the resolved `command`
+    /// binary. When set, the host refuses to spawn the extension unless the
+    /// on-disk binary hashes to exactly this value — integrity verification is
+    /// a SECOND gate after the load allow-list. When unset, the host records
+    /// the observed hash (TOFU) so a consumer can pin it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// Capability declarations. The `events` list doubles as the host's dispatch
@@ -256,6 +263,7 @@ args = ["echo.mjs"]
         assert_eq!(m.run.command, "node");
         assert_eq!(m.run.args, vec!["echo.mjs"]);
         assert!(!m.disabled);
+        assert!(m.run.sha256.is_none()); // no pin by default → TOFU
         assert!(m.capabilities.events.is_empty());
     }
 
@@ -270,6 +278,7 @@ hook_timeout_ms = 3000
 command = "python3"
 args = ["-m", "gate"]
 env = { TOKEN = "${env:GATE_TOKEN}", STATIC = "x" }
+sha256 = "abc123"
 [capabilities]
 events = ["turn_start", "tool_call"]
 tools = true
@@ -279,6 +288,7 @@ skills = "skills"
 "#;
         let m = ExtensionManifest::parse(text).expect("parse");
         assert_eq!(m.hook_timeout_ms, Some(3000));
+        assert_eq!(m.run.sha256.as_deref(), Some("abc123"));
         assert!(m.capabilities.tools && m.capabilities.ui && !m.capabilities.exec);
         assert_eq!(m.capabilities.events, vec!["turn_start", "tool_call"]);
         assert_eq!(m.resources.skills.as_deref(), Some("skills"));

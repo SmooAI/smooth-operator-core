@@ -19,6 +19,7 @@ fn slow_peer_spec() -> SpawnSpec {
         args: vec![],
         env: HashMap::from([("SEP_ECHO_SLOW".to_string(), "1".to_string())]),
         cwd: None,
+        sha256: None,
     }
 }
 

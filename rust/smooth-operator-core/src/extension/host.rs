@@ -588,6 +588,7 @@ impl ExtensionHost {
             args: ext.manifest.run.args.clone(),
             env: ext.manifest.resolved_env(),
             cwd: Some(ext.root.clone()),
+            sha256: ext.manifest.run.sha256.clone(),
         };
         let handler: Arc<dyn InboundHandler> = Arc::new(HostInbound {
             ext: ext.manifest.name.clone(),
