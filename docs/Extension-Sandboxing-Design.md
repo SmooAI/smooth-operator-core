@@ -1,8 +1,9 @@
 # OS-Level Extension Sandboxing — Design
 
-> Status: **Proposed** (design pass for pearl th-a62075, the OS-specific
-> follow-up to th-210910). Implementation not yet started — this document
-> is the decision this repo needs before writing platform code.
+> Status: **Accepted** (pearl th-a62075, the isolation follow-up to th-210910).
+> Approach: **microsandbox microVM per extension.** A seccomp/Landlock
+> in-process tier was considered and **dropped as over-engineering** — one
+> strong, cross-platform isolation mechanism is better than two partial ones.
 
 ## Context
 
@@ -11,210 +12,163 @@ SEP extensions run as **host subprocesses** speaking JSON-RPC over stdio
 `rust/smooth-operator-core/src/extension/process.rs`). They contribute tools
 (`<ext>.<tool>`), event middleware, and `ui/*` dialogs to the agent.
 
-Today an extension is launched with several layers of defense already in place:
+Defenses already in place around an extension launch:
 
-1. **Load allowlist** — `SMOOTH_EXTENSIONS_ALLOW` is default-deny; only
-   named extensions load at all.
-2. **Integrity pin** (th-210910) — the binary's SHA-256 is verified against a
-   manifest `[run] sha256` before spawn, on initial load *and* hot reload.
-3. **Environment scrub** (th-210910) — `.env_clear()` + a six-var launch
-   allowlist (`PATH`, `HOME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR`, `TERM`,
-   `SystemRoot`) plus the manifest's explicit `env`. Ambient host secrets
-   (cloud creds, tokens) never inherit.
-4. **Only stdio fds** — Rust sets `CLOEXEC` on every other host fd; the child
-   gets exactly its three JSON-RPC pipes.
-5. **Per-tool permission gate** (th-d32ce6 / th-6b3ab4) — every tool call the
-   extension makes is classified allow/ask/deny by `PermissionHook`, with hard
-   circuit-breakers and interactive approval.
-6. **Narc surveillance + redaction** (th-5f7227 / th-10eb50) — tool args and
-   results are scanned for secrets/injection; secrets are redacted out of
-   results.
+1. **Load allowlist** — `SMOOTH_EXTENSIONS_ALLOW` is default-deny.
+2. **Integrity pin** (th-210910) — the binary's SHA-256 is verified against the
+   manifest `[run] sha256` before spawn, on load *and* hot reload.
+3. **Environment scrub** (th-210910) — `.env_clear()` + a small launch allowlist;
+   ambient host secrets never inherit.
+4. **Only stdio fds** — CLOEXEC on every other host fd.
+5. **Per-tool permission gate** (th-d32ce6 / th-6b3ab4) — every tool call is
+   classified allow/ask/deny with circuit-breakers + interactive approval.
+6. **Narc surveillance + redaction** (th-5f7227 / th-10eb50).
 
-**What is still missing:** all of the above constrains what the extension does
-*through the SEP/tool channel*. None of it constrains what the extension
-process does **directly against the host kernel** — a compromised or malicious
-extension binary (one that passed the integrity pin because it was malicious
-*before* it was pinned, or was compromised at its source) can still issue
-arbitrary syscalls: read files outside the workspace, `ptrace` a sibling
-process, `mount`, `bpf`, load a kernel module, open raw sockets, spawn its own
-children that escape all the tool-layer policy. The tool-layer gate never sees
-those — they don't go through SEP.
+**The gap:** all of the above constrain what the extension does *through the
+SEP/tool channel*. None of it constrains what the extension **process** does
+directly against the host kernel. A compromised or malicious extension binary
+(supply-chain-compromised dependency, backdoored build) can still read files
+outside the workspace, `ptrace` a sibling, `mount`, open raw sockets, or spawn
+children that escape all tool-layer policy — none of which the tool gate sees,
+because those never cross SEP.
 
-This document designs the OS-level containment layer that closes that gap.
+## Decision: microsandbox microVM per extension
 
-## Non-goals (explicit boundaries)
+Run each extension inside a **microsandbox** (`msb`, v0.4.6+) microVM instead
+of as a bare host subprocess. This gives hardware-virtualized isolation — a
+separate guest kernel — so even a kernel-level exploit in an extension cannot
+reach the host.
 
-- **Network policy is NOT an OS-sandbox concern here.** Whether an extension's
-  *tool* may reach a host is already decided per-call by `PermissionHook`
-  (network → ask; dangerous domains → deny). An OS-level network jail would
-  either duplicate that (and get out of sync) or break legitimate extensions
-  whose whole purpose is a network integration (e.g. `smooai-crm` calling
-  `api.smoo.ai`). We deliberately leave egress control at the tool layer. The
-  OS sandbox constrains the *process*, not its business logic.
-- **Not a replacement for any existing layer.** This is defense-in-depth
-  *underneath* integrity + env-scrub + the permission gate. If those are the
-  lock on the door, this is the wall around the room.
-- **Not full container/VM isolation.** The microVM path was removed (smooth
-  pearl th-f4a801); we are hardening the in-process subprocess model, not
-  bringing back a VM per extension.
+### Why microsandbox and not seccomp/Landlock
 
-## Threat model
+The earlier draft of this doc proposed a seccomp-bpf syscall denylist +
+Landlock FS scoping. That was dropped:
 
-The adversary is the **extension binary itself** after it starts running:
-a supply-chain-compromised dependency, a backdoored build, or a bug an
-attacker drives via crafted tool input. It already has: its own code
-execution, its three stdio pipes, a scrubbed env, and read access to whatever
-the host uid can read. We want to bound the *damage that execution can do to
-the host*, without breaking a legitimate Node/Python/binary extension.
-
-Concretely we want to deny, at the kernel boundary:
-
-- Tampering with other processes: `ptrace`, `process_vm_readv/writev`,
-  `kcmp`, `pidfd_*` cross-process.
-- Privilege / kernel manipulation: `mount`, `umount2`, `pivot_root`,
-  `setns`, `unshare`, `init_module`/`finit_module`, `delete_module`,
-  `kexec_load`, `reboot`, `swapon/swapoff`, `bpf`, `keyctl`,
-  `add_key`/`request_key`, `perf_event_open`, `ioperm`/`iopl`.
-- Privilege escalation via the binary itself: gaining new privileges through
-  setuid helpers.
-- Filesystem reach outside the extension's working set: reading `~/.ssh`,
-  `~/.aws`, other users' homes, `/etc/shadow`; writing anywhere but its own
-  scratch + the workspace.
-
-## Options considered
-
-### Syscall filtering: allowlist vs denylist
-
-| | Allowlist (deny by default) | Denylist (allow by default) |
+| | microsandbox microVM | seccomp + Landlock |
 |---|---|---|
-| Strength | Maximal — unknown syscalls blocked | Bounded — only named dangers blocked |
-| Breakage risk | **High** — Node/Python touch hundreds of syscalls (`futex`, `mmap`, `openat`, `epoll_*`, `io_uring`, `clone`, `statx`…); a missed one crashes the interpreter, and the set drifts across libc/runtime versions | **Low** — interpreters keep working; we only block syscalls no legitimate extension needs |
-| Maintenance | Ongoing per-runtime tuning | Stable — the dangerous set rarely changes |
-| Philosophy fit | — | Matches the project's allow/ask/**deny** auto-mode model: deny only the unambiguously dangerous, keep function intact ("non-destructive auto mode") |
+| Isolation strength | Separate guest kernel — kernel exploits contained | Shared host kernel — a kernel bug escapes the filter |
+| Platform | **macOS + Linux** (libkrun/HVF) — runs on the current `th` fleet, incl. the macOS dev machines | **Linux only** — can't enforce or even test on the macOS fleet |
+| Network policy | Built-in egress control (`--no-net`, `--deny-domain`, `--net-rule`) | None — would need a separate mechanism |
+| Team familiarity | Already integrated once (the removed Safehouse) + installed on dev machines | New surface |
+| Cost | VM boot latency + a base image | Cheaper per-launch |
+| Completeness | One mechanism covers syscalls + FS + network + rlimits | Two partial mechanisms, neither covering network |
 
-**Decision: denylist.** A seccomp-bpf filter that returns `EPERM`/`SIGSYS`
-for the dangerous set above and allows everything else. This is the same
-posture as the tool-layer gate: we are precise about what is forbidden and
-permissive about the rest, so a normal extension never notices the sandbox.
-An allowlist is stronger on paper but its failure mode is "correct extension
-mysteriously crashes," which erodes trust in the whole guardrail system and
-invites people to disable it — a weaker equilibrium than a denylist that is
-always on.
+The seccomp path's fatal flaw for *this* fleet: it is Linux-only, so on the
+macOS dev machines it could neither enforce nor be tested — a security control
+that is a no-op where most development happens is worse than one strong control
+applied everywhere. microsandbox runs on macOS today (it is already installed
+at `~/.microsandbox/`, v0.4.6). Maintaining a second, weaker, platform-split
+tier underneath it is exactly the over-engineering we're avoiding.
 
-### Filesystem restriction (Linux): Landlock vs namespaces vs none
+### Why this is the right place for a microVM even though the VM stack was removed
 
-- **Landlock** (kernel 5.13+, unprivileged, `landlock` crate): grant the
-  child read on { extension dir, workspace root, system lib/bin paths needed
-  to exec the interpreter, `TMPDIR` } and write on { `TMPDIR`, workspace
-  scratch }. No new privileges required, composes with seccomp.
-- **Mount namespaces**: stronger but need `CLONE_NEWUSER`/`CLONE_NEWNS`
-  plumbing, break on some hardened kernels, and complicate PATH/interpreter
-  resolution.
-- **None**: rely only on syscall filter — leaves credential-file reads open
-  (the exact lethal-trifecta risk the tool layer already treats as a
-  circuit-breaker).
+The microVM dispatch stack was deleted in 2026-07 (smooth pearl th-f4a801)
+because wrapping **every dispatched operative** in a per-task VM — with a
+per-VM Wonk/Goalie/Narc/Scribe cast — was too heavy for the common case (your
+own trusted agent doing its own work). **Extensions are the opposite case:**
 
-**Decision: Landlock where available, degrade to seccomp-only below 5.13.**
-FS reach is the highest-value restriction after syscall danger — it directly
-blocks the "read `~/.aws/credentials` and exfil" path at the process level,
-backstopping the tool-layer credential-path breaker.
+- **Lower trust** — third-party code you trust *less* than your own operative.
+  A microVM's cost is justified exactly where the code is untrusted.
+- **Session-lived, not per-task** — an extension process persists across many
+  tool calls in a session, so a single VM boot amortizes over the whole
+  session instead of per dispatch.
 
-### Privilege drop (uid/gid + no_new_privs)
+So reintroducing a microVM *for extensions specifically* is not reversing
+th-f4a801 — it applies the strong primitive precisely where its cost pays off,
+while operatives keep the lighter host-subprocess + auto-mode model.
 
-- `no_new_privs` (`PR_SET_NO_NEW_PRIVS`): always set — cheap, required for an
-  unprivileged seccomp filter anyway, and blocks setuid escalation.
-- uid/gid drop: only meaningful when the host runs privileged. The common case
-  (developer laptop, `th` running as the user) has nothing to drop to safely.
-  **Decision:** set `no_new_privs` unconditionally; perform a uid/gid drop
-  only when the host is root **and** a drop target is configured — otherwise
-  skip (documented), never silently run as a wrong uid.
+## How it plugs in
 
-### macOS
+microsandbox is driven by the **`msb` CLI**, not a Rust SDK. The host launches
+an extension by shelling out to `msb run` with stdio piped — the *same*
+`tokio::process::Child` + stdin/stdout/stderr pipes the current direct spawn
+produces, so **everything downstream (the writer/reader tasks, the JSON-RPC
+framing) is unchanged.** This matters twice over:
 
-No Landlock/seccomp. Options: `sandbox_init` with an SBPL profile (the
-`sandbox-exec` mechanism — officially deprecated but still functional and
-widely used), or App Sandbox (requires code-signing entitlements — not viable
-for arbitrary spawned binaries). **Decision:** a `sandbox_init` deny-by-default
-profile allowing stdio, read of the extension bundle + system frameworks +
-`TMPDIR`, and write of `TMPDIR`/workspace scratch. Network left to the tool
-layer as above. Treated as best-effort parity; if the API is unavailable,
-fall back to the failure policy below.
+- **operator-core stays dependency-free.** No new cargo dependency — a runtime
+  shell-out to `msb`, exactly like the existing shell-out to the `smooth-dolt`
+  binary. The foundational crate keeps its zero-runtime-deps posture.
+- **The change is localized** to how the `Command` is built in
+  `start_connection`; the protocol layer doesn't know the difference.
 
-### Windows
+### The `msb run` invocation
 
-AppContainer / restricted tokens / Job Objects. Higher complexity, lower
-current usage. **Decision: out of scope for the first implementation**; the
-`th` fleet is macOS/Linux today. Track separately.
+`msb run [OPTIONS] <IMAGE> -- <command> <args…>` in attached mode connects the
+guest command's stdio to our pipes. The flags that map to our isolation needs:
 
-### Failure policy when the sandbox can't be installed
+- `<IMAGE>` — an image carrying **both the extension's runtime and its code**.
+  Declared by the manifest. A sandboxed extension ships as an image, not as
+  host-mounted code: `msb run -v` in 0.4.6 has no read-only mode, and a
+  *writable* bind-mount of the extension's host directory would let untrusted
+  code modify host files — defeating the containment. The image is also the
+  natural **integrity anchor**: a digest-pinned reference
+  (`registry/ext@sha256:…`) pins exactly what runs, which is why the host-binary
+  `[run] sha256` check is *skipped* on the sandboxed path (the binary runs in the
+  guest from the image, not from a resolvable host path). Read-only host mounts
+  for dev iteration are a follow-up if `msb` gains `:ro`.
+- `-e KEY=value` — the scrubbed env allowlist + manifest `[run] env` (same set
+  `build_child_env` computes today). The host env is never forwarded wholesale.
+- `--no-net` by default; `--deny-domain` / an allow set from the manifest when
+  the extension legitimately needs egress. **This is where OS-level network
+  policy finally has a home** — the earlier doc left network entirely to the
+  per-tool gate because seccomp couldn't express it; microsandbox can. The
+  per-tool gate still applies on top for tool-routed calls; the VM egress
+  policy bounds what the *process* can reach.
+- `--rlimit`, `-u <user>` (unprivileged), `--timeout` / `--idle-timeout`.
+- `--snapshot` (future) — boot from a pre-warmed snapshot to cut VM start
+  latency (tracked: th-4b4544).
 
-Two distinct cases:
+### Manifest schema (`[sandbox]`)
 
-1. **Unsupported platform / old kernel** (e.g. Linux < 5.13 for Landlock, or
-   a kernel without seccomp): the extension pre-dates this layer and the other
-   five defenses still apply. **Fail *open* with a loud one-time `WARN`** naming
-   what couldn't be applied — refusing to run every extension on an old kernel
-   is worse than running with the pre-existing (still substantial) protection.
-2. **Supported platform but setup *errors*** (seccomp install returns an error,
-   Landlock ruleset rejected): this is a real failure of a security control we
-   expected to work. **Fail *closed*** — refuse to spawn. A silent
-   half-installed sandbox is the dangerous outcome.
+```toml
+[run]
+command = "node"
+args = ["server.js"]
 
-This split mirrors the rest of the system: unknown/unsupported → degrade with
-visibility; a control we *rely on* failing → deny.
+[sandbox]                      # presence + enablement opts the extension in
+image = "node:20-alpine"       # required when sandboxed
+memory = "512M"                # optional
+cpus = 2                       # optional
+network = "none"               # "none" (default) | "egress"
+allow_domains = ["api.smoo.ai"]  # only when network = "egress"
+```
 
-## Proposed shape (implementation sketch, not built here)
+### Configuration & failure policy
 
-- New module `extension/sandbox.rs`, feature-gated:
-  `#[cfg(all(target_os = "linux", feature = "sandbox-linux"))]` and a macOS
-  counterpart. Non-supported targets compile a no-op that logs the WARN once.
-- A pure, testable core: `fn dangerous_syscalls() -> &'static [Syscall]` and
-  `fn build_seccomp_filter() -> BpfProgram` (unit-tested: the danger set is
-  present, benign syscalls like `read`/`write`/`futex`/`openat` are absent),
-  plus `fn landlock_rules(paths: &SandboxPaths) -> Ruleset` (unit-tested path
-  scoping). Kept pure/injected the same way th-210910's `build_child_env` /
-  `verify_integrity` are, so the security-critical logic is tested without a
-  spawn.
-- Wiring: in `start_connection`, after `enforce_integrity` and after building
-  the `Command`, install the sandbox via
-  `std::os::unix::process::CommandExt::pre_exec` (seccomp filter + Landlock +
-  `no_new_privs` applied in the child, post-fork/pre-exec) on Linux; via a
-  `sandbox_init` call in the same `pre_exec` on macOS. Crates:
-  [`seccompiler`](https://crates.io/crates/seccompiler) (Firecracker's, well
-  maintained) for the BPF program, [`landlock`](https://crates.io/crates/landlock)
-  for FS rules. `pre_exec` is `unsafe`; the crate forbids `unsafe_code`
-  globally, so this module carries a scoped, reviewed `#[allow(unsafe_code)]`
-  with the standard async-signal-safety caveat (no allocation/locks between
-  fork and exec — build the BPF program *before* `pre_exec`, only load it
-  inside).
-- Config: an `AutoMode`-adjacent posture is overkill; a single
-  `SMOOTH_EXTENSION_SANDBOX` env (`on` default on supported platforms / `off`
-  escape hatch) plus the manifest opting an extension into extra path grants
-  it legitimately needs (e.g. a build extension that must read `~/.cargo`).
+- `SMOOTH_EXTENSION_SANDBOX` env: `off` (default) → current direct host spawn,
+  unchanged and non-breaking; `on` → extensions with a `[sandbox]` image run in
+  a microVM.
+- **Opted-in but `msb` missing / image unresolvable → fail *closed*** (refuse
+  to spawn). If you asked for isolation of untrusted code, running it
+  unisolated instead is the wrong answer.
+- **Not opted in → direct spawn**, exactly as today. Zero behavior change for
+  anyone who hasn't turned it on.
+
+This keeps the rollout safe: the strong isolation is opt-in per deployment and
+per extension, and when it *is* requested it never silently degrades.
 
 ## Consequences
 
-- **Positive:** a compromised extension binary is contained at the kernel
-  boundary — no credential-file reads, no process tampering, no
-  privilege/kernel manipulation — independent of whether it routes through the
-  SEP tool channel. Closes the one gap the tool-layer gate structurally cannot
-  see.
-- **Cost:** platform-specific `unsafe` `pre_exec` code, two new optional deps,
-  a kernel-version support matrix, and CI that can only fully exercise the
-  Linux path on a Linux runner (the danger-set/path-scoping *unit* tests run
-  everywhere; the real-spawn enforcement test is Linux-gated).
-- **Residual risk:** the denylist is not exhaustive by construction — a novel
-  dangerous syscall not on the list is allowed until added. Accepted as the
-  cost of not breaking interpreters; the list is the reviewed security surface
-  and changes rarely. macOS parity is best-effort. Windows is unhandled.
+- **Positive:** a compromised extension binary is contained behind a guest
+  kernel — no host credential-file reads, no process tampering, no kernel
+  manipulation, and egress bounded by VM policy — independent of the SEP tool
+  channel. One mechanism, cross-platform, already on the fleet.
+- **Cost:** VM boot latency per extension (amortized over the session;
+  `--snapshot` mitigates), a base-image requirement per extension, and a
+  runtime dependency on `msb` for deployments that enable it.
+- **Residual:** `msb` must be present where sandboxing is enabled (that's the
+  fail-closed contract, not a silent gap). Windows is not a microsandbox
+  target; those deployments stay on the direct-spawn model until they move to
+  Linux/macOS hosts.
 
-## Open questions for review before implementation
+## Implementation increments
 
-1. Denylist confirmed over allowlist? (Recommendation: yes — see table.)
-2. Landlock as the FS mechanism, degrade-to-seccomp-only under 5.13? (vs.
-   requiring a minimum kernel and failing closed.)
-3. The fail-open-on-unsupported / fail-closed-on-setup-error split — agreed?
-4. Is the single `SMOOTH_EXTENSION_SANDBOX` on/off switch enough, or do we
-   want per-mode integration with the `SMOOTH_AUTO_MODE` posture (e.g.
-   `bypass` also loosens the sandbox)? Recommendation: keep them orthogonal —
-   the sandbox is a containment wall, not a permission tier.
+1. **This PR** — manifest `[sandbox]` schema + the pure `msb run` argv builder
+   (`build_msb_command`, the security-critical surface, unit-tested
+   exhaustively) + config-gated wiring in `start_connection` + fail-closed
+   policy. Default off, so non-breaking. A real-spawn smoke test is
+   `#[ignore]`d (needs `msb` + an image; runs on macOS/Linux dev machines, not
+   required in CI).
+2. **Follow-up** — `--snapshot` pre-warming to cut boot latency (th-4b4544);
+   the microsandbox Events API for structured guest output (th-dd84b5); a
+   smooth-provided minimal base image so extensions don't each pin a public one.

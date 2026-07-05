@@ -16,6 +16,7 @@ fn peer_spec() -> SpawnSpec {
         env: HashMap::new(),
         cwd: None,
         sha256: None,
+        sandbox: None,
     }
 }
 
@@ -40,6 +41,7 @@ async fn spawn_scrubs_host_secrets_but_passes_path_and_explicit_env() {
         env: HashMap::from([("SEP_ECHO_ENV".to_string(), "1".to_string())]),
         cwd: None,
         sha256: None,
+        sandbox: None,
     };
     let proc = ExtensionProcess::spawn(spec, Arc::new(DefaultInboundHandler)).expect("spawn peer");
     let result = proc
@@ -68,6 +70,7 @@ fn spawn_refuses_on_integrity_mismatch() {
         env: HashMap::new(),
         cwd: None,
         sha256: Some("00".repeat(32)), // deliberately wrong pin
+        sandbox: None,
     };
     let err = ExtensionProcess::spawn(spec, Arc::new(DefaultInboundHandler)).expect_err("wrong pin must refuse");
     assert!(err.to_string().contains("integrity check FAILED"), "{err}");
@@ -116,6 +119,7 @@ async fn request_times_out_when_peer_silent() {
         env: HashMap::new(),
         cwd: None,
         sha256: None,
+        sandbox: None,
     };
     let proc = ExtensionProcess::spawn(spec, Arc::new(DefaultInboundHandler)).expect("spawn");
     let err = proc.request(method::PING, serde_json::json!({}), Duration::from_millis(200)).await.unwrap_err();

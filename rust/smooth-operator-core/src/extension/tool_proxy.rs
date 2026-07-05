@@ -105,6 +105,7 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
             sha256: None,
+            sandbox: None,
         };
         Arc::new(ExtensionProcess::spawn(spec, Arc::new(DefaultInboundHandler)).expect("spawn cat"))
     }
