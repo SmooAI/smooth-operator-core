@@ -92,6 +92,14 @@ impl Tool for ToolSearch {
         }
 
         let summary = self.registry.deferred_summary();
+        // ponytail: unbounded case-insensitive substring match, kept as-is. A
+        // prompt-injection payload can make the LLM promote a deferred exec tool
+        // (e.g. `bash`), but promotion alone is inert: `PermissionHook` (a
+        // `ToolHook`) gates the *invocation* in `ToolRegistry::execute` — its
+        // `pre_call` runs before the tool is resolved, so a promoted-but-
+        // dangerous call is still denied (see `permission_hook_gates_promoted_deferred_tool`).
+        // The `MAX_MATCHES` cap bounds a single query's blast radius. No
+        // per-tool promote allowlist is warranted while that defense holds.
         let mut matched: Vec<(String, String)> = summary
             .into_iter()
             .filter(|(name, desc)| name.to_lowercase().contains(&needle) || desc.to_lowercase().contains(&needle))
@@ -106,6 +114,15 @@ impl Tool for ToolSearch {
 
         for (name, _) in &matched {
             self.registry.promote(name);
+        }
+
+        // Audit trail: every promotion is a privilege change (a hidden tool
+        // becomes callable), so record the query and what it promoted. The
+        // `PermissionHook` still gates invocation, but this log is how an
+        // operator reconstructs "which query surfaced tool X" after the fact.
+        let promoted: Vec<String> = matched.iter().map(|(name, _)| name.clone()).collect();
+        if !promoted.is_empty() {
+            tracing::info!(target: "tool_search", query = %query.trim(), promoted = ?promoted, "tool_search promoted deferred tools");
         }
 
         // Return each match's full schema as the JSON payload.
@@ -125,6 +142,7 @@ impl Tool for ToolSearch {
 
         Ok(json!({
             "matched": tools.len(),
+            "promoted": promoted,
             "tools": tools,
         })
         .to_string())
@@ -234,5 +252,132 @@ mod tests {
         // Promote on the original — the clone shares the promoted set.
         assert!(r.promote("alpha"));
         assert!(cloned.has_tool("alpha"), "promotion must propagate across clones");
+    }
+
+    /// A promotion is observable in the returned payload (the `promoted` list),
+    /// not merely as a side-effecting `tracing` log — an operator/agent can
+    /// read back exactly which deferred tools a query surfaced.
+    #[tokio::test]
+    async fn promotion_is_observable_in_returned_list() {
+        let registry = make_registry_with_deferred();
+        let search = ToolSearch::new(registry);
+        let out = search.execute(json!({"query": "git"})).await.expect("execute");
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let promoted: Vec<String> = parsed["promoted"]
+            .as_array()
+            .expect("promoted list")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            promoted.contains(&"git_status".to_string()),
+            "promoted list must record git_status: {promoted:?}"
+        );
+        assert!(promoted.contains(&"git_diff".to_string()), "promoted list must record git_diff: {promoted:?}");
+        assert!(!promoted.contains(&"http_get".to_string()), "unmatched tool must not appear: {promoted:?}");
+    }
+
+    /// **The security regression (pearl th-64b1ee).** A prompt-injection payload
+    /// could make a read-only agent `tool_search` a deliberately-deferred `bash`
+    /// exec tool. Promotion succeeds — but `PermissionHook`, installed on the
+    /// same registry as a `ToolHook`, must STILL block the *invocation* of a
+    /// dangerous command on that promoted tool. Promotion alone is inert.
+    ///
+    /// Asserts, using execution counters (cf. `permission::hook_gates_registry_execution`):
+    /// 1. a dangerous command on the promoted `bash` is denied and its body never runs;
+    /// 2. a safe command on the same promoted `bash` still runs (per-invocation gating,
+    ///    not a blanket deny of everything promoted);
+    /// 3. an independent safe promoted tool still runs.
+    #[tokio::test]
+    async fn permission_hook_gates_promoted_deferred_tool() {
+        use crate::permission::{AutoMode, PermissionHook};
+        use crate::tool::{ToolCall, ToolResult};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingExec {
+            name: &'static str,
+            desc: &'static str,
+            read_only: bool,
+            runs: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Tool for CountingExec {
+            fn schema(&self) -> ToolSchema {
+                ToolSchema {
+                    name: self.name.into(),
+                    description: self.desc.into(),
+                    parameters: json!({"type": "object", "properties": {"cmd": {"type": "string"}}}),
+                }
+            }
+            fn is_read_only(&self) -> bool {
+                self.read_only
+            }
+            async fn execute(&self, _args: Value) -> anyhow::Result<String> {
+                self.runs.fetch_add(1, Ordering::SeqCst);
+                Ok(format!("ran {}", self.name))
+            }
+        }
+
+        let bash_runs = Arc::new(AtomicUsize::new(0));
+        let read_runs = Arc::new(AtomicUsize::new(0));
+
+        // An oracle/read-only-style registry: the exec tool is DEFERRED (hidden)
+        // and a `PermissionHook` gates every call. `read_notes` classifies Safe.
+        let mut reg = ToolRegistry::new();
+        reg.register_deferred(CountingExec {
+            name: "bash",
+            desc: "run a shell command",
+            read_only: false,
+            runs: bash_runs.clone(),
+        });
+        reg.register_deferred(CountingExec {
+            name: "read_notes",
+            desc: "read project notes",
+            read_only: true,
+            runs: read_runs.clone(),
+        });
+        reg.add_hook(PermissionHook::new(AutoMode::Ask));
+        let reg = Arc::new(reg);
+
+        // Both deferred tools are invisible until tool_search promotes them.
+        assert!(!reg.has_tool("bash"), "bash must start deferred (hidden)");
+
+        // Simulate the prompt-injection: the model calls tool_search and promotes
+        // the exec tool + the safe tool.
+        let search = ToolSearch::new(reg.clone());
+        let _ = search.execute(json!({"query": "shell"})).await.expect("promote bash");
+        let _ = search.execute(json!({"query": "notes"})).await.expect("promote read_notes");
+        assert!(reg.has_tool("bash"), "tool_search must have promoted bash");
+        assert!(reg.has_tool("read_notes"), "tool_search must have promoted read_notes");
+
+        let call = |name: &str, cmd: &str| ToolCall {
+            id: "c1".into(),
+            name: name.into(),
+            arguments: json!({"cmd": cmd}),
+        };
+
+        // (1) Dangerous command on the promoted bash → PermissionHook DENIES,
+        //     tool body never runs.
+        let blocked: ToolResult = reg.execute(&call("bash", "rm -rf /")).await;
+        assert!(blocked.is_error, "promoted dangerous bash must be blocked");
+        assert!(blocked.content.contains("blocked by hook"), "content: {}", blocked.content);
+        assert!(blocked.content.contains("permission denied"), "content: {}", blocked.content);
+        assert_eq!(bash_runs.load(Ordering::SeqCst), 0, "denied promoted tool body MUST NOT execute");
+
+        // (2) Safe command on the same promoted bash → still runs (per-invocation).
+        let ok: ToolResult = reg.execute(&call("bash", "ls -la")).await;
+        assert!(!ok.is_error, "safe command on promoted bash should run; content: {}", ok.content);
+        assert_eq!(bash_runs.load(Ordering::SeqCst), 1, "safe invocation of promoted tool must execute once");
+
+        // (3) An independent safe promoted tool still works.
+        let read = reg
+            .execute(&ToolCall {
+                id: "c2".into(),
+                name: "read_notes".into(),
+                arguments: json!({}),
+            })
+            .await;
+        assert!(!read.is_error, "safe promoted tool should run; content: {}", read.content);
+        assert_eq!(read_runs.load(Ordering::SeqCst), 1, "safe promoted tool must execute");
     }
 }
