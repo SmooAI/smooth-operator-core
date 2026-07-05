@@ -55,6 +55,45 @@ pub struct RunSpec {
     pub sha256: Option<String>,
 }
 
+/// Optional `[sandbox]` section — opts an extension into microVM isolation
+/// (pearl th-a62075). When present *and* sandboxing is enabled for the
+/// deployment (`SMOOTH_EXTENSION_SANDBOX=on`), the host runs the extension
+/// inside a microsandbox (`msb`) microVM instead of a bare host subprocess.
+/// See `docs/Extension-Sandboxing-Design.md`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct SandboxSpec {
+    /// Base image carrying the extension's runtime (e.g. `node:20-alpine`).
+    /// Required — a sandboxed extension with no image cannot boot, and running
+    /// it unisolated instead would defeat the point (fail closed).
+    pub image: String,
+    /// Guest memory (e.g. `512M`). Passed to `msb run -m`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+    /// Guest vCPU count. Passed to `msb run -c`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u32>,
+    /// Egress posture: `none` (default — `--no-net`) or `egress` (allow the
+    /// hosts in [`allow_domains`], deny the rest).
+    #[serde(default)]
+    pub network: SandboxNetwork,
+    /// When `network = "egress"`, the only domains the guest may reach. Every
+    /// other domain is denied. Empty with `egress` means "egress allowed but
+    /// nothing explicitly permitted" → still `--no-net` (fail safe).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_domains: Vec<String>,
+}
+
+/// Guest network posture for a sandboxed extension.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxNetwork {
+    /// No network at all (`msb run --no-net`). The safe default.
+    #[default]
+    None,
+    /// Allow egress to [`SandboxSpec::allow_domains`] only.
+    Egress,
+}
+
 /// Capability declarations. The `events` list doubles as the host's dispatch
 /// filter — an extension only receives events it names here.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
@@ -97,6 +136,9 @@ pub struct ExtensionManifest {
     #[serde(default = "default_protocol")]
     pub protocol: u32,
     pub run: RunSpec,
+    /// Optional microVM isolation (pearl th-a62075).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxSpec>,
     #[serde(default)]
     pub capabilities: Capabilities,
     #[serde(default)]

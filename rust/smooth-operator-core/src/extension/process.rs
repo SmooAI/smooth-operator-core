@@ -24,6 +24,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Notify};
 
+use super::manifest::{SandboxNetwork, SandboxSpec};
 use super::protocol::{codes, method, Message, RpcError};
 
 /// Backoff schedule for restart attempts. After the third failed attempt the
@@ -146,6 +147,10 @@ pub struct SpawnSpec {
     /// exactly this. `None` → TOFU: the observed hash is logged so it can be
     /// pinned. See [`verify_integrity`].
     pub sha256: Option<String>,
+    /// Optional microVM isolation (pearl th-a62075). When `Some` *and*
+    /// sandboxing is enabled (`sandbox_enabled()`), the child is launched inside
+    /// a microsandbox (`msb`) microVM instead of a bare host subprocess.
+    pub sandbox: Option<crate::extension::manifest::SandboxSpec>,
 }
 
 /// The ONLY host environment variables passed through to an extension
@@ -180,6 +185,83 @@ fn build_child_env<F: Fn(&str) -> Option<String>>(lookup: F, explicit: &HashMap<
     // Manifest env wins on collision (an extension may legitimately override PATH).
     env.extend(explicit.iter().map(|(k, v)| (k.clone(), v.clone())));
     env
+}
+
+/// The microsandbox CLI the host shells out to for microVM-isolated extensions
+/// (pearl th-a62075). A runtime binary dependency (like `smooth-dolt`), not a
+/// cargo dependency — the foundational crate keeps its zero-runtime-deps posture.
+const MSB_BIN: &str = "msb";
+
+/// Is microVM isolation enabled for this deployment? `SMOOTH_EXTENSION_SANDBOX`
+/// must be an affirmative value (`on`/`1`/`true`/`yes`); anything else (incl.
+/// unset) keeps the current direct-host-spawn behavior. Isolation is therefore
+/// strictly opt-in and non-breaking.
+fn sandbox_enabled() -> bool {
+    sandbox_enabled_value(std::env::var("SMOOTH_EXTENSION_SANDBOX").ok().as_deref())
+}
+
+/// Pure parse of the `SMOOTH_EXTENSION_SANDBOX` value (injected for testability,
+/// mirroring `AutoMode::from_env_value`). Unset / anything non-affirmative → off.
+fn sandbox_enabled_value(v: Option<&str>) -> bool {
+    v.map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Build the `msb run` argv (everything *after* the `msb` program name) that
+/// launches an extension inside a microsandbox microVM (pearl th-a62075).
+///
+/// Pure and exhaustively testable — **the argv is the isolation surface**, so it
+/// is unit-tested directly rather than only exercised by a real (slow,
+/// environment-dependent) spawn. `env` is the already-scrubbed child environment
+/// ([`build_child_env`]); the host env is never forwarded wholesale. The
+/// extension's code comes from the image, not a host mount (see the design doc):
+/// so there is no bind-mount, and integrity is anchored by the (ideally
+/// digest-pinned) image rather than the host-binary `sha256` pin.
+fn build_msb_command(spec: &SpawnSpec, sb: &SandboxSpec, env: &HashMap<String, String>) -> Vec<String> {
+    let mut argv = vec!["run".to_string(), "--quiet".to_string()];
+
+    if let Some(mem) = &sb.memory {
+        argv.push("-m".into());
+        argv.push(mem.clone());
+    }
+    if let Some(cpus) = sb.cpus {
+        argv.push("-c".into());
+        argv.push(cpus.to_string());
+    }
+
+    // Egress posture. `none` (default) → no network. `egress` → default-deny
+    // plus one explicit allow per domain. An `egress` posture with no domains
+    // collapses to `none` (fail safe — never a silent open network).
+    let allow: &[String] = match sb.network {
+        SandboxNetwork::Egress if !sb.allow_domains.is_empty() => &sb.allow_domains,
+        _ => &[],
+    };
+    if allow.is_empty() {
+        argv.push("--no-net".into());
+    } else {
+        argv.push("--net-default-egress".into());
+        argv.push("deny".into());
+        for domain in allow {
+            argv.push("--net-rule".into());
+            argv.push(format!("allow@{domain}"));
+        }
+    }
+
+    // Scrubbed env, sorted for deterministic argv (testability + stable logs).
+    let mut keys: Vec<&String> = env.keys().collect();
+    keys.sort();
+    for k in keys {
+        argv.push("-e".into());
+        argv.push(format!("{k}={}", env[k]));
+    }
+
+    // Image, then the guest command after `--` (attached mode → guest stdio is
+    // wired to our pipes, so the JSON-RPC protocol layer is unchanged).
+    argv.push(sb.image.clone());
+    argv.push("--".into());
+    argv.push(spec.command.clone());
+    argv.extend(spec.args.iter().cloned());
+    argv
 }
 
 /// Lowercase-hex encode `bytes` (no `hex` crate — one fold).
@@ -329,26 +411,59 @@ impl ExtensionProcess {
         alive: &Arc<AtomicBool>,
         my_generation: u64,
     ) -> anyhow::Result<Connection> {
-        // Integrity gate (th-210910): even an allow-listed extension binary must
-        // match its recorded hash before we spawn it. Refuses on mismatch.
-        enforce_integrity(spec)?;
+        // The scrubbed child env is the same in both paths: host env is cleared
+        // and only ENV_PASSTHROUGH + the manifest's explicit env survive, so
+        // ambient secrets (cloud creds, tokens) never reach the extension.
+        let child_env = build_child_env(|k| std::env::var(k).ok(), &spec.env);
 
-        let mut cmd = Command::new(&spec.command);
-        cmd.args(&spec.args)
-            // Scrub the host environment: the child starts from nothing and sees
-            // only the ENV_PASSTHROUGH launch essentials + the manifest's explicit
-            // env. Ambient secrets (cloud creds, tokens) never inherit through.
-            .env_clear()
-            .envs(build_child_env(|k| std::env::var(k).ok(), &spec.env))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Only the three stdio pipes are handed to the child; Rust sets
-            // CLOEXEC on every other host fd, so nothing extra leaks in.
-            .kill_on_drop(true);
-        if let Some(cwd) = &spec.cwd {
-            cmd.current_dir(cwd);
-        }
+        let mut cmd = match &spec.sandbox {
+            // microVM-isolated path (pearl th-a62075): shell out to `msb run`.
+            // The extension's code + interpreter come from the image, so the
+            // host-binary integrity pin does not apply here — the image (ideally
+            // digest-pinned) is the integrity anchor. Fail CLOSED if `msb` is
+            // absent: we were asked to isolate untrusted code; running it
+            // unisolated instead is the wrong answer.
+            Some(sb) if sandbox_enabled() => {
+                if resolve_command_path(MSB_BIN).is_none() {
+                    anyhow::bail!(
+                        "extension sandbox requested but `{MSB_BIN}` (microsandbox) is not on PATH — refusing to spawn `{}` unisolated",
+                        spec.command
+                    );
+                }
+                let mut cmd = Command::new(MSB_BIN);
+                // `msb` inherits the host env to find its own runtime; the guest
+                // command's env is passed explicitly via the built `-e` args, so
+                // the extension inside the VM still only sees the scrubbed set.
+                cmd.args(build_msb_command(spec, sb, &child_env))
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+                cmd
+            }
+            // Direct host-subprocess path (default / unchanged from th-210910).
+            _ => {
+                // Integrity gate (th-210910): even an allow-listed extension
+                // binary must match its recorded hash before we spawn it.
+                enforce_integrity(spec)?;
+                let mut cmd = Command::new(&spec.command);
+                cmd.args(&spec.args)
+                    // Scrub the host environment: the child sees only the
+                    // ENV_PASSTHROUGH essentials + the manifest's explicit env.
+                    .env_clear()
+                    .envs(&child_env)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    // Only the three stdio pipes are handed to the child; Rust
+                    // sets CLOEXEC on every other host fd, so nothing leaks in.
+                    .kill_on_drop(true);
+                if let Some(cwd) = &spec.cwd {
+                    cmd.current_dir(cwd);
+                }
+                cmd
+            }
+        };
 
         let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("spawn extension `{}`: {e}", spec.command))?;
         let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin pipe"))?;
@@ -743,6 +858,130 @@ mod tests {
     fn to_hex_encodes_lowercase() {
         assert_eq!(to_hex(&[0x00, 0x0f, 0xff, 0xa5]), "000fffa5");
         assert_eq!(to_hex(&[]), "");
+    }
+
+    // ── microVM sandbox argv builder (pearl th-a62075) ─────────────
+
+    fn sandboxed_spec(sb: SandboxSpec) -> SpawnSpec {
+        SpawnSpec {
+            command: "node".into(),
+            args: vec!["server.js".into()],
+            sandbox: Some(sb),
+            ..Default::default()
+        }
+    }
+
+    /// Find the value following the first occurrence of `flag` in an argv.
+    fn flag_val<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        argv.iter().position(|a| a == flag).and_then(|i| argv.get(i + 1)).map(String::as_str)
+    }
+
+    #[test]
+    fn sandbox_enabled_value_parses_affirmative_only() {
+        for on in ["on", "1", "true", "YES", " On "] {
+            assert!(sandbox_enabled_value(Some(on)), "{on:?} should enable");
+        }
+        for off in [None, Some(""), Some("off"), Some("0"), Some("false"), Some("garbage")] {
+            assert!(!sandbox_enabled_value(off), "{off:?} should NOT enable");
+        }
+    }
+
+    #[test]
+    fn build_msb_command_defaults_to_no_net_and_image_then_command() {
+        let spec = sandboxed_spec(SandboxSpec {
+            image: "node:20-alpine".into(),
+            ..Default::default()
+        });
+        let argv = build_msb_command(&spec, spec.sandbox.as_ref().unwrap(), &HashMap::new());
+
+        assert_eq!(argv[0], "run");
+        assert!(argv.contains(&"--no-net".to_string()), "default posture is no network: {argv:?}");
+        assert!(!argv.iter().any(|a| a == "--net-rule"), "no allow rules by default: {argv:?}");
+        // Image precedes the `--` guest command; command+args come after.
+        let sep = argv.iter().position(|a| a == "--").expect("has -- separator");
+        assert_eq!(argv[sep - 1], "node:20-alpine", "image is the token before --");
+        assert_eq!(&argv[sep + 1..], &["node".to_string(), "server.js".to_string()]);
+    }
+
+    #[test]
+    fn build_msb_command_egress_emits_default_deny_plus_allow_per_domain() {
+        let sb = SandboxSpec {
+            image: "node:20-alpine".into(),
+            network: SandboxNetwork::Egress,
+            allow_domains: vec!["api.smoo.ai".into(), "auth.smoo.ai".into()],
+            ..Default::default()
+        };
+        let spec = sandboxed_spec(sb);
+        let argv = build_msb_command(&spec, spec.sandbox.as_ref().unwrap(), &HashMap::new());
+
+        assert!(!argv.contains(&"--no-net".to_string()), "egress posture is not no-net: {argv:?}");
+        assert_eq!(flag_val(&argv, "--net-default-egress"), Some("deny"));
+        let rules: Vec<&String> = argv
+            .iter()
+            .zip(argv.iter().skip(1))
+            .filter(|(a, _)| *a == "--net-rule")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(rules, vec!["allow@api.smoo.ai", "allow@auth.smoo.ai"]);
+    }
+
+    #[test]
+    fn build_msb_command_egress_without_domains_fails_safe_to_no_net() {
+        // Declaring egress but listing no domains must never open the network.
+        let sb = SandboxSpec {
+            image: "x".into(),
+            network: SandboxNetwork::Egress,
+            allow_domains: vec![],
+            ..Default::default()
+        };
+        let spec = sandboxed_spec(sb);
+        let argv = build_msb_command(&spec, spec.sandbox.as_ref().unwrap(), &HashMap::new());
+        assert!(argv.contains(&"--no-net".to_string()), "empty egress must collapse to no-net: {argv:?}");
+        assert!(!argv.iter().any(|a| a == "--net-rule"));
+    }
+
+    #[test]
+    fn build_msb_command_forwards_memory_cpus_and_scrubbed_env_sorted() {
+        let sb = SandboxSpec {
+            image: "x".into(),
+            memory: Some("512M".into()),
+            cpus: Some(2),
+            ..Default::default()
+        };
+        let spec = sandboxed_spec(sb);
+        let env = HashMap::from([("PATH".to_string(), "/usr/bin".to_string()), ("HOME".to_string(), "/home/x".to_string())]);
+        let argv = build_msb_command(&spec, spec.sandbox.as_ref().unwrap(), &env);
+
+        assert_eq!(flag_val(&argv, "-m"), Some("512M"));
+        assert_eq!(flag_val(&argv, "-c"), Some("2"));
+        // Env is passed as sorted `-e K=V` pairs (deterministic argv).
+        let envs: Vec<&String> = argv.iter().zip(argv.iter().skip(1)).filter(|(a, _)| *a == "-e").map(|(_, v)| v).collect();
+        assert_eq!(envs, vec!["HOME=/home/x", "PATH=/usr/bin"]);
+    }
+
+    /// End-to-end argv validation against real `msb` (needs microsandbox + the
+    /// `alpine` image). Proves the builder emits syntactically valid `msb run`
+    /// syntax and that attached-mode stdio reaches us — not run in CI.
+    #[tokio::test]
+    #[ignore = "requires microsandbox (msb) + alpine image; run on a dev machine"]
+    async fn build_msb_command_runs_under_real_msb() {
+        let sb = SandboxSpec {
+            image: "alpine".into(),
+            ..Default::default()
+        };
+        let spec = SpawnSpec {
+            command: "echo".into(),
+            args: vec!["sep-smoke".into()],
+            sandbox: Some(sb),
+            ..Default::default()
+        };
+        let argv = build_msb_command(&spec, spec.sandbox.as_ref().unwrap(), &HashMap::new());
+        let out = Command::new(MSB_BIN).args(&argv).output().await.expect("run msb");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("sep-smoke"),
+            "stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
     }
 
     #[test]
