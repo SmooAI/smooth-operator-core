@@ -302,7 +302,26 @@ public sealed class SmoothAgent
             tools.Add(_toolSearch.MetaTool);
             tools.AddRange(_toolSearch.PromotedTools());
         }
-        return tools.Count > 0 ? new ChatOptions { Tools = tools } : null;
+
+        // The clamped output budget (min(MaxOutputTokens, ModelMaxOutputTokens); null ⇒ leave
+        // max_tokens unset). Keeps a budget from exceeding what the model can physically emit
+        // (EPIC th-1cc9fa).
+        var maxTokens = _options.EffectiveMaxTokens;
+        if (tools.Count == 0 && maxTokens is null)
+        {
+            return null;
+        }
+
+        var chatOptions = new ChatOptions();
+        if (tools.Count > 0)
+        {
+            chatOptions.Tools = tools;
+        }
+        if (maxTokens is { } budget)
+        {
+            chatOptions.MaxOutputTokens = budget;
+        }
+        return chatOptions;
     }
 
     private static List<FunctionCallContent> ExtractToolCalls(IEnumerable<ChatMessage> messages) =>

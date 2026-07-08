@@ -25,6 +25,35 @@ public sealed class AgentOptions
     public int MaxIterations { get; set; } = 8;
 
     /// <summary>
+    /// Budget cap on the tokens the model may EMIT per turn (the request's <c>max_tokens</c>).
+    /// <c>null</c> (the default) leaves it unset — the provider's own default applies, behavior
+    /// unchanged. Mirrors the Rust engine's <c>LlmConfig.max_tokens</c>. Always clamped down to
+    /// <see cref="ModelMaxOutputTokens"/> via <see cref="EffectiveMaxTokens"/> before it is sent.
+    /// </summary>
+    public int? MaxOutputTokens { get; set; }
+
+    /// <summary>
+    /// The active model's HARD output ceiling (<c>max_output_tokens</c>) when known — e.g. sourced
+    /// from the LiteLLM gateway's <c>/model/info</c>. When set (&gt; 0), <see cref="MaxOutputTokens"/>
+    /// is clamped to it so a budget can never exceed what the model can physically emit — otherwise a
+    /// reasoning model burns its budget on reasoning and returns EMPTY, or the upstream 400s (e.g.
+    /// <c>groq-compound</c> caps output at 8192 under a 32768 budget). <c>null</c> = unknown ⇒ no
+    /// clamp (graceful passthrough). Mirrors the Rust engine's <c>model_max_output</c>. EPIC th-1cc9fa.
+    /// </summary>
+    public int? ModelMaxOutputTokens { get; set; }
+
+    /// <summary>
+    /// The <c>max_tokens</c> to actually send: <see cref="MaxOutputTokens"/> clamped down to
+    /// <see cref="ModelMaxOutputTokens"/> when a ceiling is known. <c>null</c> when no budget is set
+    /// (leave the request's <c>max_tokens</c> unset — passthrough). Never returns 0. Mirrors the Rust
+    /// engine's <c>LlmClient.effective_max_tokens()</c>.
+    /// </summary>
+    public int? EffectiveMaxTokens =>
+        MaxOutputTokens is not { } budget ? null
+        : ModelMaxOutputTokens is { } ceiling && ceiling > 0 ? Math.Max(1, Math.Min(budget, ceiling))
+        : budget;
+
+    /// <summary>
     /// Tools available to the agent. Author them from ordinary C# methods with
     /// <c>AIFunctionFactory.Create(...)</c> — exactly as a Microsoft Agent Framework
     /// / Semantic Kernel dev already does.
