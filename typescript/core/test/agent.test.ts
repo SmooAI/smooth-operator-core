@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { AgentOptions, SmoothAgent, Tool } from '../src/agent.js';
+import { AgentOptions, effectiveMaxTokens, SmoothAgent, Tool } from '../src/agent.js';
 import { InMemoryKnowledge } from '../src/knowledge.js';
 import { MockLlmProvider } from '../src/llmProvider.js';
 
@@ -65,5 +65,54 @@ describe('SmoothAgent', () => {
         const messages = client.calls[0].messages;
         expect(messages[0].role).toBe('system');
         expect(messages[0].content).toContain('17 days');
+    });
+});
+
+describe('effectiveMaxTokens (model-output ceiling clamp, EPIC th-1cc9fa)', () => {
+    it('clamps down when the ceiling is below the budget', () => {
+        expect(effectiveMaxTokens(32768, 8192)).toBe(8192);
+    });
+
+    it('passes the budget through when the ceiling is >= the budget', () => {
+        expect(effectiveMaxTokens(512, 8192)).toBe(512);
+        expect(effectiveMaxTokens(8192, 8192)).toBe(8192);
+    });
+
+    it('passes the budget through when there is no ceiling (undefined or non-positive)', () => {
+        expect(effectiveMaxTokens(8192, undefined)).toBe(8192);
+        expect(effectiveMaxTokens(8192, 0)).toBe(8192);
+        expect(effectiveMaxTokens(8192, -5)).toBe(8192);
+    });
+
+    it('never returns 0 even for a tiny ceiling', () => {
+        expect(effectiveMaxTokens(8192, 1)).toBe(1);
+        // A pathological budget of 0 with a positive ceiling still floors at 1.
+        expect(effectiveMaxTokens(0, 4)).toBe(1);
+    });
+});
+
+describe('SmoothAgent max_tokens clamp', () => {
+    it('sends the clamped max_tokens on the non-streaming request when a ceiling is set', async () => {
+        const client = new MockLlmProvider().pushText('ok');
+        const agent = makeAgent(client, { maxTokens: 32768, modelMaxOutput: 8192 });
+        await agent.run('hi');
+        expect(client.calls[0].body.max_tokens).toBe(8192);
+    });
+
+    it('sends the unclamped budget when no ceiling is set', async () => {
+        const client = new MockLlmProvider().pushText('ok');
+        const agent = makeAgent(client, { maxTokens: 32768 });
+        await agent.run('hi');
+        expect(client.calls[0].body.max_tokens).toBe(32768);
+    });
+
+    it('sends the clamped max_tokens on the streaming request when a ceiling is set', async () => {
+        const client = new MockLlmProvider().pushText('ok');
+        const agent = makeAgent(client, { maxTokens: 32768, modelMaxOutput: 8192 });
+        // Drive runStream to completion so the request body is recorded.
+        for await (const _ of agent.runStream('hi')) {
+            // drain
+        }
+        expect(client.calls[0].body.max_tokens).toBe(8192);
     });
 });

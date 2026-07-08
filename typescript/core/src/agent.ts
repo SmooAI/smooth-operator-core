@@ -39,6 +39,19 @@ export interface AgentOptions {
     model?: string;
     maxIterations?: number;
     maxTokens?: number;
+    /**
+     * The active model's hard **output** ceiling (`max_output_tokens`), when known.
+     * Each model call clamps `max_tokens` to `min(maxTokens, modelMaxOutput)` so a
+     * budget/policy `maxTokens` (which may be tuned high) can never exceed what the
+     * model can physically emit — otherwise a reasoning model burns its budget on
+     * `reasoning_content` and returns empty `content`, or the upstream 400s (e.g.
+     * `groq-compound` caps output at 8192). Source it from the gateway's
+     * `/model/info` (`model_info.max_output_tokens`). Omitted / `undefined` / `0` ⇒
+     * no clamp (graceful passthrough, zero behaviour change). Mirrors the Rust
+     * engine's `LlmClient::with_model_ceiling` / `AgentConfig.model_max_output`
+     * (EPIC th-1cc9fa).
+     */
+    modelMaxOutput?: number;
     temperature?: number;
     knowledge?: Knowledge;
     knowledgeTopK?: number;
@@ -223,6 +236,17 @@ function sleep(ms: number): Promise<void> {
     return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
 }
 
+/**
+ * The `max_tokens` to actually send: the configured budget, clamped down to the
+ * model's output ceiling when one is known. Never returns 0. `ceiling` of
+ * `undefined` / `0` (or any non-positive value) ⇒ passthrough (no clamp), mirroring
+ * the Rust engine's `LlmClient::effective_max_tokens` (EPIC th-1cc9fa).
+ */
+export function effectiveMaxTokens(configured: number, ceiling?: number): number {
+    if (ceiling === undefined || ceiling <= 0) return configured;
+    return Math.max(1, Math.min(configured, ceiling));
+}
+
 /** Pull token usage from an OpenAI-shaped response, defaulting to zero when absent. */
 function extractUsage(usage: { prompt_tokens?: number | null; completion_tokens?: number | null } | null | undefined): Usage {
     return { promptTokens: usage?.prompt_tokens ?? 0, completionTokens: usage?.completion_tokens ?? 0 };
@@ -337,7 +361,7 @@ export class SmoothAgent {
                     messages,
                     ...(tools ? { tools } : {}),
                     temperature: this.options.temperature ?? DEFAULTS.temperature,
-                    max_tokens: this.options.maxTokens ?? DEFAULTS.maxTokens,
+                    max_tokens: effectiveMaxTokens(this.options.maxTokens ?? DEFAULTS.maxTokens, this.options.modelMaxOutput),
                 });
                 tracker.record(model, extractUsage(response.usage), this.options.pricing);
                 const choice = response.choices[0].message;
@@ -463,7 +487,7 @@ export class SmoothAgent {
                     messages,
                     ...(tools ? { tools } : {}),
                     temperature: this.options.temperature ?? DEFAULTS.temperature,
-                    max_tokens: this.options.maxTokens ?? DEFAULTS.maxTokens,
+                    max_tokens: effectiveMaxTokens(this.options.maxTokens ?? DEFAULTS.maxTokens, this.options.modelMaxOutput),
                     stream: true,
                 });
                 for await (const chunk of stream) {
