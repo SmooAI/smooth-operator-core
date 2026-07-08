@@ -84,6 +84,13 @@ pub struct AgentConfig {
     /// that received a multimodal chat turn; consumed once, on that turn.
     /// Empty for text-only turns. Pearl th-25ce5c.
     pub next_user_images: Vec<crate::conversation::ImageContent>,
+    /// The active model's hard output ceiling (`max_output_tokens`), when known.
+    /// Threaded onto the built [`LlmClient`] so requests clamp `max_tokens` to
+    /// `min(llm.max_tokens, ceiling)` — a budget tuned high (or resolved per-org
+    /// via `@smooai/config` limits) can never exceed what the model can emit.
+    /// `None` = unknown → no clamp. The host sources it per-turn from the
+    /// gateway's `/model/info` for the resolved model. (EPIC th-1cc9fa.)
+    pub model_max_output: Option<u32>,
 }
 
 /// A message injected into a running agent's conversation from outside the loop.
@@ -126,7 +133,17 @@ impl AgentConfig {
             chat_rx: None,
             prior_messages: Vec::new(),
             next_user_images: Vec::new(),
+            model_max_output: None,
         }
+    }
+
+    /// Pin the active model's output ceiling (`max_output_tokens`). The built
+    /// [`LlmClient`] clamps `max_tokens` to `min(llm.max_tokens, ceiling)`.
+    /// `None` leaves it unclamped (the default).
+    #[must_use]
+    pub fn with_model_ceiling(mut self, ceiling: Option<u32>) -> Self {
+        self.model_max_output = ceiling;
+        self
     }
 
     /// Attach image(s) to the current turn's user message. The host sets
@@ -797,7 +814,7 @@ impl Agent {
 
         let llm: Arc<dyn LlmProvider> = match &self.llm_provider {
             Some(provider) => Arc::clone(provider),
-            None => Arc::new(LlmClient::new(self.config.llm.clone())),
+            None => Arc::new(LlmClient::new(self.config.llm.clone()).with_model_ceiling(self.config.model_max_output)),
         };
 
         for iteration in 1..=self.config.max_iterations {
@@ -1030,7 +1047,7 @@ impl Agent {
 
         let llm: Arc<dyn LlmProvider> = match &self.llm_provider {
             Some(provider) => Arc::clone(provider),
-            None => Arc::new(LlmClient::new(self.config.llm.clone())),
+            None => Arc::new(LlmClient::new(self.config.llm.clone()).with_model_ceiling(self.config.model_max_output)),
         };
 
         for iteration in 1..=self.config.max_iterations {
@@ -1713,6 +1730,13 @@ mod tests {
     fn agent_config_builder() {
         let config = test_config().with_max_iterations(10).with_checkpoint_strategy(CheckpointStrategy::Never);
         assert_eq!(config.max_iterations, 10);
+    }
+
+    #[test]
+    fn agent_config_model_ceiling_defaults_none_and_sets() {
+        assert_eq!(test_config().model_max_output, None);
+        assert_eq!(test_config().with_model_ceiling(Some(8_192)).model_max_output, Some(8_192));
+        assert_eq!(test_config().with_model_ceiling(None).model_max_output, None);
     }
 
     // ----- pearl th-operator-verify-rule: with_verify_tests_before_done -----

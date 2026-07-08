@@ -817,6 +817,15 @@ fn parse_rate_limit_headers(headers: &HeaderMap) -> RateLimitInfo {
 pub struct LlmClient {
     config: LlmConfig,
     client: reqwest::Client,
+    /// The active model's hard **output** ceiling (`max_output_tokens`), when
+    /// known. Requests clamp `max_tokens` to `min(config.max_tokens, ceiling)`
+    /// so a policy/budget `max_tokens` (which may be tuned high, or per-org via
+    /// `@smooai/config` limits) can never exceed what the model can physically
+    /// emit — otherwise a reasoning model burns its budget and returns empty, or
+    /// the upstream 400s. `None` = unknown → no clamp (graceful passthrough).
+    /// Populate from the gateway via [`fetch_litellm_model_ceiling`] +
+    /// [`LlmClient::with_model_ceiling`]. (EPIC th-1cc9fa.)
+    model_max_output: Option<u32>,
 }
 
 impl LlmClient {
@@ -838,7 +847,31 @@ impl LlmClient {
         }
 
         let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
-        Self { config, client }
+        Self {
+            config,
+            client,
+            model_max_output: None,
+        }
+    }
+
+    /// Pin the active model's hard output ceiling (`max_output_tokens`). Requests
+    /// then clamp `max_tokens` to `min(config.max_tokens, ceiling)`. Pass `None`
+    /// to leave it unclamped (the default). Source it from the gateway with
+    /// [`fetch_litellm_model_ceiling`]. Builder-style so it composes with `new`.
+    #[must_use]
+    pub fn with_model_ceiling(mut self, ceiling: Option<u32>) -> Self {
+        self.model_max_output = ceiling.filter(|&c| c > 0);
+        self
+    }
+
+    /// The `max_tokens` to actually send: the configured budget, clamped down to
+    /// the model's output ceiling when one is known. Never returns 0.
+    #[must_use]
+    pub fn effective_max_tokens(&self) -> u32 {
+        match self.model_max_output {
+            Some(ceiling) => self.config.max_tokens.min(ceiling).max(1),
+            None => self.config.max_tokens,
+        }
     }
 
     /// Send a chat completion request with automatic retry on transient errors.
@@ -905,7 +938,7 @@ impl LlmClient {
         let request = ChatRequest {
             model: self.config.model.clone(),
             messages: chat_messages,
-            max_tokens: self.config.max_tokens,
+            max_tokens: self.effective_max_tokens(),
             temperature: self.config.temperature,
             tools: chat_tools,
             tool_choice,
@@ -1070,7 +1103,7 @@ impl LlmClient {
         let request = ChatRequest {
             model: self.config.model.clone(),
             messages: chat_messages,
-            max_tokens: self.config.max_tokens,
+            max_tokens: self.effective_max_tokens(),
             temperature: self.config.temperature,
             tools: chat_tools,
             tool_choice,
@@ -1286,7 +1319,7 @@ impl LlmClient {
 
         let request = AnthropicRequest {
             model: self.config.model.clone(),
-            max_tokens: self.config.max_tokens,
+            max_tokens: self.effective_max_tokens(),
             system,
             messages: anthropic_messages,
             tools: anthropic_tools,
@@ -1431,7 +1464,7 @@ impl LlmClient {
 
         let request = AnthropicRequest {
             model: self.config.model.clone(),
-            max_tokens: self.config.max_tokens,
+            max_tokens: self.effective_max_tokens(),
             system,
             messages: anthropic_messages,
             tools: anthropic_tools,
@@ -2675,6 +2708,30 @@ mod tests {
         assert_eq!(config.model, "gpt-4o");
         assert!((config.temperature - 0.7).abs() < f32::EPSILON);
         assert_eq!(config.max_tokens, 4096);
+    }
+
+    #[test]
+    fn effective_max_tokens_clamps_to_model_ceiling() {
+        let config = LlmConfig::openrouter("key").with_max_tokens(32_768);
+
+        // No ceiling known -> passthrough of the configured budget.
+        let unclamped = LlmClient::new(config.clone());
+        assert_eq!(unclamped.effective_max_tokens(), 32_768);
+
+        // Ceiling below the budget -> clamp down (the groq-compound=8192 case).
+        let clamped = LlmClient::new(config.clone()).with_model_ceiling(Some(8_192));
+        assert_eq!(clamped.effective_max_tokens(), 8_192);
+
+        // Ceiling above the budget -> budget still governs (deepseek=384000 case).
+        let roomy = LlmClient::new(config.clone()).with_model_ceiling(Some(384_000));
+        assert_eq!(roomy.effective_max_tokens(), 32_768);
+
+        // Zero/None ceiling is ignored (never clamp to 0).
+        assert_eq!(LlmClient::new(config.clone()).with_model_ceiling(Some(0)).effective_max_tokens(), 32_768);
+        assert_eq!(LlmClient::new(config.clone()).with_model_ceiling(None).effective_max_tokens(), 32_768);
+
+        // Exactly-equal ceiling is a no-op.
+        assert_eq!(LlmClient::new(config).with_model_ceiling(Some(32_768)).effective_max_tokens(), 32_768);
     }
 
     #[test]
