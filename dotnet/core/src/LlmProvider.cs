@@ -102,7 +102,7 @@ public sealed class MockLlmProvider : IChatClient
 
     private ChatResponse Next(IEnumerable<ChatMessage> messages, ChatOptions? options)
     {
-        _recorded.Add(new RecordedCall(messages.ToList(), options?.Tools?.ToList()));
+        _recorded.Add(new RecordedCall(messages.ToList(), options?.Tools?.ToList(), options?.MaxOutputTokens));
         if (_script.Count == 0)
         {
             throw new InvalidOperationException("MockLlmProvider: no scripted response left.");
@@ -115,8 +115,9 @@ public sealed class MockLlmProvider : IChatClient
         return outcome.Response!;
     }
 
-    /// <summary>One request the mock received, captured for assertions.</summary>
-    public sealed record RecordedCall(IList<ChatMessage> Messages, IReadOnlyList<AITool>? Tools);
+    /// <summary>One request the mock received, captured for assertions. <see cref="MaxOutputTokens"/>
+    /// is the request's clamped <c>max_tokens</c> (null when the agent left it unset).</summary>
+    public sealed record RecordedCall(IList<ChatMessage> Messages, IReadOnlyList<AITool>? Tools, int? MaxOutputTokens = null);
 
     private readonly record struct Outcome(bool IsError, ChatResponse? Response, string? ErrorMessage)
     {
