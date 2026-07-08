@@ -179,9 +179,19 @@ type AgentOptions struct {
 	Model         string
 	MaxIterations int
 	MaxTokens     int
-	Temperature   float64
-	Knowledge     Knowledge
-	KnowledgeTopK int
+	// ModelMaxOutput is the active model's hard output ceiling (its
+	// max_output_tokens). When set, every request's MaxTokens is clamped to
+	// min(MaxTokens, *ModelMaxOutput) so a budget/policy MaxTokens (which may be
+	// tuned high) can never exceed what the model can physically emit — otherwise a
+	// reasoning model burns its budget on reasoning and returns empty, or the
+	// upstream 400s (e.g. groq-compound caps output at 8192). nil (the default)
+	// leaves MaxTokens unclamped. Source it from the gateway's /model/info
+	// (model_info.max_output_tokens). Mirror of the Rust engine's
+	// LlmClient.with_model_ceiling (EPIC th-1cc9fa).
+	ModelMaxOutput *int
+	Temperature    float64
+	Knowledge      Knowledge
+	KnowledgeTopK  int
 	// Reranker reorders retrieved hits before injection (nil = passthrough).
 	Reranker Reranker
 	// KnowledgeCandidateK is the pool size retrieved before reranking; when greater
@@ -257,12 +267,30 @@ type AgentRunResponse struct {
 }
 
 const (
-	defaultModel            = "claude-haiku-4-5"
-	defaultMaxIterations    = 8
-	defaultMaxTokens        = 512
+	defaultModel = "claude-haiku-4-5"
+	// defaultMaxIterations / defaultMaxTokens were 8 / 512 — chat-widget sizing that
+	// STARVES reasoning models (they burn the budget on reasoning_content and return
+	// empty). Raised to 20 / 8192 now that the per-model output ceiling (ModelMaxOutput)
+	// clamps MaxTokens to what each model can emit — a higher cap only bounds runaway
+	// output; concise answers stay concise (EPIC th-1cc9fa).
+	defaultMaxIterations    = 20
+	defaultMaxTokens        = 8192
 	defaultKnowledgeTopK    = 4
 	defaultMaxContextTokens = 8000
 )
+
+// effectiveMaxTokens clamps a configured max_tokens budget to the model's hard
+// output ceiling when one is known: it returns min(configured, *ceiling). A nil or
+// non-positive ceiling leaves the budget unclamped. The result is never 0 for a
+// positive budget — a real budget is never clamped away to nothing (some gateways
+// reject max_tokens=0 or treat it as "no output"). Mirror of the Rust engine's
+// LlmClient::effective_max_tokens (EPIC th-1cc9fa).
+func effectiveMaxTokens(configured int, ceiling *int) int {
+	if ceiling == nil || *ceiling <= 0 || *ceiling >= configured {
+		return configured
+	}
+	return *ceiling
+}
 
 // SmoothAgent is a native, in-process agent.
 type SmoothAgent struct {
@@ -419,6 +447,9 @@ func (a *SmoothAgent) run(ctx context.Context, message string, history []ChatMes
 	if maxTokens <= 0 {
 		maxTokens = defaultMaxTokens
 	}
+	// Clamp to the model's output ceiling (nil ⇒ unclamped) so MaxTokens never
+	// exceeds what the model can physically emit (EPIC th-1cc9fa).
+	maxTokens = effectiveMaxTokens(maxTokens, a.options.ModelMaxOutput)
 	// Per-run promotion state for deferred tools (nil when none registered).
 	var search *ToolSearch
 	if len(a.options.DeferredTools) > 0 {
@@ -609,6 +640,9 @@ func (a *SmoothAgent) runStream(ctx context.Context, sc StreamingChatClient, mes
 	if maxTokens <= 0 {
 		maxTokens = defaultMaxTokens
 	}
+	// Clamp to the model's output ceiling (nil ⇒ unclamped) so MaxTokens never
+	// exceeds what the model can physically emit (EPIC th-1cc9fa).
+	maxTokens = effectiveMaxTokens(maxTokens, a.options.ModelMaxOutput)
 	var search *ToolSearch
 	if len(a.options.DeferredTools) > 0 {
 		search = NewToolSearch(a.options.DeferredTools)
