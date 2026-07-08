@@ -29,6 +29,24 @@ from .thread import SmoothAgentThread
 from .tool_search import ToolSearch
 
 
+def effective_max_tokens(max_tokens: int, model_max_output: int | None) -> int:
+    """The ``max_tokens`` to actually send: the configured budget, clamped DOWN to
+    the model's hard output ceiling when one is known.
+
+    A policy/budget ``max_tokens`` (tuned high, or raised per-org) can exceed what
+    a model can physically emit — a reasoning model then burns the whole budget on
+    reasoning and returns EMPTY, or the upstream 400s (e.g. ``groq-compound`` caps
+    output at 8192). Clamping to ``min(max_tokens, ceiling)`` prevents that.
+
+    ``model_max_output`` of ``None`` (or ``<= 0``) means the ceiling is unknown ⇒
+    graceful passthrough (no clamp). Never returns 0 — a 0 budget would make the
+    model emit nothing. Mirrors the Rust reference's
+    ``LlmClient::effective_max_tokens`` (EPIC th-1cc9fa / th-562b6d)."""
+    if model_max_output is None or model_max_output <= 0:
+        return max_tokens
+    return max(1, min(max_tokens, model_max_output))
+
+
 class Tool(Protocol):
     """A callable tool the agent may invoke. Mirrors the reference engines' tool seam."""
 
@@ -60,6 +78,15 @@ class AgentOptions:
     model: str = "claude-haiku-4-5"
     max_iterations: int = 8
     max_tokens: int = 512
+    #: The active model's hard **output** ceiling (``max_output_tokens``), when
+    #: known. Requests clamp ``max_tokens`` to ``min(max_tokens, ceiling)`` (see
+    #: :func:`effective_max_tokens`) so a budget/policy ``max_tokens`` can never
+    #: exceed what the model can physically emit — otherwise a reasoning model
+    #: burns its budget and returns empty, or the upstream 400s. ``None`` (the
+    #: default) ⇒ unknown ⇒ no clamp (graceful passthrough). The server sources it
+    #: from the gateway's ``/model/info`` (EPIC th-1cc9fa). Mirrors the Rust
+    #: reference's ``AgentConfig.model_max_output`` / ``with_model_ceiling``.
+    model_max_output: int | None = None
     temperature: float = 0.0
     knowledge: Knowledge | None = None
     knowledge_top_k: int = 4
@@ -572,7 +599,7 @@ class SmoothAgent:
             messages=messages,
             tools=tool_specs,
             temperature=self._options.temperature,
-            max_tokens=self._options.max_tokens,
+            max_tokens=effective_max_tokens(self._options.max_tokens, self._options.model_max_output),
             stream=True,
         )
 
@@ -593,7 +620,7 @@ class SmoothAgent:
                     messages=messages,
                     tools=tool_specs,
                     temperature=self._options.temperature,
-                    max_tokens=self._options.max_tokens,
+                    max_tokens=effective_max_tokens(self._options.max_tokens, self._options.model_max_output),
                 )
             except Exception:
                 if attempt >= self._options.max_retries:
