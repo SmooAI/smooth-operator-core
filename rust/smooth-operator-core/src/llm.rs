@@ -847,7 +847,11 @@ impl LlmClient {
         }
 
         let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
-        Self { config, client, model_max_output: None }
+        Self {
+            config,
+            client,
+            model_max_output: None,
+        }
     }
 
     /// Pin the active model's hard output ceiling (`max_output_tokens`). Requests
