@@ -6,7 +6,7 @@
  * client, with in-memory knowledge grounding. See `docs/Architecture/TypeScript Core.md`.
  */
 
-export { delegateTool, SmoothAgent } from './agent.js';
+export { delegateTool, effectiveMaxTokens, SmoothAgent } from './agent.js';
 export type { AgentOptions, AgentRunResponse, ChatChunk, ChatClientLike, StreamEvent, Tool } from './agent.js';
 export { Cast, Clearance, makeRole, RoleKind } from './cast.js';
 export type { OperatorRole } from './cast.js';
