@@ -1121,30 +1121,58 @@ impl LlmClient {
             .ok_or_else(|| anyhow::anyhow!("serialized request is not a JSON object"))?
             .insert("stream".into(), serde_json::Value::Bool(true));
 
-        // Pearl `th-3b30b0` (was th-b30b00 in earlier filing — id
-        // truncated): retry transient reqwest errors at the request-
-        // send level. The bench observed "error sending request for
-        // url … → connection closed before message completed" on
-        // llm.smoo.ai mid-session. That's a reqwest::Error::request()
-        // / is_timeout() / is_connect() failure that the original
-        // code propagated immediately via `?`. With retry, the same
-        // call survives a brief upstream blip.
-        //
-        // Streaming requests are NOT idempotent in general (a partial
-        // response could have been emitted). We retry only when the
-        // initial `.send().await` itself fails — i.e. before any
-        // bytes have been read from the stream. Once the response
-        // headers are in (status known), we drop into the existing
-        // status-code retry path.
+        // Retry BEFORE reading any stream bytes — idempotent, since no partial
+        // response has been emitted yet. Mirrors the non-streaming `chat()` retry:
+        // transient transport failures (pearl th-3b30b0: reqwest
+        // is_timeout/is_connect/is_request, e.g. "connection closed before message
+        // completed" on llm.smoo.ai mid-session) AND retryable HTTP statuses
+        // (`policy.retry_on_status`). A transient gateway 5xx from groq/LiteLLM
+        // (502/503) must NOT nuke the turn — an un-retried 5xx propagates as an
+        // AGENT_ERROR and the chat widget renders an empty reply. Honors
+        // Retry-After; dumps the request on the final failure, same as before.
+        let policy = &self.config.retry_policy;
         let resp = {
-            const MAX_SEND_RETRIES: u32 = 3;
             let mut last_err: Option<anyhow::Error> = None;
-            let mut sent_resp = None;
-            for attempt in 0..=MAX_SEND_RETRIES {
+            let mut ok_resp = None;
+            for attempt in 0..=policy.max_retries {
                 match self.client.post(&url).bearer_auth(&self.config.api_key).json(&request_body).send().await {
-                    Ok(r) => {
-                        sent_resp = Some(r);
+                    Ok(r) if r.status().is_success() => {
+                        ok_resp = Some(r);
                         break;
+                    }
+                    Ok(r) => {
+                        let status = r.status();
+                        let status_code = status.as_u16();
+                        let rate_limit_info = parse_rate_limit_headers(r.headers());
+                        let body = r.text().await.unwrap_or_default();
+                        // Dump the failed request to a rotating file so 4xx/5xx are debuggable.
+                        let req_json = serde_json::to_string_pretty(&request_body).unwrap_or_default();
+                        if let Some(home) = dirs_next::home_dir() {
+                            let dump_dir = home.join(".smooth/llm-errors");
+                            let _ = std::fs::create_dir_all(&dump_dir);
+                            let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f");
+                            let dump_path = dump_dir.join(format!("{ts}-{}.json", status.as_u16()));
+                            let dump_contents = format!("// status={status}\n// body={body}\n{req_json}\n");
+                            let _ = std::fs::write(&dump_path, dump_contents);
+                            tracing::error!(status = %status, response_body = %body, dump = %dump_path.display(), "LLM stream request failed (full request dumped)");
+                        } else {
+                            tracing::error!(status = %status, response_body = %body, "LLM stream request failed");
+                        }
+                        last_err = Some(anyhow::anyhow!("LLM API error {status}: {body}"));
+                        if !policy.retry_on_status.contains(&status_code) || attempt == policy.max_retries {
+                            break;
+                        }
+                        let delay = rate_limit_info
+                            .retry_after_ms
+                            .map_or_else(|| calculate_backoff(attempt, policy), Duration::from_millis);
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            max_retries = policy.max_retries,
+                            status = status_code,
+                            delay_ms = delay.as_millis(),
+                            "LLM stream request failed, retrying"
+                        );
+                        tokio::time::sleep(delay).await;
                     }
                     Err(e) => {
                         let is_transient = e.is_timeout() || e.is_connect() || e.is_request();
@@ -1158,45 +1186,20 @@ impl LlmClient {
                             chain.join(" → ")
                         };
                         last_err = Some(anyhow::anyhow!("HTTP request failed: {chain}"));
-                        if !is_transient || attempt == MAX_SEND_RETRIES {
+                        if !is_transient || attempt == policy.max_retries {
                             break;
                         }
-                        let backoff_ms = 200_u64 * (1_u64 << attempt); // 200, 400, 800
-                        tracing::warn!(
-                            attempt = attempt + 1,
-                            max = MAX_SEND_RETRIES + 1,
-                            backoff_ms,
-                            error = %chain,
-                            "chat_stream send failed transient — retrying"
-                        );
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        let delay = calculate_backoff(attempt, policy);
+                        tracing::warn!(attempt = attempt + 1, max_retries = policy.max_retries, backoff_ms = delay.as_millis(), error = %chain, "chat_stream send failed transient — retrying");
+                        tokio::time::sleep(delay).await;
                     }
                 }
             }
-            match sent_resp {
+            match ok_resp {
                 Some(r) => r,
-                None => return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("HTTP request failed: no error captured"))),
+                None => return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("LLM stream request failed after retries"))),
             }
         };
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            // Dump the failed request to a rotating file so 4xx/5xx are debuggable.
-            let req_json = serde_json::to_string_pretty(&request_body).unwrap_or_default();
-            if let Some(home) = dirs_next::home_dir() {
-                let dump_dir = home.join(".smooth/llm-errors");
-                let _ = std::fs::create_dir_all(&dump_dir);
-                let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f");
-                let dump_path = dump_dir.join(format!("{ts}-{}.json", status.as_u16()));
-                let dump_contents = format!("// status={status}\n// body={body}\n{req_json}\n");
-                let _ = std::fs::write(&dump_path, dump_contents);
-                tracing::error!(status = %status, response_body = %body, dump = %dump_path.display(), "LLM stream request failed (full request dumped)");
-            } else {
-                tracing::error!(status = %status, response_body = %body, "LLM stream request failed");
-            }
-            anyhow::bail!("LLM API error {status}: {body}");
-        }
 
         let byte_stream = resp.bytes_stream();
 
@@ -3581,6 +3584,68 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         assert_eq!(policy.base_delay_ms, 1000);
         assert_eq!(policy.max_delay_ms, 60_000);
         assert_eq!(policy.retry_on_status, vec![429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527]);
+    }
+
+    /// chat_stream must RETRY a retryable HTTP status (e.g. a groq/LiteLLM 503)
+    /// before reading the stream — an un-retried 5xx becomes an AGENT_ERROR and
+    /// the chat widget renders an empty reply. Serves 503 then 200+SSE from a
+    /// throwaway local server and asserts the turn recovers.
+    #[tokio::test]
+    async fn chat_stream_retries_retryable_5xx_then_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU32::new(0));
+        let hits2 = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let n = hits2.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await; // drain request headers (best-effort)
+                let resp = if n == 0 {
+                    "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+                } else {
+                    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let mut config = LlmConfig::openrouter("test-key");
+        config.api_url = format!("http://{addr}");
+        config.model = "test-model".into();
+        // Tiny backoff so the test isn't gated on the 1s default.
+        config.retry_policy = RetryPolicy {
+            base_delay_ms: 1,
+            max_delay_ms: 5,
+            ..RetryPolicy::default()
+        };
+        let client = LlmClient::new(config);
+
+        let user = Message::user("hello");
+        let msgs = vec![&user];
+        let mut stream = client.chat_stream(&msgs, &[]).await.expect("chat_stream should recover after the 503");
+        let mut got = String::new();
+        while let Some(ev) = stream.next().await {
+            if let Ok(StreamEvent::Delta { content }) = ev {
+                got.push_str(&content);
+            }
+        }
+        assert_eq!(got, "hi");
+        assert!(
+            hits.load(Ordering::SeqCst) >= 2,
+            "expected a retry after the 503, saw {} request(s)",
+            hits.load(Ordering::SeqCst)
+        );
     }
 
     #[test]
