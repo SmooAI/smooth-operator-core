@@ -34,6 +34,53 @@ export interface Tool {
     execute(args: Record<string, unknown>): Promise<string>;
 }
 
+/** A tool call requested by the model. Mirrors the Rust engine's `ToolCall`. */
+export interface ToolCall {
+    id: string;
+    name: string;
+    arguments: Record<string, unknown>;
+}
+
+/**
+ * Result of executing a tool. Mirrors the Rust engine's `ToolResult`.
+ *
+ * `content` is what the model/conversation sees — a {@link ToolHook.postCall}
+ * hook may rewrite it in place (the redaction seam).
+ */
+export interface ToolResult {
+    toolCallId: string;
+    content: string;
+    isError: boolean;
+    /** Optional structured details for UI rendering (diffs, tables, etc.). */
+    details?: unknown;
+}
+
+/**
+ * A hook that runs around every tool call, mirroring the Rust engine's
+ * `ToolHook` trait (`pre_call` / `post_call`). Installed on the agent via
+ * {@link SmoothAgent.addHook} or {@link AgentOptions.toolHooks} and run for both
+ * {@link SmoothAgent.run} and {@link SmoothAgent.runStream}.
+ *
+ * The lifecycle is the enforcement + redaction seam Narc (and the server's
+ * consumer-supplied surveillance hooks) plug into.
+ */
+export interface ToolHook {
+    /**
+     * Called before a tool executes. **Throw to block the call** (mirrors Rust's
+     * `pre_call` returning `Err`) — the model is told the call was blocked and the
+     * tool never runs. Optional; omit for a post-only (redaction) hook.
+     */
+    preCall?(call: ToolCall): Promise<void>;
+    /**
+     * Called after the tool executes with a **mutable** {@link ToolResult}. A hook
+     * may rewrite `result.content` (e.g. redact a leaked secret) and the mutation
+     * is what the model/conversation sees. A throw here is swallowed (logged, not
+     * surfaced) so the redaction seam can never break the turn — mirroring Rust's
+     * `post_call` whose `Err` is `tracing::warn`'d, not propagated. Optional.
+     */
+    postCall?(call: ToolCall, result: ToolResult): Promise<void>;
+}
+
 export interface AgentOptions {
     instructions?: string;
     model?: string;
@@ -64,6 +111,15 @@ export interface AgentOptions {
     /** How many memory entries to recall per turn (default 4). */
     memoryTopK?: number;
     tools?: Tool[];
+    /**
+     * Tool-call surveillance hooks run around every tool dispatch (both `run` and
+     * `runStream`). Each hook's `preCall` runs before the tool executes — a throw
+     * blocks the call — and its `postCall` runs after with a mutable result it may
+     * redact. Mirrors the Rust engine's `ToolRegistry` hook chain; the server's
+     * `toolHooks` seam threads consumer-supplied hooks in here. Additional hooks can
+     * be added post-construction via {@link SmoothAgent.addHook}.
+     */
+    toolHooks?: ToolHook[];
     /**
      * When `true` and an assistant turn returns ≥2 tool calls, dispatch them
      * concurrently (`Promise.all`) instead of sequentially. The tool-result
@@ -254,6 +310,8 @@ function extractUsage(usage: { prompt_tokens?: number | null; completion_tokens?
 
 export class SmoothAgent {
     private readonly toolsByName: Map<string, Tool>;
+    /** Tool-call surveillance hooks, run in order around every dispatch. */
+    private readonly hooks: ToolHook[];
 
     constructor(
         private readonly client: ChatClientLike,
@@ -261,6 +319,17 @@ export class SmoothAgent {
     ) {
         if (!client) throw new Error('client is required');
         this.toolsByName = new Map((options.tools ?? []).map((t) => [t.name, t]));
+        this.hooks = [...(options.toolHooks ?? [])];
+    }
+
+    /**
+     * Register a tool-call surveillance {@link ToolHook}, appended after any hooks
+     * supplied via {@link AgentOptions.toolHooks}. Mirrors the Rust engine's
+     * `ToolRegistry::add_hook`: every hook's `preCall` runs before a tool executes
+     * (a throw blocks it) and its `postCall` runs after with a mutable result.
+     */
+    addHook(hook: ToolHook): void {
+        this.hooks.push(hook);
     }
 
     private buildSystem(message: string): string {
@@ -395,11 +464,11 @@ export class SmoothAgent {
                 const calls = choice.tool_calls;
                 let results: string[];
                 if (this.options.parallelToolCalls && calls.length > 1) {
-                    results = await Promise.all(calls.map((tc) => this.dispatchTool(tc.function.name, tc.function.arguments, search)));
+                    results = await Promise.all(calls.map((tc) => this.dispatchTool(tc.function.name, tc.function.arguments, search, tc.id)));
                 } else {
                     results = [];
                     for (const tc of calls) {
-                        results.push(await this.dispatchTool(tc.function.name, tc.function.arguments, search));
+                        results.push(await this.dispatchTool(tc.function.name, tc.function.arguments, search, tc.id));
                     }
                 }
                 for (let i = 0; i < calls.length; i++) {
@@ -552,11 +621,11 @@ export class SmoothAgent {
                 // original call order so the event stream stays deterministic.
                 let results: string[];
                 if (this.options.parallelToolCalls && calls.length > 1) {
-                    results = await Promise.all(calls.map((tc) => this.dispatchTool(tc.function.name, tc.function.arguments, search)));
+                    results = await Promise.all(calls.map((tc) => this.dispatchTool(tc.function.name, tc.function.arguments, search, tc.id)));
                 } else {
                     results = [];
                     for (const tc of calls) {
-                        results.push(await this.dispatchTool(tc.function.name, tc.function.arguments, search));
+                        results.push(await this.dispatchTool(tc.function.name, tc.function.arguments, search, tc.id));
                     }
                 }
                 for (let i = 0; i < calls.length; i++) {
@@ -603,7 +672,7 @@ export class SmoothAgent {
         }
     }
 
-    private async dispatchTool(name: string, rawArgs: string, search?: ToolSearch): Promise<string> {
+    private async dispatchTool(name: string, rawArgs: string, search?: ToolSearch, callId = ''): Promise<string> {
         // Enforce the role's tool clearance before dispatch: a forbidden tool is
         // never executed — the model is told it isn't permitted, mirroring how the
         // loop surfaces other tool errors.
@@ -637,12 +706,44 @@ export class SmoothAgent {
             }
         }
 
+        // Tool-call surveillance lifecycle (mirrors the Rust engine's ToolHook).
+        const call: ToolCall = { id: callId, name, arguments: args };
+
+        // pre-call: any hook that throws blocks execution (fail-closed), mirroring
+        // Rust's `pre_call` returning `Err`. The block reason is surfaced to the model.
+        for (const hook of this.hooks) {
+            if (!hook.preCall) continue;
+            try {
+                await hook.preCall(call);
+            } catch (err) {
+                return `blocked by hook: ${err instanceof Error ? err.message : String(err)}`;
+            }
+        }
+
+        const result: ToolResult = { toolCallId: callId, content: '', isError: false };
         try {
-            return await tool.execute(args);
+            result.content = await tool.execute(args);
         } catch (err) {
             // Surface tool failures to the model, don't crash the turn.
-            return `error: tool '${name}' failed: ${err instanceof Error ? err.message : String(err)}`;
+            result.content = `error: tool '${name}' failed: ${err instanceof Error ? err.message : String(err)}`;
+            result.isError = true;
         }
+
+        // post-call: hooks may redact `result.content` in place — the mutation is
+        // what the model/conversation sees. A hook throw is swallowed (never
+        // surfaced) so the redaction seam can't break the turn, mirroring Rust's
+        // `post_call` whose `Err` is warned, not propagated.
+        for (const hook of this.hooks) {
+            if (!hook.postCall) continue;
+            try {
+                await hook.postCall(call, result);
+            } catch {
+                // ponytail: swallow post-hook errors like Rust's tracing::warn — the
+                // (possibly-redacted) result still reaches the caller.
+            }
+        }
+
+        return result.content;
     }
 }
 

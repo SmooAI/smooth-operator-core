@@ -7,7 +7,7 @@
  */
 
 export { delegateTool, effectiveMaxTokens, SmoothAgent } from './agent.js';
-export type { AgentOptions, AgentRunResponse, ChatChunk, ChatClientLike, StreamEvent, Tool } from './agent.js';
+export type { AgentOptions, AgentRunResponse, ChatChunk, ChatClientLike, StreamEvent, Tool, ToolCall, ToolHook, ToolResult } from './agent.js';
 export { Cast, Clearance, makeRole, RoleKind } from './cast.js';
 export type { OperatorRole } from './cast.js';
 export { InMemoryCheckpointStore } from './checkpoint.js';
