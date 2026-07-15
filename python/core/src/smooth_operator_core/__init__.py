@@ -22,6 +22,7 @@ from .agent import (
 from .cast import Cast, Clearance, OperatorRole, RoleKind
 from .checkpoint import Checkpoint, CheckpointStore, InMemoryCheckpointStore
 from .cost import CostBudget, CostTracker, ModelPricing, Usage
+from .hooks import ToolCall, ToolHook, ToolResult
 from .human_gate import (
     DelegateHumanGate,
     HumanApprovalRequest,
@@ -89,6 +90,9 @@ __all__ = [
     "SmoothAgent",
     "SmoothAgentThread",
     "Tool",
+    "ToolCall",
+    "ToolHook",
+    "ToolResult",
     "ToolSearch",
     "Usage",
     "VectorKnowledge",

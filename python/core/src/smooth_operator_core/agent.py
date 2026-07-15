@@ -21,6 +21,7 @@ from .cast import Clearance
 from .checkpoint import Checkpoint, CheckpointStore
 from .compaction import compact
 from .cost import CostBudget, CostTracker, ModelPricing, Usage
+from .hooks import ToolCall, ToolHook, ToolResult
 from .human_gate import HumanApprovalRequest, HumanGate
 from .knowledge import Knowledge
 from .memory import Memory
@@ -101,6 +102,13 @@ class AgentOptions:
     #: How many memory entries to recall per turn.
     memory_top_k: int = 4
     tools: list[Tool] = field(default_factory=list)
+    #: Tool-call lifecycle hooks (parity with the Rust ``ToolHook`` trait). Every
+    #: hook's ``pre_call`` runs before a tool executes (raise to block it) and its
+    #: ``post_call`` runs after with a mutable :class:`~.hooks.ToolResult` — the
+    #: redaction seam (a hook may rewrite ``result.content`` and that mutation is
+    #: what the model/transcript sees). Empty (the default) ⇒ no hooks, zero
+    #: overhead, behavior unchanged.
+    tool_hooks: list[ToolHook] = field(default_factory=list)
     #: When True and an assistant turn returns >=2 tool calls, dispatch them
     #: concurrently (``asyncio.gather``) instead of sequentially. Tool-result
     #: messages are still appended in the original ``tool_calls`` order, so the
@@ -666,10 +674,35 @@ class SmoothAgent:
             if not decision.is_approved:
                 return f"Denied by human: {decision.reason or 'no reason given'}"
 
+        # Tool-call lifecycle hooks (parity with the Rust ``ToolHook`` trait). Empty
+        # ``tool_hooks`` (the default) makes both loops no-ops → behavior unchanged.
+        hooks = self._options.tool_hooks
+        call = ToolCall(name=name, arguments=args)
+
+        # pre_call: any hook may block the call by raising. The message is fed back
+        # to the model as the tool result; the tool never runs. Mirrors the Rust
+        # engine returning a "blocked by hook" result on a pre_call Err.
+        for hook in hooks:
+            try:
+                await hook.pre_call(call)
+            except Exception as exc:  # noqa: BLE001 — a blocking hook informs the model, it doesn't crash the turn
+                return f"blocked by hook: {exc}"
+
         try:
-            return await tool.execute(args)
+            result = ToolResult(content=await tool.execute(call.arguments), is_error=False)
         except Exception as exc:  # noqa: BLE001 — surface tool failures to the model, don't crash the turn
-            return f"error: tool '{name}' failed: {exc}"
+            result = ToolResult(content=f"error: tool '{name}' failed: {exc}", is_error=True)
+
+        # post_call: hooks may redact ``result.content`` in place (the mutable seam).
+        # A hook raising here is swallowed — the possibly-redacted result still
+        # reaches the caller; a broken hook must never crash the turn.
+        for hook in hooks:
+            try:
+                await hook.post_call(call, result)
+            except Exception:  # noqa: BLE001 — post-hook failure must not surface; result still returns
+                pass
+
+        return result.content
 
 
 def delegate_tool(name: str, description: str, child: SmoothAgent, task_property: str = "task") -> FunctionTool:
