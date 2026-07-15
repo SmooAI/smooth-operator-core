@@ -27,6 +27,16 @@ Do not start new tool chains. Respond with text only:\n\
 3. List any remaining tasks that were not completed.\n\
 4. Recommend what should be done next (a follow-up dispatch, a manual step, a question for the user).";
 
+/// System prompt for the fast-model preamble (see [`AgentConfig::preamble`]).
+/// Deliberately narrow: one short present-tense sentence, no answer, no
+/// greeting, no promises — it's generated WITHOUT the tool result, so it must
+/// describe intent only.
+const PREAMBLE_SYSTEM_PROMPT: &str = "You are the assistant's voice while it works. \
+In ONE short present-tense sentence (max ~12 words), tell the user what you're about to do to help with their message. \
+Do NOT answer the question, do NOT greet, do NOT promise a specific result or outcome. \
+Example: \"Let me pull up your recent conversations.\" \
+Reply with only that sentence — no quotes, no preamble, no markdown.";
+
 /// Verify-tests-before-done system-prompt rule. Appended by
 /// [`AgentConfig::with_verify_tests_before_done`]. The anchor lets the
 /// builder detect a prior append and avoid double-stacking the rule.
@@ -91,6 +101,33 @@ pub struct AgentConfig {
     /// `None` = unknown → no clamp. The host sources it per-turn from the
     /// gateway's `/model/info` for the resolved model. (EPIC th-1cc9fa.)
     pub model_max_output: Option<u32>,
+    /// Optional fast-model "preamble". Reasoning models behind a gateway sit on
+    /// dead air during their time-to-first-token (reasoning + tool call). When
+    /// set, the FIRST turn fires this small fast model *in parallel* with the
+    /// main model and streams ONE short user-facing sentence describing what's
+    /// about to happen (`AgentEvent::PreambleDelta`), so the UX doesn't stall.
+    /// Off unless set — every existing consumer is unaffected. Pearl th-9a5794.
+    ///
+    // ponytail: Rust reference impl only. The TS/Go/.NET/Python core ports skip
+    // this until a non-Rust consumer needs it — every SmooAI production brain
+    // (chat-ws, voice, HeyPage, general-agent→Rust) runs on the Rust core.
+    pub preamble: Option<PreambleConfig>,
+}
+
+/// Config for the parallel fast-model preamble (see [`AgentConfig::preamble`]).
+#[derive(Debug, Clone)]
+pub struct PreambleConfig {
+    /// Fast model alias to generate the preamble, e.g. `groq-gpt-oss-20b`.
+    /// Resolved through the same gateway/key as the main model.
+    pub model: String,
+    /// Max tokens for the preamble. Keep it to one sentence. Default 64.
+    pub max_tokens: u32,
+}
+
+impl PreambleConfig {
+    pub fn new(model: impl Into<String>) -> Self {
+        Self { model: model.into(), max_tokens: 64 }
+    }
 }
 
 /// A message injected into a running agent's conversation from outside the loop.
@@ -134,7 +171,16 @@ impl AgentConfig {
             prior_messages: Vec::new(),
             next_user_images: Vec::new(),
             model_max_output: None,
+            preamble: None,
         }
+    }
+
+    /// Enable the parallel fast-model preamble (see [`AgentConfig::preamble`]).
+    /// `None` (the default) leaves it off — no extra LLM call, no behavior change.
+    #[must_use]
+    pub fn with_preamble(mut self, preamble: Option<PreambleConfig>) -> Self {
+        self.preamble = preamble;
+        self
     }
 
     /// Pin the active model's output ceiling (`max_output_tokens`). The built
@@ -370,6 +416,16 @@ pub enum AgentEvent {
     /// Back-compat: older consumers skip this unknown variant, so they simply
     /// stop showing reasoning (rather than showing it as answer text).
     ReasoningDelta {
+        content: String,
+    },
+    /// A streamed token of the fast-model *preamble* — a short, present-tense
+    /// user-facing sentence describing what the agent is about to do, generated
+    /// in parallel with the main model's first turn to cover its time-to-first-
+    /// token (see [`AgentConfig::preamble`]). Distinct from [`TokenDelta`] so
+    /// consumers render it as an *ephemeral* status line that the real answer
+    /// replaces — never as permanent chat content. Back-compat: older consumers
+    /// skip this unknown variant and simply don't show a preamble. Pearl th-9a5794.
+    PreambleDelta {
         content: String,
     },
     StreamingComplete,
@@ -1013,6 +1069,12 @@ impl Agent {
         self.sep_before_agent_start(&mut conversation).await;
         let user_msg: String = user_message.into();
 
+        // Fire the parallel fast-model preamble (best-effort UX; no-op unless
+        // `config.preamble` is set). Kicked as early as possible — before the
+        // main model's first turn — so its one-sentence "what I'm about to do"
+        // covers the reasoning model's time-to-first-token. Pearl th-9a5794.
+        self.spawn_preamble(&user_msg, &tx);
+
         // Pre-seed prior session turns (pearl th-422b93) before
         // memory/knowledge injection. Only User/Assistant roles are
         // preserved — System prompts already came from
@@ -1640,6 +1702,44 @@ impl Agent {
     /// keeps the function callable from both the sync `emit` path
     /// in `run` and the channel-based path in `run_streaming`.
     /// Pearl th-a10c2d.
+    /// Spawn the optional fast-model preamble task (see [`AgentConfig::preamble`]).
+    /// No-op unless `config.preamble` is set. Best-effort: it runs on its own
+    /// task and any failure/slowness is swallowed, so it can never block or
+    /// break the real turn. Emits at most one [`AgentEvent::PreambleDelta`].
+    ///
+    /// Model routing: production (`llm_provider` unset) builds a dedicated fast
+    /// client on `preamble.model` (the 20b) sharing the main model's gateway +
+    /// key. When a provider is injected (tests), it reuses that provider so
+    /// unit tests stay hermetic — the mock's `chat` queue is separate from its
+    /// `chat_stream` queue, so it doesn't collide with the main loop. Pearl th-9a5794.
+    fn spawn_preamble(&self, user_msg: &str, tx: &tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
+        let Some(pre) = &self.config.preamble else { return };
+        let provider: Arc<dyn LlmProvider> = match &self.llm_provider {
+            Some(p) => Arc::clone(p),
+            None => {
+                let mut fast_cfg = self.config.llm.clone();
+                fast_cfg.model = pre.model.clone();
+                fast_cfg.max_tokens = pre.max_tokens;
+                Arc::new(LlmClient::new(fast_cfg))
+            }
+        };
+        let sys = Message::system(PREAMBLE_SYSTEM_PROMPT);
+        let user = Message::user(user_msg.to_string());
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            match provider.chat(&[&sys, &user], &[]).await {
+                Ok(resp) => {
+                    let text = resp.content.trim();
+                    if !text.is_empty() {
+                        let _ = tx.send(AgentEvent::PreambleDelta { content: text.to_string() });
+                    }
+                }
+                // Best-effort: a failed/slow preamble must never surface or block.
+                Err(e) => tracing::debug!(error = %e, "preamble generation failed (ignored)"),
+            }
+        });
+    }
+
     fn model_resolution_event(&self, response: &crate::llm::LlmResponse) -> Option<AgentEvent> {
         let upstream = response.resolved_model.as_deref()?;
         if upstream.is_empty() {
@@ -1730,6 +1830,68 @@ mod tests {
     fn agent_config_builder() {
         let config = test_config().with_max_iterations(10).with_checkpoint_strategy(CheckpointStrategy::Never);
         assert_eq!(config.max_iterations, 10);
+    }
+
+    /// Helper: drain the event channel for the first `PreambleDelta`, waiting up
+    /// to 2s for the fire-and-forget preamble task to complete. Returns None if
+    /// no preamble arrives before every sender drops.
+    async fn recv_preamble(mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Option<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Some(AgentEvent::PreambleDelta { content }) => return Some(content),
+                    Some(_) => {}
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .expect("preamble did not resolve within 2s")
+    }
+
+    #[tokio::test]
+    async fn preamble_emits_delta_and_does_not_break_the_turn() {
+        use crate::llm_provider::MockLlmClient;
+
+        let mock = MockLlmClient::new();
+        // Main loop consumes the STREAM queue: one-shot text answer, then Done.
+        mock.push_stream(vec![
+            StreamEvent::Delta { content: "The answer is 42.".into() },
+            StreamEvent::Done { finish_reason: "stop".into() },
+        ]);
+        // The preamble routes through the SAME mock but its own CHAT queue.
+        mock.push_text("Let me look into that.");
+
+        let config = test_config().with_preamble(Some(PreambleConfig::new("groq-gpt-oss-20b")));
+        let agent = Agent::new(config, ToolRegistry::new()).with_llm_provider(Arc::new(mock.clone()));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let convo = agent.run_with_channel("summarize my week", tx).await.expect("run completes");
+
+        // The real answer still lands — the preamble is additive, not a detour.
+        assert_eq!(convo.last_assistant_content(), Some("The answer is 42."));
+        // And the ephemeral preamble was emitted from the parallel fast model.
+        assert_eq!(recv_preamble(rx).await, Some("Let me look into that.".to_string()));
+    }
+
+    #[tokio::test]
+    async fn preamble_off_by_default_emits_nothing() {
+        use crate::llm_provider::MockLlmClient;
+
+        let mock = MockLlmClient::new();
+        mock.push_stream(vec![
+            StreamEvent::Delta { content: "hi".into() },
+            StreamEvent::Done { finish_reason: "stop".into() },
+        ]);
+        // No preamble config → spawn_preamble returns early, no chat() call.
+        let agent = Agent::new(test_config(), ToolRegistry::new()).with_llm_provider(Arc::new(mock.clone()));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        agent.run_with_channel("hello", tx).await.expect("run completes");
+
+        assert_eq!(recv_preamble(rx).await, None);
+        // Exactly one upstream call (the main chat_stream) — no extra preamble chat.
+        assert_eq!(mock.call_count(), 1);
     }
 
     #[test]
