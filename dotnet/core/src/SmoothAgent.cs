@@ -388,18 +388,51 @@ public sealed class SmoothAgent
             }
         }
 
+        // Pre-call hooks run before the tool. A hook that throws blocks the call — the tool never
+        // runs and the model gets a "Blocked by hook" result. Parity with the Rust reference's
+        // pre_call returning Err (registry short-circuits without executing the tool).
+        try
+        {
+            foreach (var hook in _options.ToolHooks)
+            {
+                await hook.PreCallAsync(call, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            return new FunctionResultContent(call.CallId, $"Blocked by hook: {ex.Message}");
+        }
+
+        FunctionResultContent resultContent;
         try
         {
             var arguments = new AIFunctionArguments(call.Arguments);
             var result = await function.InvokeAsync(arguments, cancellationToken).ConfigureAwait(false);
-            return new FunctionResultContent(call.CallId, result);
+            resultContent = new FunctionResultContent(call.CallId, result);
         }
         catch (Exception ex)
         {
             // A failing tool is fed back to the model as an error result, not thrown —
             // the model can recover or apologize. Mirrors the Rust ToolResult.is_error path.
-            return new FunctionResultContent(call.CallId, $"Error: {ex.Message}");
+            resultContent = new FunctionResultContent(call.CallId, $"Error: {ex.Message}");
         }
+
+        // Post-call hooks run with the mutable result (redaction seam) on both success and error.
+        // A hook failure is swallowed so the possibly-redacted result still reaches the caller —
+        // parity with the Rust reference logging post_call errors rather than surfacing them.
+        foreach (var hook in _options.ToolHooks)
+        {
+            try
+            {
+                await hook.PostCallAsync(call, resultContent, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // ponytail: swallow post-hook failures — the (redacted) result still returns. Parity with Rust.
+            }
+        }
+
+        return resultContent;
     }
 
     private static void Accumulate(UsageDetails total, UsageDetails? add)
