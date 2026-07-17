@@ -1,7 +1,9 @@
 # Publish the Python agent-engine core to PyPI.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# THIS WORKFLOW IS THE ONLY PLACE THIS PACKAGE IS PUBLISHED.
+# MANUAL FALLBACK. The Changesets release (release.yml → `pnpm ci:publish`) now
+# drives the normal, lockstep publish. Keep this workflow for out-of-band /
+# recovery publishes; both paths are idempotent (--check-url).
 #
 # Package: smooai-smooth-operator-core  (python/core) — the native Python engine.
 #

@@ -20,7 +20,9 @@
         "rust:clippy": "cd rust && cargo clippy --workspace --all-targets -- -D warnings",
         "rust:test": "cd rust && cargo test --workspace",
         "changeset": "changeset",
-        "ci:publish": "pnpm --filter @smooai/smooth-operator-core build && changeset publish"
+        "version:sync": "node scripts/sync-versions.mjs",
+        "ci:version": "node scripts/ci-version.mjs",
+        "ci:publish": "node scripts/ci-publish.mjs"
     },
     "devDependencies": {
         "@changesets/cli": "^2.27.10"
