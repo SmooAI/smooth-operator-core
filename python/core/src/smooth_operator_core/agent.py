@@ -21,10 +21,12 @@ from .cast import Clearance
 from .checkpoint import Checkpoint, CheckpointStore
 from .compaction import compact
 from .cost import CostBudget, CostTracker, ModelPricing, Usage
+from .deny_policy import DenyPolicy
 from .hooks import ToolCall, ToolHook, ToolResult
 from .human_gate import HumanApprovalRequest, HumanGate
 from .knowledge import Knowledge
 from .memory import Memory
+from .permission import AutoMode, PermissionHook
 from .rerank import NoopReranker, Reranker
 from .thread import SmoothAgentThread
 from .tool_search import ToolSearch
@@ -109,6 +111,22 @@ class AgentOptions:
     #: what the model/transcript sees). Empty (the default) ⇒ no hooks, zero
     #: overhead, behavior unchanged.
     tool_hooks: list[ToolHook] = field(default_factory=list)
+    #: Tool-call permission mode (pearl th-ab0437 — parity with the Rust engine's
+    #: ``AutoMode``). When set (not ``None``), a :class:`~.permission.PermissionHook`
+    #: enforcing this mode is prepended to :attr:`tool_hooks` so it gates every call
+    #: FIRST (read-only allow / mutating ask / dangerous deny, per the mode). ``None``
+    #: (the default) ⇒ no permission gating (behavior unchanged). For interactive
+    #: ``Ask`` routing or a persisted allow-list, construct a ``PermissionHook``
+    #: directly (``.with_approver`` / ``.with_grants``) and add it to ``tool_hooks``.
+    permission_mode: AutoMode | None = None
+    #: Consumer deny policy (pearl th-deny-policy — parity with the Rust
+    #: ``DenyPolicy``). When set, its rules/predicates are enforced FIRST as hard
+    #: circuit-breakers (no grant waives them, no mode downgrades them). If
+    #: :attr:`permission_mode` is also ``None``, the policy alone still activates a
+    #: gate in :attr:`~.permission.AutoMode.BYPASS` mode — only the built-in
+    #: circuit-breakers and this policy deny; everything else is allowed. ``None``
+    #: (the default) ⇒ no deny policy (behavior unchanged).
+    deny_policy: DenyPolicy | None = None
     #: When True and an assistant turn returns >=2 tool calls, dispatch them
     #: concurrently (``asyncio.gather``) instead of sequentially. Tool-result
     #: messages are still appended in the original ``tool_calls`` order, so the
@@ -241,6 +259,22 @@ class SmoothAgent:
         self._client = chat_client
         self._options = options
         self._tools_by_name = {t.name: t for t in options.tools}
+
+        # Assemble the effective hook chain. When a permission mode and/or deny policy
+        # is configured, a PermissionHook is prepended so it gates every call FIRST
+        # (before any other hook, e.g. Narc). A deny policy with no explicit mode
+        # activates the gate in BYPASS — only the built-in circuit-breakers + the
+        # policy deny; everything else allowed. Neither set ⇒ the user's hooks
+        # verbatim (additive no-op default).
+        self._hooks: list[ToolHook] = list(options.tool_hooks)
+        mode = options.permission_mode
+        if mode is None and options.deny_policy is not None:
+            mode = AutoMode.BYPASS
+        if mode is not None:
+            hook = PermissionHook(mode)
+            if options.deny_policy is not None:
+                hook = hook.with_deny_policy(options.deny_policy)
+            self._hooks = [hook, *self._hooks]
 
     def _build_system(self, message: str) -> str:
         system = self._options.instructions or ""
@@ -674,9 +708,11 @@ class SmoothAgent:
             if not decision.is_approved:
                 return f"Denied by human: {decision.reason or 'no reason given'}"
 
-        # Tool-call lifecycle hooks (parity with the Rust ``ToolHook`` trait). Empty
-        # ``tool_hooks`` (the default) makes both loops no-ops → behavior unchanged.
-        hooks = self._options.tool_hooks
+        # Tool-call lifecycle hooks (parity with the Rust ``ToolHook`` trait). The
+        # effective chain (built in __init__) prepends a PermissionHook when a
+        # permission mode / deny policy is configured, so it gates FIRST. An empty
+        # chain (the default) makes both loops no-ops → behavior unchanged.
+        hooks = self._hooks
         call = ToolCall(name=name, arguments=args)
 
         # pre_call: any hook may block the call by raising. The message is fed back
