@@ -15,11 +15,13 @@
 
 ---
 
-> The Go sibling of the [Rust reference engine](https://github.com/SmooAI/smooth-operator-core). Agents, tools, knowledge/RAG, memory, checkpointing, human-in-the-loop, cost budgets, and workflows — as one embeddable package. It's the engine, not a notebook demo.
+> ### The agent brain you can point at production — right in your Go process.
+>
+> Most agent frameworks hand the model a pile of tools and hope. This one gives you the loop **and the brakes**: draw hard lines the model can never cross, then let it run.
 
-`github.com/SmooAI/smooth-operator-core/go/core` is the **native Go implementation** of the Smoo AI agent engine — the in-process observe→think→act loop that powers [**lom.smoo.ai**](https://lom.smoo.ai). It's a sibling of the [Rust reference engine](https://github.com/SmooAI/smooth-operator-core) and one of the [polyglot set](https://github.com/SmooAI/smooth-operator-core/blob/main/docs/Polyglot-Engines.md) (Rust, TypeScript, Python, Go, C#/.NET) whose behavior is held at parity by a shared eval suite.
+`github.com/SmooAI/smooth-operator-core/go/core` is the agent engine itself, in-process — an observe→think→act loop over any OpenAI-compatible client, with typed tools, streaming, checkpointing, cost budgets, and a permission gate you control. Not a client to a remote server: the agent *is* your process.
 
-It's a library, not a client to a remote server: it *is* the agent, running in your Go process. Every surface is covered by **fast, offline tests** built on a deterministic `MockLlmProvider`, so the loop is verified — not vibe-coded.
+It's the native Go port of the [Rust reference engine](https://github.com/SmooAI/smooth-operator-core) — one of five siblings (Rust, TypeScript, Python, Go, C#/.NET) that share one wire spec and one eval suite. **The same agent brain, the same guarantees, wherever your stack already lives.** Every surface is covered by fast, offline tests on a deterministic `MockLlmProvider`, so the loop is verified — not vibe-coded.
 
 ## Install
 
@@ -33,6 +35,8 @@ The engine is the `core` package; idiomatic alias `core`.
 
 A complete agent — no credentials needed — using the deterministic mock provider the engine's own tests run on:
 
+A complete agent with one tool — the mock is scripted to call the tool, then answer:
+
 ```go
 package main
 
@@ -44,10 +48,29 @@ import (
 )
 
 func main() {
-	provider := core.NewMockLlmProvider().PushText("the answer is 42")
-	agent := core.NewSmoothAgent(provider, core.AgentOptions{Instructions: "You are a helpful assistant"})
+	weather := core.FuncTool{
+		ToolName: "get_weather",
+		Desc:     "Get the current weather for a city",
+		Params: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"city": map[string]any{"type": "string"}},
+			"required":   []string{"city"},
+		},
+		Fn: func(ctx context.Context, args map[string]any) (string, error) {
+			return fmt.Sprintf("Weather in %v: 72F, sunny", args["city"]), nil
+		},
+	}
 
-	res, err := agent.Run(context.Background(), "what is the answer?", nil)
+	provider := core.NewMockLlmProvider().
+		PushToolCall("call_1", "get_weather", `{"city":"Tokyo"}`).
+		PushText("It's 72F and sunny in Tokyo.")
+
+	agent := core.NewSmoothAgent(provider, core.AgentOptions{
+		Instructions: "You are a helpful assistant",
+		Tools:        []core.Tool{weather},
+	})
+
+	res, err := agent.Run(context.Background(), "what's the weather in Tokyo?", nil)
 	if err != nil {
 		panic(err)
 	}
@@ -55,7 +78,7 @@ func main() {
 }
 ```
 
-`NewSmoothAgent(client, options)` takes a `ChatClient` (the `MockLlmProvider` implements it — swap in any OpenAI-compatible client) and an `AgentOptions` struct. `Run(ctx, message, history)` — pass `nil` history for a fresh turn — returns `(AgentRunResponse, error)`; `res.Text` is the final answer.
+`NewSmoothAgent(client, options)` takes a `ChatClient` (the `MockLlmProvider` implements it — swap in any OpenAI-compatible client) and an `AgentOptions` struct. `FuncTool` wraps a function as a `Tool`. `Run(ctx, message, history)` — pass `nil` history for a fresh turn — returns `(AgentRunResponse, error)`; `res.Text` is the final answer.
 
 ## Features
 
@@ -71,6 +94,7 @@ The full parity surface — every engine in the [polyglot set](https://github.co
 - **Rerank** — rerank retrieved hits before injection (lexical reranker built in).
 - **Sub-agents / delegation** — spawn child agents for sub-tasks.
 - **Cast + clearance** — roles with per-role tool-access policy.
+- **Permissions + deny-policy** — a tool-call gate (`AutoMode`: ask / accept-edits / deny-unmatched / bypass) with hard circuit-breakers (`rm -rf /`, credential paths, pipe-to-shell, dangerous domains), a persisted allow-list, and a consumer `DenyPolicy` — declarative TOML rules plus semantic predicates for what strings can't express.
 - **Human-in-the-loop gate** — require approval before designated tool calls run.
 - **Conversation thread** — carry a conversation across multiple `Run` calls.
 - **`LlmProvider` seam + `MockLlmProvider`** — inject any OpenAI-compatible client; the record/replay mock drives the offline tests.
@@ -79,6 +103,43 @@ The full parity surface — every engine in the [polyglot set](https://github.co
 - **Parallel tool calls** — dispatch ≥2 tool calls concurrently (transcript order preserved).
 - **Retry / backoff** — retry transient model-call failures with exponential backoff.
 - **Streaming** — stream incremental text, tool calls, and tool results as the turn runs.
+
+## Permissions & deny-policy — lines the agent can't cross
+
+This is what makes an agent safe to point at real infrastructure: **you** decide what it can never do, and no prompt or model mistake talks it out of that. Every tool call passes through a gate. `AutoMode` sets the posture — read-only calls **allow**, mutating calls **ask**, dangerous calls **deny** — and hard circuit-breakers (`rm -rf /`, credential paths, pipe-to-shell, dangerous domains) fire in every mode, `AutoModeBypass` included. Attach a `DenyPolicy` on top: declarative TOML rules for the lines you can name, semantic predicates for the ones you can't. A match is a hard deny no stored grant and no mode can waive.
+
+```go
+// A DenyPredicate for what strings can't express — return (reason, true) to deny.
+type denyDbWriter struct{}
+
+func (denyDbWriter) Evaluate(name string, args map[string]any) (core.DenyReason, bool) {
+	if name == "db_query" && strings.Contains(fmt.Sprint(args), "writer") {
+		return core.NewDenyReason("DB writer endpoint is off-limits — reads go to the replica"), true
+	}
+	return core.DenyReason{}, false
+}
+
+// Declarative rules (TOML): never the prod AWS profile, never a prod host.
+policy, err := core.DenyPolicyFromTOML(`
+	schema_version = 1
+	[bash]
+	deny_patterns = ["aws * --profile prod"]
+	[network]
+	deny_hosts = ["*.prod.internal"]
+`)
+if err != nil {
+	panic(err)
+}
+policy = policy.WithPredicate(denyDbWriter{})
+
+mode := core.AutoModeAsk
+agent := core.NewSmoothAgent(provider, core.AgentOptions{
+	Instructions:   "You are a careful assistant",
+	Tools:          []core.Tool{weather},
+	PermissionMode: &mode, // read allow · mutate ask · dangerous deny
+	DenyPolicy:     policy,
+})
+```
 
 ## Streaming
 
