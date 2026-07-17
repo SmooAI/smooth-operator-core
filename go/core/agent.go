@@ -243,6 +243,28 @@ type AgentOptions struct {
 	//
 	//	func(name string, _ map[string]any) bool { return name == "delete_record" }
 	RequiresApproval func(name string, args map[string]any) bool
+	// PermissionMode, when non-nil, enables the native permission engine (the Go
+	// port of the Rust PermissionHook — see permission.go / permission_gate.go):
+	// every tool call is classified by Decide and gated before it runs. A hard
+	// circuit-breaker (rm -rf /, credential paths, pipe-to-shell, dangerous
+	// domains, env dumps) is always denied; a mutating/network call Asks (routed
+	// to HumanGate, or fails closed with no gate); read-only calls Allow. nil (the
+	// default) disables the engine entirely — dispatch is byte-for-byte unchanged.
+	// Setting DenyPolicy without PermissionMode enables the engine at
+	// AutoModeAsk. The HumanGate seam doubles as the Ask approver (an
+	// ApproveAlways response persists a grant to PermissionGrantsPath).
+	PermissionMode *AutoMode
+	// DenyPolicy is a consumer-supplied deny policy (declarative TOML rules +
+	// predicates) evaluated FIRST on every gated call — a match is a
+	// circuit-breaker no grant or mode can waive. nil = none. Enables the
+	// permission engine even when PermissionMode is nil.
+	DenyPolicy *DenyPolicy
+	// PermissionGrants is the live allow-list consulted on an Ask before
+	// prompting; a matching grant auto-approves silently. nil disables persistence.
+	PermissionGrants *SharedGrants
+	// PermissionGrantsPath is where an ApproveAlways answer persists a new grant
+	// (the user-scope wonk-allow.toml). Empty degrades approve-always to approve-once.
+	PermissionGrantsPath string
 	// MaxRetries is the number of ADDITIONAL attempts after the first if the model
 	// call returns a transient error (rate-limit, 5xx, dropped connection). 0 (the
 	// default) preserves today's behaviour: a single attempt, error returned
@@ -297,6 +319,7 @@ type SmoothAgent struct {
 	client      ChatClient
 	options     AgentOptions
 	toolsByName map[string]Tool
+	permGate    *PermissionGate // nil unless the permission engine is enabled
 }
 
 // NewSmoothAgent constructs an agent over an OpenAI-compatible ChatClient.
@@ -308,7 +331,27 @@ func NewSmoothAgent(client ChatClient, options AgentOptions) *SmoothAgent {
 	for _, t := range options.Tools {
 		byName[t.Name()] = t
 	}
-	return &SmoothAgent{client: client, options: options, toolsByName: byName}
+	return &SmoothAgent{client: client, options: options, toolsByName: byName, permGate: buildPermissionGate(options)}
+}
+
+// buildPermissionGate assembles the permission gate from options, or returns nil
+// when the engine is disabled (no PermissionMode and no DenyPolicy) — the
+// additive no-op default that leaves dispatch unchanged.
+func buildPermissionGate(o AgentOptions) *PermissionGate {
+	if o.PermissionMode == nil && o.DenyPolicy == nil {
+		return nil
+	}
+	mode := AutoModeAsk
+	if o.PermissionMode != nil {
+		mode = *o.PermissionMode
+	}
+	return &PermissionGate{
+		Mode:        mode,
+		Grants:      o.PermissionGrants,
+		PersistPath: o.PermissionGrantsPath,
+		DenyPolicy:  o.DenyPolicy,
+		Approver:    o.HumanGate,
+	}
 }
 
 func (a *SmoothAgent) buildSystem(message string) string {
@@ -811,6 +854,15 @@ func (a *SmoothAgent) dispatchTool(ctx context.Context, tc ToolCall, search *Too
 	if tc.Arguments != "" {
 		if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil {
 			return fmt.Sprintf("error: tool '%s' received invalid JSON arguments", tc.Name)
+		}
+	}
+
+	// Native permission engine (opt-in via PermissionMode / DenyPolicy): classify
+	// and gate the call before it runs. A deny (circuit-breaker, deny-policy, or a
+	// fail-closed Ask) is fed back to the model as a result — the tool never runs.
+	if a.permGate != nil {
+		if err := a.permGate.Check(ctx, tc.Name, args); err != nil {
+			return fmt.Sprintf("error: tool '%s' %v", tc.Name, err)
 		}
 	}
 
