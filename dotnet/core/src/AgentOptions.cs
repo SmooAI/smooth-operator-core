@@ -135,6 +135,53 @@ public sealed class AgentOptions
     public Func<FunctionCallContent, bool>? RequiresApproval { get; set; }
 
     /// <summary>
+    /// Auto-mode permission gate. When set (or when <see cref="DenyPolicy"/> is), the agent runs the
+    /// ported <see cref="PermissionEngine"/> classifier on <b>every</b> tool call before it executes:
+    /// read-only allow, mutating ask, dangerous deny — with the hard circuit-breakers (<c>rm -rf /</c>,
+    /// <c>curl | sh</c>, credential paths, env dumps, dangerous domains) always denying. An Ask routes
+    /// to <see cref="HumanGate"/> (failing closed if none is set). <c>null</c> (the default) disables
+    /// the gate entirely — today's behaviour, unchanged. Mirrors the Rust engine's <c>AutoMode</c>.
+    /// </summary>
+    public AutoMode? PermissionMode { get; set; }
+
+    /// <summary>
+    /// Consumer-supplied deny policy — declarative "never do this" rules (no prod AWS, DB writer off-
+    /// limits, no writes under <c>/prod</c>) plus semantic <see cref="IDenyPredicate"/> checks. Purely
+    /// additive: <c>null</c> (the default) denies nothing. When set it is evaluated <b>first</b> on
+    /// every tool call and a match is a hard deny of the same tier as the built-in circuit-breakers —
+    /// no grant waives it, and <see cref="AutoMode.Bypass"/> cannot downgrade it. Setting a deny policy
+    /// enables the gate even when <see cref="PermissionMode"/> is left <c>null</c> (defaulting to
+    /// <see cref="AutoMode.Ask"/>). Mirrors the Rust engine's <c>DenyPolicy</c>.
+    /// </summary>
+    public DenyPolicy? DenyPolicy { get; set; }
+
+    /// <summary>
+    /// Optional persisted allow-list consulted by the permission gate before prompting: a stored grant
+    /// auto-approves a matching Ask silently. Load it with <see cref="SmooAI.SmoothOperator.Core.PermissionGrants.LoadLayered"/>.
+    /// </summary>
+    public SharedGrants? PermissionGrants { get; set; }
+
+    /// <summary>
+    /// Where an "approve always" answer persists a new grant (the user-scope
+    /// <c>~/.smooth/wonk-allow.toml</c>). <c>null</c> ⇒ approve-always degrades to approve-once.
+    /// </summary>
+    public string? PermissionGrantsPersistPath { get; set; }
+
+    /// <summary>Fluent: set the auto-mode permission gate. Returns <c>this</c> for chaining.</summary>
+    public AgentOptions WithPermissionMode(AutoMode mode)
+    {
+        PermissionMode = mode;
+        return this;
+    }
+
+    /// <summary>Fluent: attach a consumer deny policy. Returns <c>this</c> for chaining.</summary>
+    public AgentOptions WithDenyPolicy(DenyPolicy policy)
+    {
+        DenyPolicy = policy;
+        return this;
+    }
+
+    /// <summary>
     /// Optional spend ceiling. When set, the run halts (gracefully, returning what it has) as soon
     /// as accumulated cost/tokens exceed it. Mirrors the Rust engine's <c>budget</c>.
     /// </summary>

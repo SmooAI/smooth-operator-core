@@ -27,6 +27,7 @@ public sealed class SmoothAgent
     private readonly AgentOptions _options;
     private readonly Dictionary<string, AIFunction> _functions;
     private readonly ToolSearch? _toolSearch;
+    private readonly PermissionHook? _permissionHook;
 
     public SmoothAgent(IChatClient chatClient, AgentOptions options)
     {
@@ -34,6 +35,12 @@ public sealed class SmoothAgent
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _functions = options.Tools.OfType<AIFunction>().ToDictionary(f => f.Name, StringComparer.Ordinal);
         _toolSearch = options.DeferredTools.Count > 0 ? new ToolSearch(options.DeferredTools.OfType<AIFunction>()) : null;
+        // The permission gate is opt-in: it engages only when a mode or a deny policy is configured.
+        // Attaching just a deny policy still runs the full engine (defaulting to Ask). This keeps every
+        // existing agent byte-identical to before. An Ask routes to the same IHumanGate seam.
+        _permissionHook = options.PermissionMode is not null || options.DenyPolicy is not null
+            ? new PermissionHook(options.PermissionMode ?? AutoMode.Ask, options.HumanGate, options.DenyPolicy, options.PermissionGrants, options.PermissionGrantsPersistPath)
+            : null;
     }
 
     /// <summary>Start a fresh conversation thread for multi-turn use. (MAF: <c>GetNewThread</c>.)</summary>
@@ -374,6 +381,19 @@ public sealed class SmoothAgent
         if (function is null)
         {
             return new FunctionResultContent(call.CallId, $"Error: unknown tool '{call.Name}'");
+        }
+
+        // Permission gate (auto-mode + deny policy): classify every tool call before it runs. A deny
+        // (built-in circuit-breaker or consumer deny policy) or a fail-closed Ask blocks the tool and
+        // feeds the reason back to the model. An Ask that routes to the human is handled inside the
+        // hook via the same IHumanGate seam. Runs before the legacy RequiresApproval gate below.
+        if (_permissionHook is not null)
+        {
+            var blockReason = await _permissionHook.PreCallAsync(call, cancellationToken).ConfigureAwait(false);
+            if (blockReason is not null)
+            {
+                return new FunctionResultContent(call.CallId, $"Error: {blockReason}");
+            }
         }
 
         // Human-in-the-loop: pause for approval before running a flagged (write/sensitive) tool.
