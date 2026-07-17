@@ -20,6 +20,11 @@ const (
 	HumanApproved HumanDecision = iota
 	// HumanDenied blocks the tool; the reason is fed back to the model.
 	HumanDenied
+	// HumanApprovedAlways lets the tool run AND asks the permission gate to
+	// persist a matching grant so identical future Asks auto-approve without
+	// prompting (see permission_grants.go). Used only by the PermissionGate Ask
+	// flow; the RequiresApproval path treats it exactly like HumanApproved.
+	HumanApprovedAlways
 )
 
 // HumanApprovalRequest is sent before the agent executes a sensitive/write tool.
@@ -37,11 +42,22 @@ type HumanApprovalResponse struct {
 	Reason   string
 }
 
-// IsApproved reports whether the decision was HumanApproved.
-func (r HumanApprovalResponse) IsApproved() bool { return r.Decision == HumanApproved }
+// IsApproved reports whether the decision lets the tool run (HumanApproved or
+// HumanApprovedAlways).
+func (r HumanApprovalResponse) IsApproved() bool {
+	return r.Decision == HumanApproved || r.Decision == HumanApprovedAlways
+}
+
+// IsApprovedAlways reports whether the human asked to persist a grant.
+func (r HumanApprovalResponse) IsApprovedAlways() bool { return r.Decision == HumanApprovedAlways }
 
 // Approve builds an approval.
 func Approve() HumanApprovalResponse { return HumanApprovalResponse{Decision: HumanApproved} }
+
+// ApproveAlways builds an approval that also persists a permission grant.
+func ApproveAlways() HumanApprovalResponse {
+	return HumanApprovalResponse{Decision: HumanApprovedAlways}
+}
 
 // Deny builds a denial carrying a reason the model will see.
 func Deny(reason string) HumanApprovalResponse {
