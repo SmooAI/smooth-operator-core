@@ -609,6 +609,13 @@ pub struct Agent {
     /// `Ask`). Override via [`with_permission_mode`](Self::with_permission_mode)
     /// *before* attaching the host. Pearl th-d32ce6.
     permission_mode: crate::permission::AutoMode,
+    /// Optional consumer-supplied deny policy (pearl th-deny-policy). `None` (the
+    /// default) leaves enforcement byte-identical. When set, it is attached to
+    /// the [`PermissionHook`](crate::permission::PermissionHook) installed by
+    /// [`with_extension_host`](Self::with_extension_host) and evaluated first —
+    /// a policy match is a circuit-breaker. Set via
+    /// [`with_deny_policy`](Self::with_deny_policy) *before* attaching the host.
+    deny_policy: Option<Arc<crate::deny_policy::DenyPolicy>>,
 }
 
 impl Agent {
@@ -625,7 +632,21 @@ impl Agent {
             llm_provider: None,
             extension_host: None,
             permission_mode: crate::permission::AutoMode::from_env(),
+            deny_policy: None,
         }
+    }
+
+    /// Attach a consumer-supplied [`DenyPolicy`](crate::deny_policy::DenyPolicy)
+    /// (pearl th-deny-policy). Purely additive: with no policy (the default)
+    /// behavior is unchanged. Call this **before**
+    /// [`with_extension_host`](Self::with_extension_host), which reads it when it
+    /// installs the permission gate. A policy match is a circuit-breaker — it
+    /// wins over stored grants and every [`AutoMode`](crate::permission::AutoMode),
+    /// `Bypass` included.
+    #[must_use]
+    pub fn with_deny_policy(mut self, policy: Arc<crate::deny_policy::DenyPolicy>) -> Self {
+        self.deny_policy = Some(policy);
+        self
     }
 
     /// Set the [`AutoMode`](crate::permission::AutoMode) posture for the
@@ -668,6 +689,11 @@ impl Agent {
         // after any role-clearance `PermissionHook` already installed — a `deny`
         // from either blocks, so ordering only affects which reason surfaces first.
         let mut permission_hook = crate::permission::PermissionHook::new(self.permission_mode);
+        // Attach the consumer deny policy (pearl th-deny-policy) if one was set —
+        // evaluated first in `pre_call`, so a policy match is a circuit-breaker.
+        if let Some(policy) = &self.deny_policy {
+            permission_hook = permission_hook.with_deny_policy(policy.clone());
+        }
         if let (Some(tx), Some(rx)) = (self.config.human_tx.clone(), self.config.human_rx.clone()) {
             // ponytail: 5-min approval window; consumer sets the channel, this is
             // the default wait before an unanswered ask fails closed.
