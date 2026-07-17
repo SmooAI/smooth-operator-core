@@ -20,7 +20,17 @@ public sealed record HumanApprovalResponse(HumanDecision Decision, string? Reaso
 {
     public bool IsApproved => Decision == HumanDecision.Approved;
 
+    /// <summary>
+    /// When approved, persist a matching grant to the allow-list so the next identical permission Ask
+    /// is auto-approved without prompting (the permission gate's "approve always"). Mirrors the Rust
+    /// engine's <c>HumanResponse::ApprovedAlways</c>. Ignored on a denial.
+    /// </summary>
+    public bool Remember { get; init; }
+
     public static HumanApprovalResponse Approve() => new(HumanDecision.Approved);
+
+    /// <summary>Approve <b>and</b> remember (persist a grant so the gate stops asking).</summary>
+    public static HumanApprovalResponse ApproveAlways() => new(HumanDecision.Approved) { Remember = true };
 
     public static HumanApprovalResponse Deny(string reason) => new(HumanDecision.Denied, reason);
 }
