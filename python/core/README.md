@@ -15,11 +15,13 @@
 
 ---
 
-> The Python sibling of the [Rust reference engine](https://github.com/SmooAI/smooth-operator-core). Agents, tools, knowledge/RAG, memory, checkpointing, human-in-the-loop, cost budgets, and workflows — as one embeddable package. It's the engine, not a notebook demo.
+> ### The agent brain you can point at production — right in your Python process.
+>
+> Most agent frameworks hand the model a pile of tools and hope. This one gives you the loop **and the brakes**: draw hard lines the model can never cross, then let it run.
 
-`smooai-smooth-operator-core` is the **native Python implementation** of the Smoo AI agent engine — the in-process observe→think→act loop that powers [**lom.smoo.ai**](https://lom.smoo.ai). It's a sibling of the [Rust reference engine](https://github.com/SmooAI/smooth-operator-core) and one of the [polyglot set](https://github.com/SmooAI/smooth-operator-core/blob/main/docs/Polyglot-Engines.md) (Rust, TypeScript, Python, Go, C#/.NET) whose behavior is held at parity by a shared eval suite.
+`smooai-smooth-operator-core` is the agent engine itself, in-process — an observe→think→act loop over any OpenAI-compatible client, with typed tools, streaming, checkpointing, cost budgets, and a permission gate you control. Not a client to a remote server: the agent *is* your process.
 
-It's a library, not a client to a remote server: it *is* the agent, running in your Python process. Every surface is covered by **fast, offline tests** built on a deterministic `MockLlmProvider`, so the loop is verified — not vibe-coded.
+It's the native Python port of the [Rust reference engine](https://github.com/SmooAI/smooth-operator-core) — one of five siblings (Rust, TypeScript, Python, Go, C#/.NET) that share one wire spec and one eval suite. **The same agent brain, the same guarantees, wherever your stack already lives.** Every surface is covered by fast, offline tests on a deterministic `MockLlmProvider`, so the loop is verified — not vibe-coded.
 
 ## Install
 
@@ -33,22 +35,36 @@ Import as `smooth_operator_core`.
 
 A complete agent — no credentials needed — using the deterministic mock provider the engine's own tests run on:
 
+A complete agent with one tool — the mock is scripted to call the tool, then answer:
+
 ```python
 import asyncio
-from smooth_operator_core import SmoothAgent, AgentOptions, MockLlmProvider
+import json
+from smooth_operator_core import SmoothAgent, AgentOptions, FunctionTool, MockLlmProvider
+
+async def get_weather(args):
+    return f"Weather in {args['city']}: 72F, sunny"
 
 async def main():
-    provider = MockLlmProvider()
-    provider.push_text("the answer is 42")
+    weather = FunctionTool(
+        name="get_weather",
+        description="Get the current weather for a city",
+        parameters={"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+        func=get_weather,
+    )
 
-    agent = SmoothAgent(provider, AgentOptions(instructions="You are a helpful assistant"))
-    result = await agent.run("what is the answer?")
+    provider = MockLlmProvider()
+    provider.push_tool_call("call_1", "get_weather", json.dumps({"city": "Tokyo"}))
+    provider.push_text("It's 72F and sunny in Tokyo.")
+
+    agent = SmoothAgent(provider, AgentOptions(instructions="You are a helpful assistant", tools=[weather]))
+    result = await agent.run("what's the weather in Tokyo?")
     print(result.text)
 
 asyncio.run(main())
 ```
 
-`SmoothAgent(chat_client, options)` takes the provider (the `MockLlmProvider` — swap in any OpenAI-compatible client) and an `AgentOptions` dataclass (all fields default, so `AgentOptions()` is valid). `await agent.run(...)` returns an `AgentRunResponse`; `result.text` is the final answer.
+`SmoothAgent(chat_client, options)` takes the provider (the `MockLlmProvider` — swap in any OpenAI-compatible client) and an `AgentOptions` dataclass (all fields default, so `AgentOptions()` is valid). `FunctionTool` wraps an async function as a tool. `await agent.run(...)` returns an `AgentRunResponse`; `result.text` is the final answer.
 
 ## Features
 
@@ -64,6 +80,7 @@ The full parity surface — every engine in the [polyglot set](https://github.co
 - **Rerank** — rerank retrieved hits before injection (lexical reranker built in).
 - **Sub-agents / delegation** — spawn child agents for sub-tasks.
 - **Cast + clearance** — roles with per-role tool-access policy.
+- **Permissions + deny-policy** — a tool-call gate (`AutoMode`: ask / accept-edits / deny-unmatched / bypass) with hard circuit-breakers (`rm -rf /`, credential paths, pipe-to-shell, dangerous domains), a persisted allow-list, and a consumer `DenyPolicy` — declarative TOML rules plus semantic predicates for what strings can't express.
 - **Human-in-the-loop gate** — require approval before designated tool calls run.
 - **Conversation thread** — `SmoothAgentThread` carries a conversation across multiple `run` calls.
 - **`LlmProvider` seam + `MockLlmProvider`** — inject any OpenAI-compatible client; the record/replay mock drives the offline tests.
@@ -72,6 +89,44 @@ The full parity surface — every engine in the [polyglot set](https://github.co
 - **Parallel tool calls** — dispatch ≥2 tool calls concurrently (transcript order preserved).
 - **Retry / backoff** — retry transient model-call failures with exponential backoff.
 - **Streaming** — stream incremental text, tool calls, and tool results as the turn runs.
+
+## Permissions & deny-policy — lines the agent can't cross
+
+This is what makes an agent safe to point at real infrastructure: **you** decide what it can never do, and no prompt or model mistake talks it out of that. Every tool call passes through a gate. `AutoMode` sets the posture — read-only calls **allow**, mutating calls **ask**, dangerous calls **deny** — and hard circuit-breakers (`rm -rf /`, credential paths, pipe-to-shell, dangerous domains) fire in every mode, `BYPASS` included. Attach a `DenyPolicy` on top: declarative TOML rules for the lines you can name, semantic predicates for the ones you can't. A match is a hard deny no stored grant and no mode can waive.
+
+```python
+from smooth_operator_core import (
+    SmoothAgent, AgentOptions, AutoMode, DenyPolicy, DenyPredicate, DenyReason,
+)
+
+# Declarative rules (TOML): never the prod AWS profile, never a prod host.
+policy = DenyPolicy.from_toml(
+    """
+    schema_version = 1
+    [bash]
+    deny_patterns = ["aws * --profile prod"]
+    [network]
+    deny_hosts = ["*.prod.internal"]
+    """
+)
+
+# Predicate for what strings can't express — return a DenyReason to deny, None to allow.
+class DenyDbWriter(DenyPredicate):
+    def evaluate(self, call):
+        if call.name == "db_query" and "writer" in str(call.arguments):
+            return DenyReason.new("DB writer endpoint is off-limits — reads go to the replica")
+        return None
+
+agent = SmoothAgent(
+    provider,
+    AgentOptions(
+        instructions="You are a careful assistant",
+        tools=[weather],
+        permission_mode=AutoMode.ASK,  # read allow · mutate ask · dangerous deny
+        deny_policy=policy.with_predicate(DenyDbWriter()),
+    ),
+)
+```
 
 ## Streaming
 

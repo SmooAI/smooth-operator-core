@@ -1,6 +1,10 @@
 # Publish the smooth-operator-core TypeScript engine to npm.
 #
 # ─────────────────────────────────────────────────────────────────────────────
+# MANUAL FALLBACK. The Changesets release (release.yml → `pnpm ci:publish`) now
+# drives the normal, lockstep publish. Keep this workflow for out-of-band /
+# recovery publishes; both paths are idempotent (skip-if-exists).
+#
 # Package:
 #   • @smooai/smooth-operator-core  (typescript/core/) — the native, in-process
 #     TypeScript agent engine. The sibling of the Rust reference engine, the C#

@@ -15,11 +15,13 @@
 
 ---
 
-> The agent runtime behind the [smooth-operator](https://github.com/SmooAI/smooth-operator) service and [lom.smoo.ai](https://lom.smoo.ai). Agents, workflows, tools, checkpointing, memory, human-in-the-loop, and per-model cost budgets — as a single embeddable Rust crate. It's the engine, not a notebook demo.
+> ### The agent brain you can point at production — a single embeddable Rust crate.
+>
+> Most agent frameworks hand the model a pile of tools and hope. This one gives you the loop **and the brakes**: draw hard lines the model can never cross, then let it run.
 
-`smooai-smooth-operator-core` is the **reference implementation** of the Smoo AI agent engine — the observe→think→act loop that powers the [**smooth-operator**](https://github.com/SmooAI/smooth-operator) service and [**lom.smoo.ai**](https://lom.smoo.ai). It gives you the moving parts of a serious agent framework — a typed tool system, a graph workflow engine, pluggable checkpoint stores, memory, RAG, human-in-the-loop gates, and per-model cost budgets — as one embeddable crate.
+`smooai-smooth-operator-core` is the agent engine itself — an observe→think→act loop over any OpenAI-compatible client, with a typed tool system, pre/post hooks, pluggable checkpoint stores, memory, RAG, human-in-the-loop gates, per-model cost budgets, and a permission gate you control. One crate; runs in a Lambda, a container, any host process. It's the runtime the [**smooth-operator**](https://github.com/SmooAI/smooth-operator) service actually ships on.
 
-This Rust crate is the source of truth: the [TypeScript, Python, Go, and C#/.NET engines](https://github.com/SmooAI/smooth-operator-core/blob/main/docs/Polyglot-Engines.md) mirror its behavior. Every surface is covered by **fast, offline unit tests** built on a deterministic `MockLlmClient`, so the loop is verified — not vibe-coded.
+This crate is the **reference implementation** — the source of truth the [TypeScript, Python, Go, and C#/.NET ports](https://github.com/SmooAI/smooth-operator-core/blob/main/docs/Polyglot-Engines.md) mirror at parity. **The same agent brain, the same guarantees, wherever your stack already lives.** Every surface is covered by fast, offline unit tests on a deterministic `MockLlmClient`, so the loop is verified — not vibe-coded.
 
 ## Install
 
@@ -33,23 +35,48 @@ The crate is `smooai-smooth-operator-core` (library `smooth_operator_core`), v0.
 
 ## Quickstart
 
-A complete agent — no credentials needed — using the deterministic mock provider the engine's own tests run on:
+A complete agent with one tool — no credentials needed — using the deterministic mock provider the engine's own tests run on. The mock is scripted to call the tool, then answer:
 
 ```rust
 use std::sync::Arc;
-use smooth_operator_core::{Agent, AgentConfig, LlmConfig, ToolRegistry};
+use async_trait::async_trait;
+use smooth_operator_core::{Agent, AgentConfig, LlmConfig, Tool, ToolRegistry, ToolSchema};
 use smooth_operator_core::llm_provider::MockLlmClient;
+
+struct GetWeather;
+
+#[async_trait]
+impl Tool for GetWeather {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "get_weather".into(),
+            description: "Get the current weather for a city".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "city": { "type": "string" } },
+                "required": ["city"]
+            }),
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<String> {
+        Ok(format!("Weather in {}: 72F, sunny", args["city"].as_str().unwrap_or("?")))
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mock = MockLlmClient::new();
-    mock.push_text("the answer is 42");
+    mock.push_tool_call("call_1", "get_weather", serde_json::json!({ "city": "Tokyo" }));
+    mock.push_text("It's 72F and sunny in Tokyo.");
+
+    let mut registry = ToolRegistry::new();
+    registry.register(GetWeather);
 
     let config = AgentConfig::new("agent", "You are a helpful assistant", LlmConfig::openrouter("fake-key"));
-    let agent = Agent::new(config, ToolRegistry::new())
-        .with_llm_provider(Arc::new(mock.clone()));
+    let agent = Agent::new(config, registry).with_llm_provider(Arc::new(mock.clone()));
 
-    let conversation = agent.run("what is the answer?").await?;
+    let conversation = agent.run("what's the weather in Tokyo?").await?;
     println!("{}", conversation.last_assistant_content().unwrap_or(""));
     Ok(())
 }
@@ -71,6 +98,7 @@ The full parity surface — every engine in the [polyglot set](https://github.co
 - **Rerank** — rerank retrieved hits before injection (lexical reranker built in).
 - **Sub-agents / delegation** — spawn child agents for sub-tasks.
 - **Cast + clearance** — roles with per-role tool-access policy.
+- **Permissions + deny-policy** — a `PermissionHook` tool-call gate (`AutoMode`: ask / accept-edits / deny-unmatched / bypass) with hard circuit-breakers (`rm -rf /`, credential paths, pipe-to-shell, dangerous domains), a persisted allow-list, and a consumer `DenyPolicy` — declarative TOML rules plus semantic predicates for what strings can't express.
 - **Human-in-the-loop gate** — `ConfirmationHook` requires approval before designated tool calls run.
 - **Conversation thread** — carry a conversation across multiple `run` calls.
 - **`LlmProvider` seam + `MockLlmClient`** — inject any OpenAI-compatible client; the record/replay mock drives the offline tests.
@@ -79,6 +107,42 @@ The full parity surface — every engine in the [polyglot set](https://github.co
 - **Parallel tool calls** — dispatch ≥2 tool calls concurrently (transcript order preserved).
 - **Retry / backoff** — retry transient model-call failures with exponential backoff.
 - **Streaming** — incremental text, tool calls, and tool results as the turn runs.
+
+## Permissions & deny-policy — lines the agent can't cross
+
+This is what makes an agent safe to point at real infrastructure: **you** decide what it can never do, and no prompt or model mistake talks it out of that. Every tool call passes through a gate. `AutoMode` sets the posture — read-only calls **allow**, mutating calls **ask**, dangerous calls **deny** — and hard circuit-breakers (`rm -rf /`, credential paths, pipe-to-shell, dangerous domains) fire in every mode, `Bypass` included. Attach a `DenyPolicy` on top: declarative TOML rules for the lines you can name, semantic predicates for the ones you can't. A match is a hard deny no stored grant and no mode can waive.
+
+```rust
+use std::sync::Arc;
+use smooth_operator_core::{Agent, AutoMode, DenyPolicy, DenyPredicate, DenyReason, ToolCall};
+
+// A predicate for what strings can't express — return Some(reason) to deny.
+struct DenyDbWriter;
+impl DenyPredicate for DenyDbWriter {
+    fn evaluate(&self, call: &ToolCall) -> Option<DenyReason> {
+        if call.name == "db_query" && call.arguments.to_string().contains("writer") {
+            return Some(DenyReason::new("DB writer endpoint is off-limits — reads go to the replica"));
+        }
+        None
+    }
+}
+
+// Declarative rules (TOML): never the prod AWS profile, never a prod host.
+let policy = DenyPolicy::from_toml(r#"
+    schema_version = 1
+    [bash]
+    deny_patterns = ["aws * --profile prod"]
+    [network]
+    deny_hosts = ["*.prod.internal"]
+"#)?.with_predicate(Arc::new(DenyDbWriter));
+
+let agent = Agent::new(config, registry)
+    .with_permission_mode(AutoMode::Ask) // read allow · mutate ask · dangerous deny
+    .with_deny_policy(Arc::new(policy))
+    .with_extension_host(host); // the gate is installed here; set mode/policy first
+```
+
+The gate is installed by `with_extension_host` (the SEP extension host), so call `with_permission_mode` / `with_deny_policy` **before** it.
 
 ## Streaming
 
