@@ -1,6 +1,6 @@
 [package]
 name = "smooai-smooth-operator-core"
-version = "0.16.2"
+version = "1.6.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/SmooAI/smooth-operator-core"
