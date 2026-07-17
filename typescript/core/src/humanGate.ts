@@ -30,6 +30,13 @@ export interface HumanApprovalRequest {
 export interface HumanApprovalResponse {
     decision: HumanDecision;
     reason?: string;
+    /**
+     * "Approve always" — when `true` on an approval routed through a
+     * {@link PermissionHook} with a grant store, a matching grant is persisted so
+     * the next identical `Ask` is silent. Ignored for a denial or when no grant
+     * store is wired. Mirrors the Rust engine's `HumanResponse::ApprovedAlways`.
+     */
+    remember?: boolean;
 }
 
 /** True when the decision is {@link HumanDecision.Approved}. */
@@ -40,6 +47,11 @@ export function isApproved(response: HumanApprovalResponse): boolean {
 /** Build an approval. */
 export function approve(): HumanApprovalResponse {
     return { decision: HumanDecision.Approved };
+}
+
+/** Build an approval that also persists a grant ("approve always") when a grant store is wired. */
+export function approveAlways(): HumanApprovalResponse {
+    return { decision: HumanDecision.Approved, remember: true };
 }
 
 /** Build a denial carrying a reason the model will see. */

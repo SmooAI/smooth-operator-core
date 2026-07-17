@@ -13,6 +13,7 @@ pub mod checkpoint;
 pub mod context;
 pub mod conversation;
 pub mod cost;
+pub mod deny_policy;
 pub mod executor;
 pub mod extension;
 pub mod human;
@@ -37,6 +38,7 @@ pub use cast::{Cast, Clearance, DispatchResult, DispatchSubagentTool, LlmConfigF
 pub use checkpoint::{Checkpoint, CheckpointStore, MemoryCheckpointStore};
 pub use conversation::{CompactionResult, CompactionStrategy, Conversation, Message, Role};
 pub use cost::{BudgetExceeded, CostBudget, CostEntry, CostTracker, ModelPricing};
+pub use deny_policy::{DenyPolicy, DenyPredicate, DenyReason, DenyRules};
 pub use executor::{AgentExecutor, InProcessExecutor};
 pub use extension::{ExtensionHost, ExtensionLlmProvider, ExtensionManifest, ExtensionTool, FoldedHook, HookType, HostDelegate, ProviderRegistration};
 pub use human::{human_channel, ConfirmationHook, HumanChannelPair, HumanRequest, HumanResponse};
