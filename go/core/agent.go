@@ -275,6 +275,11 @@ type AgentOptions struct {
 	// value means no real delay (retries fire immediately) — which is what tests use
 	// so they don't sleep; production should set a small base such as 200ms.
 	RetryBackoff time.Duration
+	// Hooks are ToolHooks run in registration order around every dispatched tool
+	// call: each PreCall runs before the tool (any error blocks it), each PostCall
+	// runs after with a mutable *ToolResult it may redact. Nil (the default) → no
+	// hooks, behaviour unchanged. Mirrors the Rust engine's ToolRegistry hook chain.
+	Hooks []ToolHook
 }
 
 // AgentRunResponse is the result of a turn.
@@ -883,10 +888,27 @@ func (a *SmoothAgent) dispatchTool(ctx context.Context, tc ToolCall, search *Too
 		}
 	}
 
+	// Pre-call hooks run last, right before execution — any error blocks the tool
+	// (the model is told, mirroring the Rust engine's "blocked by hook" result).
+	for _, h := range a.options.Hooks {
+		if err := h.PreCall(ctx, tc); err != nil {
+			return fmt.Sprintf("blocked by hook: %v", err)
+		}
+	}
+
 	out, err := tool.Execute(ctx, args)
+	// Wrap the outcome so PostCall hooks can redact Content in place before it
+	// reaches the model. A tool error becomes an IsError result the hooks still see.
+	result := ToolResult{ToolCallID: tc.ID, Content: out}
 	if err != nil {
 		// Surface tool failures to the model, don't crash the turn.
-		return fmt.Sprintf("error: tool '%s' failed: %v", tc.Name, err)
+		result.Content = fmt.Sprintf("error: tool '%s' failed: %v", tc.Name, err)
+		result.IsError = true
 	}
-	return out
+	// Post-call hooks may redact result.Content in place. A hook error is ignored —
+	// the (possibly redacted) result still reaches the model (Rust parity).
+	for _, h := range a.options.Hooks {
+		_ = h.PostCall(ctx, tc, &result)
+	}
+	return result.Content
 }
