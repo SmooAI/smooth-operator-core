@@ -368,6 +368,19 @@ struct ChatRequest {
     /// support it (and the no-structured-output path) see no change.
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<OpenAiResponseFormat>,
+    /// Arbitrary passthrough metadata forwarded verbatim as a top-level
+    /// `metadata` object. Consumers set it via
+    /// [`LlmClient::with_metadata`] to tag the request for downstream
+    /// systems — e.g. the LiteLLM gateway records `metadata` on its
+    /// `LiteLLM_SpendLogs` rows, letting a host attribute per-agent spend.
+    /// Kept generic (no host-specific keys): LiteLLM ignores unknown
+    /// top-level `metadata`, so `None` is byte-identical on the wire and
+    /// `Some` is a safe additive. Core sets no keys of its own here.
+    /// Typed as a JSON object (not a bare `Value`) so it always merges as
+    /// top-level `metadata`; empty is normalized to `None` at the builder,
+    /// so an empty map is byte-identical too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -826,6 +839,12 @@ pub struct LlmClient {
     /// Populate from the gateway via [`fetch_litellm_model_ceiling`] +
     /// [`LlmClient::with_model_ceiling`]. (EPIC th-1cc9fa.)
     model_max_output: Option<u32>,
+    /// Passthrough metadata attached to every outbound `/chat/completions`
+    /// request (streaming and non-streaming) as a top-level `metadata`
+    /// object. `None` = no `metadata` field on the wire. Set builder-style
+    /// with [`LlmClient::with_metadata`]; a host clones a per-agent client
+    /// to carry per-agent tags (e.g. spend attribution).
+    request_metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl LlmClient {
@@ -851,6 +870,7 @@ impl LlmClient {
             config,
             client,
             model_max_output: None,
+            request_metadata: None,
         }
     }
 
@@ -861,6 +881,27 @@ impl LlmClient {
     #[must_use]
     pub fn with_model_ceiling(mut self, ceiling: Option<u32>) -> Self {
         self.model_max_output = ceiling.filter(|&c| c > 0);
+        self
+    }
+
+    /// Attach passthrough `metadata` to every outbound `/chat/completions`
+    /// request (streaming and non-streaming). Pass `None` (the default) to
+    /// send no `metadata` field — byte-identical to before. Builder-style so
+    /// a host can cheaply clone a shared client per agent/turn and stamp a
+    /// per-agent tag:
+    ///
+    /// ```ignore
+    /// let mut tag = serde_json::Map::new();
+    /// tag.insert("smooai_agent_slug".into(), "observability-analyst".into());
+    /// let tagged = base_client.clone().with_metadata(Some(tag));
+    /// ```
+    ///
+    /// The map is forwarded verbatim as top-level `metadata`. An empty map is
+    /// normalized to `None` (byte-identical wire). Kept fully generic — core
+    /// attaches no keys of its own, so a host's keys are never clobbered.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: Option<serde_json::Map<String, serde_json::Value>>) -> Self {
+        self.request_metadata = metadata.filter(|m| !m.is_empty());
         self
     }
 
@@ -902,19 +943,14 @@ impl LlmClient {
         self.chat_with_format(messages, &[], Some(format)).await
     }
 
-    /// Core chat implementation shared by [`Self::chat`] and
-    /// [`Self::chat_structured`]. When `format` is `Some`, the request is
-    /// constrained to the given JSON Schema (see [`ResponseFormat`]).
-    ///
-    /// # Errors
-    /// Returns error if the API call fails after all retries or returns an
-    /// invalid response.
-    pub async fn chat_with_format(&self, messages: &[&Message], tools: &[ToolSchema], format: Option<&ResponseFormat>) -> anyhow::Result<LlmResponse> {
-        match self.config.api_format {
-            ApiFormat::Anthropic => return self.chat_anthropic(messages, tools, format).await,
-            ApiFormat::OpenAiCompat => {}
-        }
-
+    /// Build the OpenAI-compatible `/chat/completions` request body shared by
+    /// the streaming and non-streaming paths. Centralizing it guarantees both
+    /// carry the same fields — notably
+    /// [`request_metadata`](Self::request_metadata), so a per-agent tag can't be
+    /// attached to one path and silently dropped on the other. `format` is the
+    /// structured-output constraint (always `None` on the streaming path, which
+    /// doesn't yet support it).
+    fn build_openai_request(&self, messages: &[&Message], tools: &[ToolSchema], format: Option<&ResponseFormat>) -> ChatRequest {
         let mut chat_messages: Vec<ChatMessage> = messages.iter().map(|m| to_chat_message(m)).collect();
 
         let mut chat_tools: Vec<ChatTool> = tools
@@ -935,7 +971,7 @@ impl LlmClient {
         }
 
         let tool_choice = if chat_tools.is_empty() { None } else { Some("auto".to_string()) };
-        let request = ChatRequest {
+        ChatRequest {
             model: self.config.model.clone(),
             messages: chat_messages,
             max_tokens: self.effective_max_tokens(),
@@ -943,7 +979,24 @@ impl LlmClient {
             tools: chat_tools,
             tool_choice,
             response_format: format.map(ResponseFormat::to_openai),
-        };
+            metadata: self.request_metadata.clone(),
+        }
+    }
+
+    /// Core chat implementation shared by [`Self::chat`] and
+    /// [`Self::chat_structured`]. When `format` is `Some`, the request is
+    /// constrained to the given JSON Schema (see [`ResponseFormat`]).
+    ///
+    /// # Errors
+    /// Returns error if the API call fails after all retries or returns an
+    /// invalid response.
+    pub async fn chat_with_format(&self, messages: &[&Message], tools: &[ToolSchema], format: Option<&ResponseFormat>) -> anyhow::Result<LlmResponse> {
+        match self.config.api_format {
+            ApiFormat::Anthropic => return self.chat_anthropic(messages, tools, format).await,
+            ApiFormat::OpenAiCompat => {}
+        }
+
+        let request = self.build_openai_request(messages, tools, format);
 
         let url = format!("{}/chat/completions", self.config.api_url);
         let policy = &self.config.retry_policy;
@@ -1065,53 +1118,25 @@ impl LlmClient {
             return self.chat_anthropic_stream(messages, tools).await;
         }
 
-        let mut chat_messages: Vec<ChatMessage> = messages.iter().map(|m| to_chat_message(m)).collect();
+        // Streaming structured output is not yet wired — callers needing a
+        // schema-constrained response use the non-streaming `chat_structured`
+        // path (SMOODEV-1472 follow-up), so `format` is always `None` here.
+        let request = self.build_openai_request(messages, tools, None);
 
-        let mut chat_tools: Vec<ChatTool> = tools
-            .iter()
-            .map(|t| ChatTool {
-                r#type: "function".into(),
-                function: ChatFunction {
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    parameters: t.parameters.clone(),
-                },
-                cache_control: None,
-            })
-            .collect();
-
-        if supports_anthropic_cache_control(&self.config.model, &self.config.api_url) {
-            apply_cache_control(&mut chat_messages, &mut chat_tools);
-        }
-
-        let tool_count = chat_tools.len();
-        let msg_count = chat_messages.len();
+        let tool_count = request.tools.len();
+        let msg_count = request.messages.len();
         tracing::debug!(model = %self.config.model, tool_count, msg_count, "chat_stream: sending request");
         // Bench-debug instrumentation (pearl th-67e338): print the
         // tool count to stderr so a bench operator can confirm tools
         // are actually being attached to the request. Gated behind
         // SMOOTH_BENCH_TRACE_TOOLS so production runs aren't noisy.
         if std::env::var("SMOOTH_BENCH_TRACE_TOOLS").is_ok() {
-            let first_tool = chat_tools.first().map(|t| t.function.name.as_str()).unwrap_or("<none>");
+            let first_tool = request.tools.first().map(|t| t.function.name.as_str()).unwrap_or("<none>");
             eprintln!(
                 "[SMOOTH_BENCH_TRACE] chat_stream: model={} tools={} first_tool={} msgs={}",
                 self.config.model, tool_count, first_tool, msg_count,
             );
         }
-
-        let tool_choice = if chat_tools.is_empty() { None } else { Some("auto".to_string()) };
-        let request = ChatRequest {
-            model: self.config.model.clone(),
-            messages: chat_messages,
-            max_tokens: self.effective_max_tokens(),
-            temperature: self.config.temperature,
-            tools: chat_tools,
-            tool_choice,
-            // Streaming structured output is not yet wired — callers needing a
-            // schema-constrained response use the non-streaming
-            // `chat_structured` path. SMOODEV-1472 follow-up.
-            response_format: None,
-        };
 
         let url = format!("{}/chat/completions", self.config.api_url);
 
@@ -2738,6 +2763,74 @@ mod tests {
     }
 
     #[test]
+    fn request_omits_metadata_by_default() {
+        // Default client: the outbound /chat/completions body carries NO
+        // `metadata` key — byte-identical to before this field existed. The
+        // shared builder feeds both the streaming and non-streaming paths, so
+        // this covers both.
+        let client = LlmClient::new(LlmConfig::openrouter("key"));
+        let msgs = [Message::user("hi")];
+        let refs: Vec<&Message> = msgs.iter().collect();
+
+        let req = client.build_openai_request(&refs, &[], None);
+        assert!(req.metadata.is_none());
+
+        let v = serde_json::to_value(&req).expect("serialize");
+        assert!(v.get("metadata").is_none(), "None metadata must be omitted on the wire: {v}");
+    }
+
+    /// Turn a JSON object literal into the `Map` shape `with_metadata` takes.
+    fn obj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().expect("test metadata must be a JSON object").clone()
+    }
+
+    #[test]
+    fn with_metadata_is_forwarded_verbatim() {
+        // A host stamps a per-agent tag; core forwards it as top-level
+        // `metadata` (the LiteLLM spend-attribution key is the first consumer).
+        let tag = serde_json::json!({ "smooai_agent_slug": "observability-analyst" });
+        let client = LlmClient::new(LlmConfig::openrouter("key")).with_metadata(Some(obj(tag.clone())));
+        let msgs = [Message::user("hi")];
+        let refs: Vec<&Message> = msgs.iter().collect();
+
+        let v = serde_json::to_value(client.build_openai_request(&refs, &[], None)).expect("serialize");
+        assert_eq!(v["metadata"], tag, "metadata must be forwarded verbatim: {v}");
+    }
+
+    #[test]
+    fn empty_metadata_is_wire_identical() {
+        // An empty map normalizes to None — no `metadata` key on the wire,
+        // identical to passing None.
+        let client = LlmClient::new(LlmConfig::openrouter("key")).with_metadata(Some(serde_json::Map::new()));
+        assert!(client.request_metadata.is_none());
+        let v = serde_json::to_value(client.build_openai_request(&[], &[], None)).expect("serialize");
+        assert!(v.get("metadata").is_none(), "empty metadata must be omitted: {v}");
+    }
+
+    #[test]
+    fn metadata_is_purely_additive() {
+        // Attaching metadata must not disturb any other request field: the
+        // tagged body equals the untagged body plus exactly the `metadata`
+        // key. Core sets no metadata keys of its own, so a host's keys are
+        // never clobbered — this guards that invariant if that ever changes.
+        let config = LlmConfig::openrouter("key");
+        let msgs = [Message::user("hi")];
+        let refs: Vec<&Message> = msgs.iter().collect();
+
+        let untagged = serde_json::to_value(LlmClient::new(config.clone()).build_openai_request(&refs, &[], None)).unwrap();
+        let mut tagged = serde_json::to_value(
+            LlmClient::new(config)
+                .with_metadata(Some(obj(serde_json::json!({ "k": "v" }))))
+                .build_openai_request(&refs, &[], None),
+        )
+        .unwrap();
+
+        assert_eq!(tagged["metadata"], serde_json::json!({ "k": "v" }));
+        tagged.as_object_mut().unwrap().remove("metadata");
+        assert_eq!(tagged, untagged, "metadata must be purely additive");
+    }
+
+    #[test]
     fn to_chat_message_user() {
         let msg = Message::user("Hello");
         let chat = to_chat_message(&msg);
@@ -2916,6 +3009,7 @@ mod tests {
             tools: vec![],
             tool_choice: None,
             response_format: None,
+            metadata: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(json.contains("test-model"));
@@ -3978,6 +4072,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             tools: chat_tools,
             tool_choice: None,
             response_format: None,
+            metadata: None,
         }
     }
 
@@ -4072,6 +4167,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             tools: chat_tools,
             tool_choice: None,
             response_format: None,
+            metadata: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(
@@ -4149,6 +4245,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             tools: vec![],
             tool_choice: None,
             response_format: Some(format.to_openai()),
+            metadata: None,
         };
         let json: serde_json::Value = serde_json::to_value(&req).expect("serialize");
         assert_eq!(json["response_format"]["type"], "json_schema");
@@ -4168,6 +4265,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             tools: vec![],
             tool_choice: None,
             response_format: None,
+            metadata: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(!json.contains("response_format"), "absent format must not serialize: {json}");
