@@ -15,7 +15,7 @@
   <!-- NuGet package metadata -->
   <PropertyGroup>
     <PackageId>SmooAI.SmoothOperator.Core</PackageId>
-    <Version>1.7.0</Version>
+    <Version>1.7.1</Version>
     <Authors>SmooAI</Authors>
     <Company>SmooAI</Company>
     <Description>Native C# implementation of the smooth-operator agent engine — the in-process, Microsoft.Extensions.AI-based sibling of the Rust smooai-smooth-operator-core. Drive an agentic tool-calling loop over any IChatClient; author tools from ordinary C# methods with AIFunctionFactory. Learns from Microsoft Agent Framework idioms.</Description>
