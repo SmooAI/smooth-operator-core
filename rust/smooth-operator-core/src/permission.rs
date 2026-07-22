@@ -229,7 +229,7 @@ const SENSITIVE_VAR_FRAGMENTS: &[&str] = &[
 ];
 
 /// Match a domain against a suffix list (exact or subdomain), case-insensitive.
-fn domain_matches_suffix_list(domain: &str, suffixes: &[&str]) -> bool {
+pub(crate) fn domain_matches_suffix_list(domain: &str, suffixes: &[&str]) -> bool {
     let d = domain.to_ascii_lowercase();
     suffixes.iter().any(|suffix| {
         let s = suffix.to_ascii_lowercase();
@@ -242,7 +242,7 @@ fn domain_matches_suffix_list(domain: &str, suffixes: &[&str]) -> bool {
 /// process substitution (`$(…)`, `` `…` ``, `<(…)`) is surfaced as its own
 /// segment so it can't ride in on a safe outer command. Every resulting
 /// segment must clear policy on its own.
-fn split_compound(command: &str) -> Vec<String> {
+pub(crate) fn split_compound(command: &str) -> Vec<String> {
     // ponytail: substring split, not a real shell lexer — upgrade only if
     // quoting edge-cases (`echo "a && b"`) start mattering for policy.
     let mut normalized = command.replace("&&", "\u{1}").replace("||", "\u{1}");
@@ -278,7 +278,7 @@ fn command_bin(subcommand: &str) -> Option<String> {
 }
 
 /// Pull a bare hostname out of a URL-ish or `host:port` token.
-fn host_from_token(tok: &str) -> Option<String> {
+pub(crate) fn host_from_token(tok: &str) -> Option<String> {
     let after_scheme = tok.split_once("://").map_or(tok, |(_, rest)| rest);
     let after_userinfo = after_scheme.rsplit_once('@').map_or(after_scheme, |(_, rest)| rest);
     let host = after_userinfo.split(['/', ':', '?', '#']).next().unwrap_or("").trim();
@@ -294,7 +294,7 @@ fn host_from_token(tok: &str) -> Option<String> {
 
 /// Extract candidate hostnames from a single (already split) net-tool
 /// subcommand. Empty if the binary isn't a net tool.
-fn extract_hosts(subcommand: &str) -> Vec<String> {
+pub(crate) fn extract_hosts(subcommand: &str) -> Vec<String> {
     let tokens: Vec<&str> = subcommand.split_whitespace().collect();
     let start = strip_wrappers(&tokens);
     let Some(&bin) = tokens.get(start) else { return Vec::new() };
@@ -344,6 +344,22 @@ fn sink_bin(segment: &str) -> Option<String> {
         }
     }
     tokens.get(i).map(|s| (*s).to_string())
+}
+
+/// Strip leading transparent wrappers (`timeout 5`, `nice`, `env`, …) and any
+/// leading `sudo` from a single subcommand, returning the remaining command
+/// text. Used by the [deny policy](crate::deny_policy) so a rule anchored on
+/// the real binary (`aws …`) still matches `sudo aws …` / `timeout 5 aws …`.
+pub(crate) fn strip_wrappers_and_sudo(subcommand: &str) -> String {
+    let tokens: Vec<&str> = subcommand.split_whitespace().collect();
+    let mut i = strip_wrappers(&tokens);
+    while i < tokens.len() && tokens[i] == "sudo" {
+        i += 1;
+        while i < tokens.len() && tokens[i].starts_with('-') {
+            i += 1;
+        }
+    }
+    tokens[i..].join(" ")
 }
 
 /// Does the command reference a sensitive credential path?
@@ -535,7 +551,7 @@ fn decide_bash(command: &str) -> Verdict {
 /// Category a tool falls into, derived from its name. Drives the default
 /// posture for non-bash tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Category {
+pub(crate) enum Category {
     Bash,
     Network,
     Write,
@@ -543,7 +559,7 @@ enum Category {
     Unknown,
 }
 
-fn tool_category(name: &str) -> Category {
+pub(crate) fn tool_category(name: &str) -> Category {
     // Extension tools are dotted `<ext>.<tool>`; classify on the bare tool name.
     let bare = name.rsplit('.').next().unwrap_or(name);
     let n = bare.to_ascii_lowercase();
@@ -771,6 +787,11 @@ pub struct PermissionHook {
     /// Where an `ApprovedAlways` grant is written (the user-scope file). `None`
     /// means approve-always degrades to approve-once (no place to persist).
     persist_path: Option<PathBuf>,
+    /// Consumer-supplied deny policy (pearl th-deny-policy). Evaluated FIRST in
+    /// [`pre_call`](Self::pre_call), so a policy deny is a circuit-breaker: it
+    /// wins over grants, `Ask`, `Allow`, and every [`AutoMode`] (including
+    /// `Bypass`). `None` (the default) = today's behavior exactly.
+    deny_policy: Option<Arc<crate::deny_policy::DenyPolicy>>,
 }
 
 impl std::fmt::Debug for PermissionHook {
@@ -779,6 +800,7 @@ impl std::fmt::Debug for PermissionHook {
             .field("mode", &self.mode)
             .field("interactive", &self.approver.is_some())
             .field("grants", &self.grants.is_some())
+            .field("deny_policy", &self.deny_policy.is_some())
             .finish()
     }
 }
@@ -793,6 +815,7 @@ impl PermissionHook {
             approver: None,
             grants: None,
             persist_path: None,
+            deny_policy: None,
         }
     }
 
@@ -823,6 +846,19 @@ impl PermissionHook {
     pub fn with_grants(mut self, grants: SharedGrants, persist_path: PathBuf) -> Self {
         self.grants = Some(grants);
         self.persist_path = Some(persist_path);
+        self
+    }
+
+    /// Attach a consumer-supplied [`DenyPolicy`](crate::deny_policy::DenyPolicy)
+    /// (pearl th-deny-policy). Purely additive: with no policy attached (the
+    /// default) enforcement is byte-identical to before. When set, the policy is
+    /// evaluated **first** in [`pre_call`](Self::pre_call) — a policy match is a
+    /// hard deny (circuit-breaker tier) that no stored grant can waive and that
+    /// [`AutoMode::Bypass`] / [`AutoMode::AcceptEdits`] cannot downgrade, exactly
+    /// like the built-in circuit-breakers.
+    #[must_use]
+    pub fn with_deny_policy(mut self, policy: Arc<crate::deny_policy::DenyPolicy>) -> Self {
+        self.deny_policy = Some(policy);
         self
     }
 
@@ -863,6 +899,14 @@ impl Default for PermissionHook {
 #[async_trait]
 impl ToolHook for PermissionHook {
     async fn pre_call(&self, call: &ToolCall) -> anyhow::Result<()> {
+        // Deny policy runs FIRST — a consumer-supplied deny is a circuit-breaker
+        // that wins over grants, ask, allow, and every mode (Bypass included).
+        // It is never routed to a human and never grantable.
+        if let Some(policy) = &self.deny_policy {
+            if let Some(reason) = policy.evaluate(call) {
+                anyhow::bail!("permission denied: {reason}");
+            }
+        }
         match decide(self.mode, &call.name, &call.arguments) {
             Verdict::Allow => Ok(()),
             // Deny is a circuit-breaker — never routed to a human, never grantable.
@@ -1475,5 +1519,92 @@ mod tests {
         let path = tmp.path().join("wonk-allow.toml");
         append_grant(&path, GrantQuery::Tool("web_search".into())).unwrap();
         assert!(PermissionGrants::load_from_path(&path).unwrap().matches_tool("web_search"));
+    }
+
+    // ── consumer deny policy (pearl th-deny-policy) ─────────────────
+    //
+    // The deny policy's own matching is exhaustively covered in
+    // `deny_policy::tests`; these prove the HOOK wiring — precedence over
+    // grants / modes, the circuit-breaker tier, and the additive no-op.
+
+    use crate::deny_policy::{DenyPolicy, DenyPredicate, DenyReason};
+
+    /// Additive no-op: an attached but empty policy leaves a call that is Allow
+    /// today still Allow, and an Ask still fails-closed exactly as before.
+    #[tokio::test]
+    async fn empty_deny_policy_is_additive_noop() {
+        let empty = Arc::new(DenyPolicy::new());
+        let hook = PermissionHook::new(AutoMode::Ask).with_deny_policy(empty);
+        // Allow-today stays Allow.
+        assert!(hook.pre_call(&call("bash", bash("ls -la"))).await.is_ok());
+        // Ask-today still fails closed (no approver) — unchanged.
+        assert!(hook.pre_call(&call("bash", bash("npm install x"))).await.is_err());
+        // Circuit-breaker still denies.
+        assert!(hook.pre_call(&call("bash", bash("rm -rf /"))).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn deny_policy_blocks_matching_call() {
+        let policy = Arc::new(DenyPolicy::from_toml("[bash]\ndeny_patterns = [\"terraform apply\"]").unwrap());
+        // Bypass — an ordinary Ask would pass, but the policy deny wins.
+        let hook = PermissionHook::new(AutoMode::Bypass).with_deny_policy(policy);
+        let err = hook
+            .pre_call(&call("bash", bash("terraform apply -auto-approve")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("permission denied"), "got: {err}");
+        assert!(err.contains("denied by policy"), "reason should name the policy: {err}");
+        // A non-matching command still passes under Bypass.
+        assert!(hook.pre_call(&call("bash", bash("terraform plan"))).await.is_ok());
+    }
+
+    /// A stored grant can never waive a deny-policy match — same invariant as
+    /// `stored_grant_cannot_waive_a_deny` for the built-in breakers.
+    #[tokio::test]
+    async fn deny_policy_beats_a_stored_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Grant the `terraform ` prefix outright…
+        let mut grants = PermissionGrants::new();
+        grants.add(GrantQuery::Bash("terraform ".into()));
+        // …but the policy denies `terraform apply`.
+        let policy = Arc::new(DenyPolicy::from_toml("[bash]\ndeny_patterns = [\"terraform apply\"]").unwrap());
+        let hook = PermissionHook::new(AutoMode::Ask)
+            .with_grants(SharedGrants::new(grants), tmp.path().join("w.toml"))
+            .with_deny_policy(policy);
+        assert!(
+            hook.pre_call(&call("bash", bash("terraform apply"))).await.is_err(),
+            "a grant must not waive a deny-policy match"
+        );
+    }
+
+    struct WriterEndpointPredicate;
+    impl DenyPredicate for WriterEndpointPredicate {
+        fn evaluate(&self, call: &ToolCall) -> Option<DenyReason> {
+            let cmd = call.arguments.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+            cmd.contains("writer.db")
+                .then(|| DenyReason::new("db writer endpoint is off-limits; use the read replica"))
+        }
+    }
+
+    /// A predicate deny is circuit-breaker tier too: it beats a grant and
+    /// survives Bypass.
+    #[tokio::test]
+    async fn deny_policy_predicate_beats_grant_and_survives_bypass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut grants = PermissionGrants::new();
+        grants.add(GrantQuery::Bash("psql ".into()));
+        let policy = Arc::new(DenyPolicy::new().with_predicate(Arc::new(WriterEndpointPredicate)));
+        let hook = PermissionHook::new(AutoMode::Bypass)
+            .with_grants(SharedGrants::new(grants), tmp.path().join("w.toml"))
+            .with_deny_policy(policy);
+        let err = hook
+            .pre_call(&call("bash", bash("psql -h writer.db.internal -c 'select 1'")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("read replica"), "predicate reason should surface: {err}");
+        // A read-replica connection falls through and (under Bypass) passes.
+        assert!(hook.pre_call(&call("bash", bash("psql -h replica.db.internal -c 'select 1'"))).await.is_ok());
     }
 }

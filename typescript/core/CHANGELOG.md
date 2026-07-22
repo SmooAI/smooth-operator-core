@@ -1,5 +1,123 @@
 # @smooai/smooth-operator-core
 
+## 1.7.0
+
+### Minor Changes
+
+- fe882c3: First lockstep polyglot release. Changesets now drives publishing for every
+  language artifact (npm + crates.io + NuGet + PyPI + Go tag) at a single shared
+  version via `scripts/ci-publish.mjs`, with `scripts/sync-versions.mjs`
+  propagating the Changeset version to all manifests. This aligns the previously
+  divergent per-language versions (npm 0.22, Rust 0.16, .NET 1.6, Python 1.3) onto
+  one lockstep line at 1.7.0 — no registry downgrades.
+
+### Patch Changes
+
+- fe882c3: Release infra: Changesets now drives lockstep publishing of every polyglot artifact (npm + crates.io + NuGet + PyPI + Go tag) from a single canonical version. Adds `scripts/sync-versions.mjs` (propagates the npm version to Rust/.NET/Python/Go manifests) and `scripts/ci-publish.mjs` (idempotent, skip-if-already-published, DRY_RUN) wired into `release.yml`. The per-language `publish-*.yml` workflows remain as manual fallbacks.
+- fe882c3: docs: rewrite the root + per-language package READMEs as registry landing pages that tell a story
+
+  Every README (root and the Rust / TypeScript / Python / Go / .NET package pages)
+  now opens with a hook and a narrative arc — problem → one engine in five
+  languages → observe→think→act → the permission gate + deny-policy that makes an
+  agent safe to point at production → build → get started. Each package page leads
+  with a tight agent-plus-tool quickstart in its own idiom (the mock scripted to
+  call the tool, then answer) and a permissions/deny-policy example using that
+  language's real API (`with_deny_policy` in Rust, `denyPolicy`/`permissionMode`
+  options in TS/Py, `WithDenyPolicy` in Go/C#).
+
+  Adds the headline permission system + deny-policy (AutoMode ask / accept-edits /
+  deny-unmatched / bypass, circuit-breakers, declarative TOML rules + semantic
+  predicates) to the feature surface, refreshes the polyglot table
+  (language → package → registry), and fixes stale test-count claims. Docs only —
+  no code changes.
+
+## 0.23.0
+
+### Minor Changes
+
+- f4ba064: feat(python): permission engine + consumer deny policy (parity with the Rust reference)
+
+  Python port of the Rust engine's tool-call permission system and the new deny
+  policy (pearl th-ab0437; mirrors `permission.rs`, `permission_grants.rs`,
+  `deny_policy.rs`). Three new modules, all built on the existing `ToolHook` seam:
+
+  - **`permission`** — `AutoMode` (Ask / AcceptEdits / DenyUnmatched / Bypass, with
+    `SMOOTH_AUTO_MODE` parsing), the `Verdict` union (Allow / Deny / Ask), and the
+    pure `decide(mode, tool_name, args)` classifier faithfully reproducing every
+    circuit-breaker: dangerous-CLI substrings, structural `curl … | sh` (across the
+    pipe, sudo/wrapper-aware), credential/dotenv paths, process-env dumps
+    (`env`/`printenv`/`$SECRET` expansions, command-substitution-proof), dangerous
+    domains, `split_compound` / `strip_wrappers_and_sudo`, and the safe read-only
+    bash/git allow-set. `PermissionHook` (a `ToolHook`) enforces it: `pre_call`
+    raises on Deny; an Ask consults stored grants then routes to a `HumanGate`
+    approver (fail-closed on timeout / no approver).
+  - **`permission_grants`** — the `wonk-allow.toml` allow-list (`PermissionGrants`,
+    `NetworkGrant`/`ToolGrant`/`BashGrant`, `SharedGrants`, atomic
+    `append_grant`, layered user+project load). A grant can only upgrade an Ask,
+    never waive a Deny.
+  - **`deny_policy`** — `DenyPolicy` = declarative `DenyRules` (TOML: `[tools]` /
+    `[bash]` / `[network]` / `[paths]` deny lists, same section style as grants) +
+    a `DenyPredicate` ABC for semantic checks. Evaluated **first** in `pre_call`, so
+    a policy match is a circuit-breaker no grant waives and no mode downgrades.
+
+  Wired into `AgentOptions` via `permission_mode` + `deny_policy` — when either is
+  set a `PermissionHook` is prepended so it gates every call first (a `deny_policy`
+  alone activates a Bypass-mode gate: built-in breakers + policy only). Purely
+  additive: with neither set, enforcement is byte-identical to before.
+  `HumanDecision` gains `APPROVED_ALWAYS` (persist a grant). Adversarial tests
+  ported from the Rust suites (sudo/compound/wrapper bash, network suffix+glob,
+  path R/W, predicate some/none, deny-beats-grant, survives-Bypass, TOML
+  round-trip).
+
+## 0.22.0
+
+### Minor Changes
+
+- d85a958: Port the permission system + deny-policy to the TypeScript engine, to parity with the Rust reference (pearl th-ab0437).
+
+  Adds a native tool-call permission gate mirroring `rust/smooth-operator-core`:
+
+  - **`AutoMode`** (`Ask` / `AcceptEdits` / `DenyUnmatched` / `Bypass`, plus `autoModeFromEnv`/`autoModeFromValue` reading `SMOOTH_AUTO_MODE`) and **`Verdict`** (an `allow`/`deny`/`ask` discriminated union).
+  - **`decide(mode, toolName, args)`** — the pure, deterministic classifier with all circuit-breakers faithfully reproduced (dangerous-CLI substrings, `curl | sh` pipe-to-shell, credential/dotenv path guard, env-dump guard, dangerous domains, compound-command splitting, `sudo`/wrapper stripping, safe read-only bash allow-list). Denies survive every mode, including `Bypass`.
+  - **`PermissionGrants`** — the allow-only grant store (`network`/`tools`/`bash` sections, TOML round-trip) that can upgrade an `Ask`, never waive a `Deny`.
+  - **`DenyPolicy`** — consumer-supplied declarative deny rules (`[tools]`/`[bash]`/`[network]`/`[paths]`, TOML) plus a `DenyPredicate` callback for semantic checks. Evaluated FIRST as a circuit-breaker tier: no grant waives it and no mode downgrades it.
+  - **`PermissionHook`** (implements the new `ToolHook` interface) wiring it together, with `Ask` routed to the existing `HumanGate` (new `approveAlways()` / `remember` for persistent grants) and failing closed when no approver is wired.
+
+  Wired into `SmoothAgent` via new options `permissionMode`, `denyPolicy`, and `permissionGrants`. Purely additive: with none set the gate is off and behaviour is unchanged.
+
+## 0.21.0
+
+### Minor Changes
+
+- 2051413: feat(rust): consumer-supplied deny policy for the permission engine (reference impl)
+
+  Adds a new `deny_policy` module to the Rust engine — a consumer-declarable deny
+  tier that the hardcoded circuit-breakers and allow-only grants could not express
+  ("never the prod AWS profile", "deny the DB writer endpoint, reads go to the
+  replica", "no writes under `/prod`").
+
+  Two tiers, both circuit-breaker strength:
+
+  - **Declarative** `DenyRules` (serde/TOML, mirroring `permission_grants`'
+    section style): `[tools] deny` (name globs), `[bash] deny_patterns` (compound-
+    and sudo/wrapper-aware command prefixes/globs), `[network] deny_hosts` (suffix
+    - `*.`/mid-string globs, reusing `domain_matches_suffix_list`), `[paths] deny`
+      (path globs for Write/Read tools).
+  - **Predicate** `DenyPredicate` trait — boxed consumer checks for semantic cases
+    the engine can't parse from strings (is this the prod account? the writer
+    endpoint?).
+
+  Assembled into `DenyPolicy { declarative, predicates }` (`from_toml` + a builder
+  for predicates). Wired via `PermissionHook::with_deny_policy(...)` and
+  `Agent::with_deny_policy(...)`; evaluated **first** in `pre_call`, so a policy
+  match is a terminal deny that no stored grant can waive and that
+  `Bypass`/`AcceptEdits` cannot downgrade — the same tier as the built-in
+  breakers.
+
+  Purely additive: with no policy set, enforcement is byte-identical to before
+  (proven by test). This is the reference implementation the C#/TS/Python/Go ports
+  will mirror.
+
 ## 0.20.4
 
 ### Patch Changes

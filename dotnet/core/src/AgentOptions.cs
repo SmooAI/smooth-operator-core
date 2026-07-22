@@ -71,6 +71,15 @@ public sealed class AgentOptions
     public bool ParallelToolCalls { get; set; }
 
     /// <summary>
+    /// Tool-call hooks — the in-process surveillance / redaction seam. Every hook's
+    /// <see cref="IToolHook.PreCallAsync"/> runs before a tool executes (a throw blocks the call) and
+    /// its <see cref="IToolHook.PostCallAsync"/> runs after with the mutable result (a hook can
+    /// redact it in place). Hooks fire in registration order. Mirrors the Rust reference's
+    /// <c>ToolRegistry</c> hook chain (<c>add_hook</c>). Default: none.
+    /// </summary>
+    public IList<IToolHook> ToolHooks { get; } = new List<IToolHook>();
+
+    /// <summary>
     /// Tools whose schemas are hidden from the model until promoted. When non-empty, the agent
     /// advertises a single <c>tool_search(query)</c> meta-tool; the model calls it to discover and
     /// promote the deferred tools it needs, keeping the visible tool set (and its token cost) small.
@@ -133,6 +142,53 @@ public sealed class AgentOptions
     /// Only consulted when <see cref="HumanGate"/> is set.
     /// </summary>
     public Func<FunctionCallContent, bool>? RequiresApproval { get; set; }
+
+    /// <summary>
+    /// Auto-mode permission gate. When set (or when <see cref="DenyPolicy"/> is), the agent runs the
+    /// ported <see cref="PermissionEngine"/> classifier on <b>every</b> tool call before it executes:
+    /// read-only allow, mutating ask, dangerous deny — with the hard circuit-breakers (<c>rm -rf /</c>,
+    /// <c>curl | sh</c>, credential paths, env dumps, dangerous domains) always denying. An Ask routes
+    /// to <see cref="HumanGate"/> (failing closed if none is set). <c>null</c> (the default) disables
+    /// the gate entirely — today's behaviour, unchanged. Mirrors the Rust engine's <c>AutoMode</c>.
+    /// </summary>
+    public AutoMode? PermissionMode { get; set; }
+
+    /// <summary>
+    /// Consumer-supplied deny policy — declarative "never do this" rules (no prod AWS, DB writer off-
+    /// limits, no writes under <c>/prod</c>) plus semantic <see cref="IDenyPredicate"/> checks. Purely
+    /// additive: <c>null</c> (the default) denies nothing. When set it is evaluated <b>first</b> on
+    /// every tool call and a match is a hard deny of the same tier as the built-in circuit-breakers —
+    /// no grant waives it, and <see cref="AutoMode.Bypass"/> cannot downgrade it. Setting a deny policy
+    /// enables the gate even when <see cref="PermissionMode"/> is left <c>null</c> (defaulting to
+    /// <see cref="AutoMode.Ask"/>). Mirrors the Rust engine's <c>DenyPolicy</c>.
+    /// </summary>
+    public DenyPolicy? DenyPolicy { get; set; }
+
+    /// <summary>
+    /// Optional persisted allow-list consulted by the permission gate before prompting: a stored grant
+    /// auto-approves a matching Ask silently. Load it with <see cref="SmooAI.SmoothOperator.Core.PermissionGrants.LoadLayered"/>.
+    /// </summary>
+    public SharedGrants? PermissionGrants { get; set; }
+
+    /// <summary>
+    /// Where an "approve always" answer persists a new grant (the user-scope
+    /// <c>~/.smooth/wonk-allow.toml</c>). <c>null</c> ⇒ approve-always degrades to approve-once.
+    /// </summary>
+    public string? PermissionGrantsPersistPath { get; set; }
+
+    /// <summary>Fluent: set the auto-mode permission gate. Returns <c>this</c> for chaining.</summary>
+    public AgentOptions WithPermissionMode(AutoMode mode)
+    {
+        PermissionMode = mode;
+        return this;
+    }
+
+    /// <summary>Fluent: attach a consumer deny policy. Returns <c>this</c> for chaining.</summary>
+    public AgentOptions WithDenyPolicy(DenyPolicy policy)
+    {
+        DenyPolicy = policy;
+        return this;
+    }
 
     /// <summary>
     /// Optional spend ceiling. When set, the run halts (gracefully, returning what it has) as soon

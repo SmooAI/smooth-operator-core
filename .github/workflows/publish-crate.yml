@@ -1,7 +1,9 @@
 # Publish `smooai-smooth-operator-core` to crates.io.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# THIS WORKFLOW IS THE ONLY PLACE THIS CRATE IS PUBLISHED.
+# MANUAL FALLBACK. The Changesets release (release.yml → `pnpm ci:publish`) now
+# drives the normal, lockstep publish of this crate. Keep this workflow for
+# out-of-band / recovery publishes; both paths are idempotent (skip-if-exists).
 #
 #   • Publishing to crates.io is IRREVERSIBLE — there is no delete, only
 #     `cargo yank` (which hides a version but cannot reuse the version number).

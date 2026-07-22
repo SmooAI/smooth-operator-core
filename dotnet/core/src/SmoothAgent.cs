@@ -27,6 +27,7 @@ public sealed class SmoothAgent
     private readonly AgentOptions _options;
     private readonly Dictionary<string, AIFunction> _functions;
     private readonly ToolSearch? _toolSearch;
+    private readonly PermissionHook? _permissionHook;
 
     public SmoothAgent(IChatClient chatClient, AgentOptions options)
     {
@@ -34,6 +35,12 @@ public sealed class SmoothAgent
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _functions = options.Tools.OfType<AIFunction>().ToDictionary(f => f.Name, StringComparer.Ordinal);
         _toolSearch = options.DeferredTools.Count > 0 ? new ToolSearch(options.DeferredTools.OfType<AIFunction>()) : null;
+        // The permission gate is opt-in: it engages only when a mode or a deny policy is configured.
+        // Attaching just a deny policy still runs the full engine (defaulting to Ask). This keeps every
+        // existing agent byte-identical to before. An Ask routes to the same IHumanGate seam.
+        _permissionHook = options.PermissionMode is not null || options.DenyPolicy is not null
+            ? new PermissionHook(options.PermissionMode ?? AutoMode.Ask, options.HumanGate, options.DenyPolicy, options.PermissionGrants, options.PermissionGrantsPersistPath)
+            : null;
     }
 
     /// <summary>Start a fresh conversation thread for multi-turn use. (MAF: <c>GetNewThread</c>.)</summary>
@@ -376,6 +383,19 @@ public sealed class SmoothAgent
             return new FunctionResultContent(call.CallId, $"Error: unknown tool '{call.Name}'");
         }
 
+        // Permission gate (auto-mode + deny policy): classify every tool call before it runs. A deny
+        // (built-in circuit-breaker or consumer deny policy) or a fail-closed Ask blocks the tool and
+        // feeds the reason back to the model. An Ask that routes to the human is handled inside the
+        // hook via the same IHumanGate seam. Runs before the legacy RequiresApproval gate below.
+        if (_permissionHook is not null)
+        {
+            var blockReason = await _permissionHook.PreCallAsync(call, cancellationToken).ConfigureAwait(false);
+            if (blockReason is not null)
+            {
+                return new FunctionResultContent(call.CallId, $"Error: {blockReason}");
+            }
+        }
+
         // Human-in-the-loop: pause for approval before running a flagged (write/sensitive) tool.
         // A denial is fed back to the model as a result — the tool never runs.
         if (_options.HumanGate is not null && (_options.RequiresApproval?.Invoke(call) ?? false))
@@ -388,18 +408,51 @@ public sealed class SmoothAgent
             }
         }
 
+        // Pre-call hooks run before the tool. A hook that throws blocks the call — the tool never
+        // runs and the model gets a "Blocked by hook" result. Parity with the Rust reference's
+        // pre_call returning Err (registry short-circuits without executing the tool).
+        try
+        {
+            foreach (var hook in _options.ToolHooks)
+            {
+                await hook.PreCallAsync(call, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            return new FunctionResultContent(call.CallId, $"Blocked by hook: {ex.Message}");
+        }
+
+        FunctionResultContent resultContent;
         try
         {
             var arguments = new AIFunctionArguments(call.Arguments);
             var result = await function.InvokeAsync(arguments, cancellationToken).ConfigureAwait(false);
-            return new FunctionResultContent(call.CallId, result);
+            resultContent = new FunctionResultContent(call.CallId, result);
         }
         catch (Exception ex)
         {
             // A failing tool is fed back to the model as an error result, not thrown —
             // the model can recover or apologize. Mirrors the Rust ToolResult.is_error path.
-            return new FunctionResultContent(call.CallId, $"Error: {ex.Message}");
+            resultContent = new FunctionResultContent(call.CallId, $"Error: {ex.Message}");
         }
+
+        // Post-call hooks run with the mutable result (redaction seam) on both success and error.
+        // A hook failure is swallowed so the possibly-redacted result still reaches the caller —
+        // parity with the Rust reference logging post_call errors rather than surfacing them.
+        foreach (var hook in _options.ToolHooks)
+        {
+            try
+            {
+                await hook.PostCallAsync(call, resultContent, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // ponytail: swallow post-hook failures — the (redacted) result still returns. Parity with Rust.
+            }
+        }
+
+        return resultContent;
     }
 
     private static void Accumulate(UsageDetails total, UsageDetails? add)

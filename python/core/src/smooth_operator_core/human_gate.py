@@ -21,6 +21,11 @@ class HumanDecision(Enum):
 
     APPROVED = "approved"
     DENIED = "denied"
+    #: Approve AND remember: the permission gate persists a grant so the same call
+    #: is auto-approved (silently) next time. Mirrors the Rust engine's
+    #: ``HumanResponse::ApprovedAlways``. Treated as approved everywhere approval is
+    #: checked (see :attr:`HumanApprovalResponse.is_approved`).
+    APPROVED_ALWAYS = "approved_always"
 
 
 @dataclass(frozen=True)
@@ -44,11 +49,17 @@ class HumanApprovalResponse:
 
     @property
     def is_approved(self) -> bool:
-        return self.decision is HumanDecision.APPROVED
+        return self.decision in (HumanDecision.APPROVED, HumanDecision.APPROVED_ALWAYS)
 
     @staticmethod
     def approve() -> "HumanApprovalResponse":
         return HumanApprovalResponse(HumanDecision.APPROVED)
+
+    @staticmethod
+    def approve_always() -> "HumanApprovalResponse":
+        """Approve this call AND persist a grant so the permission gate auto-approves
+        the same call next time (see :attr:`HumanDecision.APPROVED_ALWAYS`)."""
+        return HumanApprovalResponse(HumanDecision.APPROVED_ALWAYS)
 
     @staticmethod
     def deny(reason: str) -> "HumanApprovalResponse":

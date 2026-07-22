@@ -14,8 +14,26 @@ export { InMemoryCheckpointStore } from './checkpoint.js';
 export type { Checkpoint, CheckpointStore } from './checkpoint.js';
 export { CostTracker, DEFAULT_PRICING } from './cost.js';
 export type { CostBudget, ModelPricing, Usage } from './cost.js';
-export { approve, deny, HumanDecision, isApproved } from './humanGate.js';
+export { approve, approveAlways, deny, HumanDecision, isApproved } from './humanGate.js';
 export type { HumanApprovalRequest, HumanApprovalResponse, HumanGate } from './humanGate.js';
+export {
+    AutoMode,
+    autoModeFromEnv,
+    autoModeFromValue,
+    decide,
+    domainMatchesSuffixList,
+    extractHosts,
+    hostFromToken,
+    PermissionHook,
+    splitCompound,
+    stripWrappersAndSudo,
+    toolCategory,
+} from './permission.js';
+export type { Category, Verdict } from './permission.js';
+export { hostMatchesGlob, PermissionGrants } from './permissionGrants.js';
+export type { GrantQuery } from './permissionGrants.js';
+export { DenyPolicy, DenyRules, globMatch } from './denyPolicy.js';
+export type { DenyPredicate } from './denyPolicy.js';
 export { InMemoryKnowledge } from './knowledge.js';
 export type { Knowledge, KnowledgeHit } from './knowledge.js';
 export { MockLlmProvider, textResponse, toolCallResponse } from './llmProvider.js';

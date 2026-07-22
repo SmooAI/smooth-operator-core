@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-reference%20impl-FF6B6C?style=flat-square" alt="Rust reference implementation">
-  <img src="https://img.shields.io/badge/tests-337%20passing-00A6A6?style=flat-square" alt="337 tests passing">
+  <img src="https://img.shields.io/badge/tests-passing-00A6A6?style=flat-square" alt="tests passing">
 </p>
 
 <p align="center">
@@ -19,13 +19,15 @@
 
 ---
 
-> The agent runtime behind the [smooth-operator](https://github.com/SmooAI/smooth-operator) service and [lom.smoo.ai](https://lom.smoo.ai). Agents, workflows, tools, checkpointing, memory, human-in-the-loop, and per-model cost budgets — as a single embeddable Rust crate. It's the engine, not a notebook demo.
+> ### The agent brain you can point at production — because you decide what it must never do.
+>
+> One observe→think→act engine — typed tools, streaming, checkpointing, memory, cost budgets, and a permission gate with hard lines the model can't cross — native in **Rust, TypeScript, Python, Go, and C#**.
 
-`smooai-smooth-operator-core` is the agent runtime that powers the [**smooth-operator**](https://github.com/SmooAI/smooth-operator) service and [**lom.smoo.ai**](https://lom.smoo.ai). It gives you the moving parts of a serious agent framework — an observe→think→act loop, a typed tool system, a graph workflow engine, pluggable checkpoint stores, memory, RAG, human-in-the-loop gates, and per-model cost budgets — as a single, embeddable Rust crate.
+Most agent frameworks hand the model a pile of tools and hope for the best. `smooth-operator-core` gives you the whole loop **and the brakes**: a typed tool system with pre/post hooks, human-in-the-loop gates, per-model cost budgets — and a **deny-policy** that lets you draw lines the model can never cross, not even in bypass mode. *No prod AWS profile. No writes to the DB writer. No `rm -rf /`.* Declared once, enforced on every tool call.
 
-Inspired by LangGraph, CrewAI, and Agno, with one hard difference: **it's the engine, not a notebook demo.** Every surface is covered by **337 fast, offline unit tests** built on a deterministic `MockLlmClient`, so the loop is verified — not vibe-coded.
+It's the runtime that powers the [**smooth-operator**](https://github.com/SmooAI/smooth-operator) service and [**lom.smoo.ai**](https://lom.smoo.ai) — not a notebook demo. Inspired by LangGraph, CrewAI, and Agno, with one hard difference: every surface is covered by **hundreds of fast, offline unit tests** built on a deterministic `MockLlmClient`, so the loop is verified — not vibe-coded. And it's the **same engine in five languages** — write your agent where your stack already lives.
 
-> The Rust implementation is the source of truth. TypeScript, Go, C#/.NET, and Python bindings mirror its surface (protocol-first; see [Repository layout](#repository-layout)).
+> The Rust implementation is the source of truth. The TypeScript, Python, Go, and C#/.NET ports mirror its surface at parity (protocol-first; see [Repository layout](#repository-layout)).
 
 ---
 
@@ -166,6 +168,7 @@ let agent = Agent::new(config, registry).with_checkpoint_store(checkpoints);
 | --- | --- |
 | An agent loop you can **trust** | observe→think→act with iteration caps, parallel tool calls, and a typed `AgentEvent` stream |
 | **Typed tools** with guardrails | `Tool` trait + `ToolRegistry`, with pre/post hooks for surveillance, secret detection, prompt-injection guards |
+| **Deny what must never run** | `PermissionHook` gate (`AutoMode`: ask / accept-edits / deny-unmatched / bypass) + hard circuit-breakers + a consumer `DenyPolicy` (declarative TOML rules + semantic predicates) |
 | **Stateful graphs** (a LangGraph analog) | `Workflow<S>` / `WorkflowBuilder<S>` with conditional edges and typed state |
 | **Resume after a crash** | `CheckpointStore`: in-memory, file, SQLite, or Postgres |
 | **RAG + memory** | `KnowledgeBase` / `Memory` traits (with in-memory impls) as clean seams |
@@ -175,6 +178,44 @@ let agent = Agent::new(config, registry).with_checkpoint_store(checkpoints);
 | To **embed it anywhere** | one crate, `provided.al2023`-friendly, runs in a Lambda, a container, or any host process |
 
 It's the runtime the smooth-operator service actually ships on — not a reference design.
+
+---
+
+## Permissions & deny-policy — draw lines the agent can't cross
+
+Here's the thing that makes an agent safe to point at real infrastructure: **you** decide what it can never do, and no prompt, jailbreak, or model mistake can talk it out of that.
+
+Every tool call passes through a gate before it runs. `AutoMode` sets the baseline posture — read-only calls **allow**, mutating calls **ask**, dangerous calls **deny** — and hard circuit-breakers (`rm -rf /`, credential paths, pipe-to-shell, dangerous domains) fire in *every* mode, `Bypass` included. On top of that you attach a **`DenyPolicy`**: declarative TOML rules for the lines you can name, plus semantic predicates for the ones you can't.
+
+```rust
+use std::sync::Arc;
+use smooth_operator_core::{Agent, AutoMode, DenyPolicy, DenyPredicate, DenyReason, ToolCall};
+
+// Predicate: the checks strings can't express — is this AWS call the *prod account*?
+// Is this DB connection the *writer* endpoint? Return Some(reason) to deny.
+struct DenyDbWriter;
+impl DenyPredicate for DenyDbWriter {
+    fn evaluate(&self, call: &ToolCall) -> Option<DenyReason> {
+        (call.name == "db_query" && call.arguments.to_string().contains("writer"))
+            .then(|| DenyReason::new("DB writer is off-limits — reads go to the replica"))
+    }
+}
+
+// Declarative rules: never the prod AWS profile, never a prod host.
+let policy = DenyPolicy::from_toml(r#"
+    schema_version = 1
+    [bash]
+    deny_patterns = ["aws * --profile prod"]
+    [network]
+    deny_hosts = ["*.prod.internal"]
+"#)?.with_predicate(Arc::new(DenyDbWriter));
+
+let agent = Agent::new(config, registry)
+    .with_permission_mode(AutoMode::Ask)
+    .with_deny_policy(Arc::new(policy));
+```
+
+A deny-policy match is a **hard deny of circuit-breaker tier** — no stored grant waives it, no mode downgrades it. That's the difference between "we asked the model nicely" and "it structurally cannot." And it's identical across all five languages.
 
 ---
 
@@ -237,7 +278,7 @@ The service is thin: it terminates the WebSocket protocol and hands turns to the
 
 ## Test-driven by default — verified, not vibe-coded
 
-This is the part we care about most. The engine ships **408 unit tests** that run in **seconds, fully offline**, because every LLM call goes through an `LlmProvider` seam that tests satisfy with `MockLlmClient`:
+This is the part we care about most. The engine ships **hundreds of unit tests** that run in **seconds, fully offline**, because every LLM call goes through an `LlmProvider` seam that tests satisfy with `MockLlmClient`:
 
 ```rust
 use smooth_operator_core::llm_provider::{LlmProvider, MockLlmClient};
@@ -272,7 +313,7 @@ flowchart TD
     J["LLM-as-judge evals — multi-turn quality, 0–5"]
     E["Live E2E — real gateway + WS, streamed answer"]
     C["Conformance — SQLite + Postgres stores, testcontainers"]
-    U["337 unit tests — MockLlmClient, offline, fast"]
+    U["hundreds of unit tests — MockLlmClient, offline, fast"]
 
     J --> E --> C --> U
 
@@ -282,7 +323,7 @@ flowchart TD
     class U teal
 ```
 
-- **Unit (408):** the bulk. Loop control, tool dispatch, workflow edges, compaction, cost enforcement, HITL gating, checkpoint round-trips — all against `MockLlmClient`.
+- **Unit (the bulk):** loop control, tool dispatch, workflow edges, compaction, cost enforcement, permission-gate + deny-policy verdicts, HITL gating, checkpoint round-trips — all against `MockLlmClient`.
 - **Conformance:** the `sqlite` and `postgres` checkpoint stores run the same suite against real engines (testcontainers), so "resume" means the same thing everywhere.
 - **Live E2E:** the smooth-operator service + [chat-widget](https://github.com/SmooAI/chat-widget) drive a real streamed, knowledge-grounded answer through a live gateway.
 - **LLM-as-judge:** multi-turn conversation quality is scored 0–5 by a judge model. This caught a real multi-turn context defect: a regression scored **1/5**, the fix landed, and it went back to **5/5** — a class of bug no assertion-based test would have flagged.
@@ -309,17 +350,17 @@ cargo clippy --all-targets -- -D warnings
 
 ## Repository layout
 
-This is a multi-language SmooAI package. The Rust crate is the reference; other languages mirror its surface. For install commands and a hello-agent example in every language, see [**docs/Polyglot-Engines.md**](./docs/Polyglot-Engines.md).
+This is a multi-language SmooAI package. The Rust crate is the reference; the other four are **native ports at parity** — the same engine, idiomatic in each language, held to a shared eval suite. Each ships to its language's registry with its own README landing page. For install commands and a hello-agent example in every language, see [**docs/Polyglot-Engines.md**](./docs/Polyglot-Engines.md).
 
-| Directory | Language | Status |
-| --- | --- | --- |
-| [`rust/`](./rust) | Rust (reference) | Active — crate `smooai-smooth-operator-core` (lib `smooth_operator_core`) |
-| [`typescript/`](./typescript) | TypeScript | Planned |
-| [`go/`](./go) | Go | Active — module `github.com/SmooAI/smooth-operator-core/go` |
-| [`dotnet/`](./dotnet) | C# / .NET | Planned (first-class target) |
-| [`python/`](./python) | Python | Planned |
+| Language | Directory | Package | Registry |
+| --- | --- | --- | --- |
+| Rust (reference) | [`rust/`](./rust/smooth-operator-core) | `smooai-smooth-operator-core` (lib `smooth_operator_core`) | [crates.io](https://crates.io/crates/smooai-smooth-operator-core) |
+| TypeScript | [`typescript/`](./typescript/core) | `@smooai/smooth-operator-core` | [npm](https://www.npmjs.com/package/@smooai/smooth-operator-core) |
+| Python | [`python/`](./python/core) | `smooai-smooth-operator-core` | [PyPI](https://pypi.org/project/smooai-smooth-operator-core/) |
+| Go | [`go/`](./go/core) | `github.com/SmooAI/smooth-operator-core/go/core` | [pkg.go.dev](https://pkg.go.dev/github.com/SmooAI/smooth-operator-core/go/core) |
+| C# / .NET | [`dotnet/`](./dotnet/core) | `SmooAI.SmoothOperator.Core` | [nuget.org](https://www.nuget.org/packages/SmooAI.SmoothOperator.Core) |
 
-Bindings follow a **protocol-first** strategy (a stable wire spec each language implements natively), with in-process FFI (napi-rs, PyO3/uniffi) layered on where embedding the engine pays off.
+The ports follow a **protocol-first** strategy: a stable wire spec each language implements natively, so the loop, tool system, permission gate, checkpointing, and cost accounting behave the same everywhere.
 
 ---
 

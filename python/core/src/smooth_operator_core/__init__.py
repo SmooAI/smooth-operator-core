@@ -22,6 +22,8 @@ from .agent import (
 from .cast import Cast, Clearance, OperatorRole, RoleKind
 from .checkpoint import Checkpoint, CheckpointStore, InMemoryCheckpointStore
 from .cost import CostBudget, CostTracker, ModelPricing, Usage
+from .deny_policy import DenyPolicy, DenyPredicate, DenyReason, DenyRules
+from .hooks import ToolCall, ToolHook, ToolResult
 from .human_gate import (
     DelegateHumanGate,
     HumanApprovalRequest,
@@ -39,6 +41,31 @@ from .llm_provider import (
     usage,
 )
 from .memory import InMemoryMemory, Memory, MemoryEntry
+from .permission import (
+    Allow,
+    Ask,
+    AutoMode,
+    Category,
+    Deny,
+    PermissionHook,
+    Verdict,
+    covered_by_grants,
+    decide,
+    grant_query,
+    tool_category,
+)
+from .permission_grants import (
+    BashGrant,
+    GrantQuery,
+    NetworkGrant,
+    PermissionGrants,
+    SharedGrants,
+    ToolGrant,
+    append_grant,
+    host_matches_glob,
+    project_grants_path,
+    user_grants_path,
+)
 from .rerank import LexicalReranker, NoopReranker, Reranker
 from .thread import SmoothAgentThread
 from .tool_search import ToolSearch
@@ -61,6 +88,10 @@ __all__ = [
     "CostBudget",
     "CostTracker",
     "DelegateHumanGate",
+    "DenyPolicy",
+    "DenyPredicate",
+    "DenyReason",
+    "DenyRules",
     "Embedder",
     "FunctionTool",
     "delegate_tool",
@@ -89,8 +120,32 @@ __all__ = [
     "SmoothAgent",
     "SmoothAgentThread",
     "Tool",
+    "ToolCall",
+    "ToolHook",
+    "ToolResult",
     "ToolSearch",
     "Usage",
+    "Allow",
+    "Ask",
+    "AutoMode",
+    "Category",
+    "Deny",
+    "PermissionHook",
+    "Verdict",
+    "covered_by_grants",
+    "decide",
+    "grant_query",
+    "tool_category",
+    "BashGrant",
+    "GrantQuery",
+    "NetworkGrant",
+    "PermissionGrants",
+    "SharedGrants",
+    "ToolGrant",
+    "append_grant",
+    "host_matches_glob",
+    "project_grants_path",
+    "user_grants_path",
     "VectorKnowledge",
     "Workflow",
     "WorkflowError",

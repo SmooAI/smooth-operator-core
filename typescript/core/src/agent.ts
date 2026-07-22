@@ -23,6 +23,9 @@ import type { CostBudget, ModelPricing, Usage } from './cost.js';
 import type { HumanGate } from './humanGate.js';
 import { isApproved } from './humanGate.js';
 import type { Knowledge } from './knowledge.js';
+import type { DenyPolicy } from './denyPolicy.js';
+import { AutoMode, PermissionHook } from './permission.js';
+import type { PermissionGrants } from './permissionGrants.js';
 import { ToolSearch } from './toolSearch.js';
 
 /** A callable tool the agent may invoke. Mirrors the reference engines' tool seam. */
@@ -172,6 +175,31 @@ export interface AgentOptions {
      */
     requiresApproval?: (name: string, args: Record<string, unknown>) => boolean;
     /**
+     * Enable the native permission gate ({@link PermissionHook}). When set (or when
+     * {@link denyPolicy} / {@link permissionGrants} is set, defaulting to
+     * {@link AutoMode.Ask}), every tool call is classified before dispatch: read-only
+     * calls allow, dangerous calls (`rm -rf /`, credential paths, `curl | sh`,
+     * dangerous domains, env dumps) hard-deny in EVERY mode, and mutating/unknown
+     * calls `Ask`. An `Ask` is routed to {@link humanGate} when one is wired and
+     * **fails closed** (blocked, surfaced to the model) otherwise. A blocked call is
+     * never executed; the model is told why. Undefined ⇒ the gate is off (prior
+     * behaviour). Mirrors the Rust engine's `SMOOTH_AUTO_MODE` / `PermissionHook`.
+     */
+    permissionMode?: AutoMode;
+    /**
+     * A consumer {@link DenyPolicy} (declarative deny rules + predicates). Evaluated
+     * FIRST as a circuit-breaker: a match hard-denies regardless of grants or mode
+     * (including {@link AutoMode.Bypass}). Setting this alone enables the gate at
+     * {@link AutoMode.Ask}. Purely additive — an empty/absent policy changes nothing.
+     */
+    denyPolicy?: DenyPolicy;
+    /**
+     * In-memory allow-list consulted before prompting on an `Ask`. A matching grant
+     * auto-approves silently; an `approveAlways` answer adds a grant. Setting this
+     * alone enables the gate at {@link AutoMode.Ask}. The consumer owns persistence.
+     */
+    permissionGrants?: PermissionGrants;
+    /**
      * Number of ADDITIONAL attempts after the first if the model call throws a transient
      * error (rate-limit, 5xx, dropped connection). `0` (the default) preserves today's
      * behaviour: a single attempt, error propagates immediately. Only the model call is
@@ -312,6 +340,8 @@ export class SmoothAgent {
     private readonly toolsByName: Map<string, Tool>;
     /** Tool-call surveillance hooks, run in order around every dispatch. */
     private readonly hooks: ToolHook[];
+    /** The native permission gate, built when permissionMode/denyPolicy/permissionGrants is set; else undefined (gate off). */
+    private readonly permissionHook?: PermissionHook;
 
     constructor(
         private readonly client: ChatClientLike,
@@ -320,6 +350,13 @@ export class SmoothAgent {
         if (!client) throw new Error('client is required');
         this.toolsByName = new Map((options.tools ?? []).map((t) => [t.name, t]));
         this.hooks = [...(options.toolHooks ?? [])];
+        if (options.permissionMode !== undefined || options.denyPolicy !== undefined || options.permissionGrants !== undefined) {
+            const hook = new PermissionHook(options.permissionMode ?? AutoMode.Ask);
+            if (options.humanGate) hook.withApprover(options.humanGate);
+            if (options.permissionGrants) hook.withGrants(options.permissionGrants);
+            if (options.denyPolicy) hook.withDenyPolicy(options.denyPolicy);
+            this.permissionHook = hook;
+        }
     }
 
     /**
@@ -694,6 +731,18 @@ export class SmoothAgent {
             args = rawArgs ? JSON.parse(rawArgs) : {};
         } catch {
             return `error: tool '${name}' received invalid JSON arguments`;
+        }
+
+        // Native permission gate: classify the call (circuit-breakers → hard deny,
+        // mutating/unknown → Ask routed to the human gate, else allow). A blocked
+        // call is never executed; the reason is surfaced to the model, like other
+        // tool errors. The gate is only active when a permission option was set.
+        if (this.permissionHook) {
+            try {
+                await this.permissionHook.preCall({ id: name, name, arguments: args });
+            } catch (err) {
+                return `error: tool '${name}' blocked by permission policy: ${err instanceof Error ? err.message : String(err)}`;
+            }
         }
 
         // Human-in-the-loop: pause for approval before running a flagged (write/sensitive)

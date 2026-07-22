@@ -15,11 +15,13 @@
 
 ---
 
-> The C#/.NET sibling of the [Rust reference engine](https://github.com/SmooAI/smooth-operator-core). Agents, tools, knowledge/RAG, memory, checkpointing, human-in-the-loop, cost budgets, and workflows — as one embeddable NuGet package. It's the engine, not a notebook demo.
+> ### The agent brain you can point at production — right in your .NET process.
+>
+> Most agent frameworks hand the model a pile of tools and hope. This one gives you the loop **and the brakes**: draw hard lines the model can never cross, then let it run.
 
-`SmooAI.SmoothOperator.Core` is the **native C# implementation** of the Smoo AI agent engine — the in-process observe→think→act loop that powers [**lom.smoo.ai**](https://lom.smoo.ai). It's a sibling of the [Rust reference engine](https://github.com/SmooAI/smooth-operator-core) and one of the [polyglot set](https://github.com/SmooAI/smooth-operator-core/blob/main/docs/Polyglot-Engines.md) (Rust, TypeScript, Python, Go, C#/.NET) whose behavior is held at parity by a shared eval suite. Its API follows Microsoft.Extensions.AI naming.
+`SmooAI.SmoothOperator.Core` is the agent engine itself, in-process — an observe→think→act loop over any `IChatClient`, with typed tools (authored from ordinary C# methods via `AIFunctionFactory`), streaming, checkpointing, cost budgets, and a permission gate you control. Its API follows Microsoft.Extensions.AI naming, so it drops into an existing .NET AI stack. Not a client to a remote server: the agent *is* your process.
 
-It's a library, not a client to a remote server: it *is* the agent, running in your .NET process. Every surface is covered by **fast, offline tests** built on a deterministic `MockLlmProvider`, so the loop is verified — not vibe-coded.
+It's the native C# port of the [Rust reference engine](https://github.com/SmooAI/smooth-operator-core) — one of five siblings (Rust, TypeScript, Python, Go, C#/.NET) that share one wire spec and one eval suite. **The same agent brain, the same guarantees, wherever your stack already lives.** Every surface is covered by fast, offline tests on a deterministic `MockLlmProvider`, so the loop is verified — not vibe-coded.
 
 ## Install
 
@@ -31,17 +33,30 @@ dotnet add package SmooAI.SmoothOperator.Core
 
 A complete agent — no credentials needed — using the deterministic mock provider the engine's own tests run on:
 
+A complete agent with one tool — the mock is scripted to call the tool, then answer. Author tools from ordinary C# methods with `AIFunctionFactory.Create`:
+
 ```csharp
+using Microsoft.Extensions.AI;
 using SmooAI.SmoothOperator.Core;
 
-var provider = new MockLlmProvider().PushText("the answer is 42");
-var agent = new SmoothAgent(provider, new AgentOptions { Instructions = "You are a helpful assistant" });
+var getWeather = AIFunctionFactory.Create(
+    (string city) => $"Weather in {city}: 72F, sunny",
+    "get_weather",
+    "Get the current weather for a city");
 
-var response = await agent.RunAsync("what is the answer?");
+var provider = new MockLlmProvider()
+    .PushToolCall("call_1", "get_weather", new Dictionary<string, object?> { ["city"] = "Tokyo" })
+    .PushText("It's 72F and sunny in Tokyo.");
+
+var options = new AgentOptions { Instructions = "You are a helpful assistant" };
+options.Tools.Add(getWeather);
+var agent = new SmoothAgent(provider, options);
+
+var response = await agent.RunAsync("what's the weather in Tokyo?");
 Console.WriteLine(response.Text);
 ```
 
-`new SmoothAgent(chatClient, options)` takes an `IChatClient` (the `MockLlmProvider` implements it — swap in any OpenAI-compatible client) and an `AgentOptions`. `await agent.RunAsync(...)` returns an `AgentRunResponse`; `response.Text` is the final assistant message.
+`new SmoothAgent(chatClient, options)` takes an `IChatClient` (the `MockLlmProvider` implements it — swap in any OpenAI-compatible client) and an `AgentOptions`; tools are `AITool`s added to `options.Tools`. `await agent.RunAsync(...)` returns an `AgentRunResponse`; `response.Text` is the final assistant message.
 
 ## Features
 
@@ -57,6 +72,7 @@ The full parity surface — every engine in the [polyglot set](https://github.co
 - **Rerank** — rerank retrieved hits before injection (lexical reranker built in).
 - **Sub-agents / delegation** — spawn child agents for sub-tasks.
 - **Cast + clearance** — roles with per-role tool-access policy.
+- **Permissions + deny-policy** — a tool-call gate (`AutoMode`: ask / accept-edits / deny-unmatched / bypass) with hard circuit-breakers (`rm -rf /`, credential paths, pipe-to-shell, dangerous domains), a persisted allow-list, and a consumer `DenyPolicy` — declarative TOML rules plus semantic predicates for what strings can't express.
 - **Human-in-the-loop gate** — require approval before designated tool calls run.
 - **Conversation thread** — carry a conversation across multiple `RunAsync` calls.
 - **`LlmProvider` seam + `MockLlmProvider`** — inject any OpenAI-compatible client; the record/replay mock drives the offline tests.
@@ -65,6 +81,39 @@ The full parity surface — every engine in the [polyglot set](https://github.co
 - **Parallel tool calls** — dispatch ≥2 tool calls concurrently (transcript order preserved).
 - **Retry / backoff** — retry transient model-call failures with exponential backoff.
 - **Streaming** — stream incremental text, tool calls, and tool results as the turn runs.
+
+## Permissions & deny-policy — lines the agent can't cross
+
+This is what makes an agent safe to point at real infrastructure: **you** decide what it can never do, and no prompt or model mistake talks it out of that. Every tool call passes through a gate. `AutoMode` sets the posture — read-only calls **allow**, mutating calls **ask**, dangerous calls **deny** — and hard circuit-breakers (`rm -rf /`, credential paths, pipe-to-shell, dangerous domains) fire in every mode, `Bypass` included. Attach a `DenyPolicy` on top: declarative TOML rules for the lines you can name, semantic predicates for the ones you can't. A match is a hard deny no stored grant and no mode can waive.
+
+```csharp
+using Microsoft.Extensions.AI;
+using SmooAI.SmoothOperator.Core;
+
+// Declarative rules (TOML): never the prod AWS profile, never a prod host.
+var policy = DenyPolicy.FromToml(@"
+    schema_version = 1
+    [bash]
+    deny_patterns = [""aws * --profile prod""]
+    [network]
+    deny_hosts = [""*.prod.internal""]
+").WithPredicate(new DenyDbWriter());
+
+var options = new AgentOptions { Instructions = "You are a careful assistant" }
+    .WithPermissionMode(AutoMode.Ask) // read allow · mutate ask · dangerous deny
+    .WithDenyPolicy(policy);
+options.Tools.Add(getWeather);
+var agent = new SmoothAgent(provider, options);
+
+// A predicate for what strings can't express — return a DenyReason to deny, null to allow.
+sealed class DenyDbWriter : IDenyPredicate
+{
+    public DenyReason? Evaluate(FunctionCallContent call) =>
+        call.Name == "db_query" && call.Arguments?.Values.Any(v => $"{v}".Contains("writer")) == true
+            ? new DenyReason("DB writer endpoint is off-limits — reads go to the replica")
+            : null;
+}
+```
 
 ## Streaming
 

@@ -243,6 +243,28 @@ type AgentOptions struct {
 	//
 	//	func(name string, _ map[string]any) bool { return name == "delete_record" }
 	RequiresApproval func(name string, args map[string]any) bool
+	// PermissionMode, when non-nil, enables the native permission engine (the Go
+	// port of the Rust PermissionHook — see permission.go / permission_gate.go):
+	// every tool call is classified by Decide and gated before it runs. A hard
+	// circuit-breaker (rm -rf /, credential paths, pipe-to-shell, dangerous
+	// domains, env dumps) is always denied; a mutating/network call Asks (routed
+	// to HumanGate, or fails closed with no gate); read-only calls Allow. nil (the
+	// default) disables the engine entirely — dispatch is byte-for-byte unchanged.
+	// Setting DenyPolicy without PermissionMode enables the engine at
+	// AutoModeAsk. The HumanGate seam doubles as the Ask approver (an
+	// ApproveAlways response persists a grant to PermissionGrantsPath).
+	PermissionMode *AutoMode
+	// DenyPolicy is a consumer-supplied deny policy (declarative TOML rules +
+	// predicates) evaluated FIRST on every gated call — a match is a
+	// circuit-breaker no grant or mode can waive. nil = none. Enables the
+	// permission engine even when PermissionMode is nil.
+	DenyPolicy *DenyPolicy
+	// PermissionGrants is the live allow-list consulted on an Ask before
+	// prompting; a matching grant auto-approves silently. nil disables persistence.
+	PermissionGrants *SharedGrants
+	// PermissionGrantsPath is where an ApproveAlways answer persists a new grant
+	// (the user-scope wonk-allow.toml). Empty degrades approve-always to approve-once.
+	PermissionGrantsPath string
 	// MaxRetries is the number of ADDITIONAL attempts after the first if the model
 	// call returns a transient error (rate-limit, 5xx, dropped connection). 0 (the
 	// default) preserves today's behaviour: a single attempt, error returned
@@ -253,6 +275,11 @@ type AgentOptions struct {
 	// value means no real delay (retries fire immediately) — which is what tests use
 	// so they don't sleep; production should set a small base such as 200ms.
 	RetryBackoff time.Duration
+	// Hooks are ToolHooks run in registration order around every dispatched tool
+	// call: each PreCall runs before the tool (any error blocks it), each PostCall
+	// runs after with a mutable *ToolResult it may redact. Nil (the default) → no
+	// hooks, behaviour unchanged. Mirrors the Rust engine's ToolRegistry hook chain.
+	Hooks []ToolHook
 }
 
 // AgentRunResponse is the result of a turn.
@@ -297,6 +324,7 @@ type SmoothAgent struct {
 	client      ChatClient
 	options     AgentOptions
 	toolsByName map[string]Tool
+	permGate    *PermissionGate // nil unless the permission engine is enabled
 }
 
 // NewSmoothAgent constructs an agent over an OpenAI-compatible ChatClient.
@@ -308,7 +336,27 @@ func NewSmoothAgent(client ChatClient, options AgentOptions) *SmoothAgent {
 	for _, t := range options.Tools {
 		byName[t.Name()] = t
 	}
-	return &SmoothAgent{client: client, options: options, toolsByName: byName}
+	return &SmoothAgent{client: client, options: options, toolsByName: byName, permGate: buildPermissionGate(options)}
+}
+
+// buildPermissionGate assembles the permission gate from options, or returns nil
+// when the engine is disabled (no PermissionMode and no DenyPolicy) — the
+// additive no-op default that leaves dispatch unchanged.
+func buildPermissionGate(o AgentOptions) *PermissionGate {
+	if o.PermissionMode == nil && o.DenyPolicy == nil {
+		return nil
+	}
+	mode := AutoModeAsk
+	if o.PermissionMode != nil {
+		mode = *o.PermissionMode
+	}
+	return &PermissionGate{
+		Mode:        mode,
+		Grants:      o.PermissionGrants,
+		PersistPath: o.PermissionGrantsPath,
+		DenyPolicy:  o.DenyPolicy,
+		Approver:    o.HumanGate,
+	}
 }
 
 func (a *SmoothAgent) buildSystem(message string) string {
@@ -814,6 +862,15 @@ func (a *SmoothAgent) dispatchTool(ctx context.Context, tc ToolCall, search *Too
 		}
 	}
 
+	// Native permission engine (opt-in via PermissionMode / DenyPolicy): classify
+	// and gate the call before it runs. A deny (circuit-breaker, deny-policy, or a
+	// fail-closed Ask) is fed back to the model as a result — the tool never runs.
+	if a.permGate != nil {
+		if err := a.permGate.Check(ctx, tc.Name, args); err != nil {
+			return fmt.Sprintf("error: tool '%s' %v", tc.Name, err)
+		}
+	}
+
 	// Human-in-the-loop: pause for approval before running a flagged (write/sensitive)
 	// tool. A denial is fed back to the model as a result — the tool never runs.
 	if a.options.HumanGate != nil && a.options.RequiresApproval != nil && a.options.RequiresApproval(tc.Name, args) {
@@ -831,10 +888,27 @@ func (a *SmoothAgent) dispatchTool(ctx context.Context, tc ToolCall, search *Too
 		}
 	}
 
+	// Pre-call hooks run last, right before execution — any error blocks the tool
+	// (the model is told, mirroring the Rust engine's "blocked by hook" result).
+	for _, h := range a.options.Hooks {
+		if err := h.PreCall(ctx, tc); err != nil {
+			return fmt.Sprintf("blocked by hook: %v", err)
+		}
+	}
+
 	out, err := tool.Execute(ctx, args)
+	// Wrap the outcome so PostCall hooks can redact Content in place before it
+	// reaches the model. A tool error becomes an IsError result the hooks still see.
+	result := ToolResult{ToolCallID: tc.ID, Content: out}
 	if err != nil {
 		// Surface tool failures to the model, don't crash the turn.
-		return fmt.Sprintf("error: tool '%s' failed: %v", tc.Name, err)
+		result.Content = fmt.Sprintf("error: tool '%s' failed: %v", tc.Name, err)
+		result.IsError = true
 	}
-	return out
+	// Post-call hooks may redact result.Content in place. A hook error is ignored —
+	// the (possibly redacted) result still reaches the model (Rust parity).
+	for _, h := range a.options.Hooks {
+		_ = h.PostCall(ctx, tc, &result)
+	}
+	return result.Content
 }
