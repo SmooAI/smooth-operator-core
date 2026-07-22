@@ -24,21 +24,11 @@ import { isApproved } from './humanGate.js';
 import { PermissionGrants } from './permissionGrants.js';
 import type { GrantQuery } from './permissionGrants.js';
 
-/** A tool call presented to a {@link ToolHook}. Mirrors the Rust engine's `ToolCall`. */
-export interface ToolCall {
-    id: string;
-    name: string;
-    arguments: Record<string, unknown>;
-}
+// ToolCall/ToolHook are the engine-wide hook seam, defined once in agent.ts
+// (optional preCall/postCall). PermissionHook implements the preCall gate.
+import type { ToolCall, ToolHook } from './agent.js';
 
-/**
- * A pre-execution gate on tool calls. `preCall` throws to block the call (the
- * agent surfaces the error to the model); returning resolves the gate. Mirrors
- * the Rust engine's `ToolHook::pre_call -> Result<()>`.
- */
-export interface ToolHook {
-    preCall(call: ToolCall): Promise<void>;
-}
+export type { ToolCall, ToolHook };
 
 /**
  * How aggressively the hook enforces. Mirrors the Rust engine's `AutoMode` (a

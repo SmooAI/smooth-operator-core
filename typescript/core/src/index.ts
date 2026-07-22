@@ -7,7 +7,7 @@
  */
 
 export { delegateTool, effectiveMaxTokens, SmoothAgent } from './agent.js';
-export type { AgentOptions, AgentRunResponse, ChatChunk, ChatClientLike, StreamEvent, Tool } from './agent.js';
+export type { AgentOptions, AgentRunResponse, ChatChunk, ChatClientLike, StreamEvent, Tool, ToolCall, ToolHook, ToolResult } from './agent.js';
 export { Cast, Clearance, makeRole, RoleKind } from './cast.js';
 export type { OperatorRole } from './cast.js';
 export { InMemoryCheckpointStore } from './checkpoint.js';
@@ -29,7 +29,7 @@ export {
     stripWrappersAndSudo,
     toolCategory,
 } from './permission.js';
-export type { Category, ToolCall, ToolHook, Verdict } from './permission.js';
+export type { Category, Verdict } from './permission.js';
 export { hostMatchesGlob, PermissionGrants } from './permissionGrants.js';
 export type { GrantQuery } from './permissionGrants.js';
 export { DenyPolicy, DenyRules, globMatch } from './denyPolicy.js';
