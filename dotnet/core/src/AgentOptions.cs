@@ -71,6 +71,15 @@ public sealed class AgentOptions
     public bool ParallelToolCalls { get; set; }
 
     /// <summary>
+    /// Tool-call hooks — the in-process surveillance / redaction seam. Every hook's
+    /// <see cref="IToolHook.PreCallAsync"/> runs before a tool executes (a throw blocks the call) and
+    /// its <see cref="IToolHook.PostCallAsync"/> runs after with the mutable result (a hook can
+    /// redact it in place). Hooks fire in registration order. Mirrors the Rust reference's
+    /// <c>ToolRegistry</c> hook chain (<c>add_hook</c>). Default: none.
+    /// </summary>
+    public IList<IToolHook> ToolHooks { get; } = new List<IToolHook>();
+
+    /// <summary>
     /// Tools whose schemas are hidden from the model until promoted. When non-empty, the agent
     /// advertises a single <c>tool_search(query)</c> meta-tool; the model calls it to discover and
     /// promote the deferred tools it needs, keeping the visible tool set (and its token cost) small.
