@@ -282,6 +282,17 @@ pub enum AgentEvent {
         /// older runners.
         #[serde(default)]
         duration_ms: u64,
+        /// UN-truncated structured details from the tool's
+        /// [`ToolResult::details`](crate::tool::ToolResult) — the UI-facing
+        /// payload (`content` above is only the LLM-facing text, capped at
+        /// 500 chars). Carries e.g. the observability tools' trace ids /
+        /// counts / rows so a downstream server (the SEP `stream_chunk`) can
+        /// render real artifact cards instead of re-parsing prose. `default` +
+        /// `skip_serializing_if` keeps the wire byte-identical when absent, so
+        /// older runners/clients are unaffected (pairs with the SMOODEV-2717
+        /// web renderer, which reads `stream_chunk.state.rawResponse.toolResult.data`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
     },
     CheckpointSaved {
         checkpoint_id: String,
@@ -1605,6 +1616,7 @@ impl Agent {
                     is_error: result.is_error,
                     result: result.content.chars().take(500).collect(),
                     duration_ms: 0,
+                    details: result.details.clone(),
                 });
                 self.sep_dispatch(
                     crate::extension::events::TOOL_EXECUTION_END,
@@ -1643,6 +1655,7 @@ impl Agent {
                     is_error: result.is_error,
                     result: result.content.chars().take(500).collect(),
                     duration_ms,
+                    details: result.details.clone(),
                 });
                 self.sep_dispatch(
                     crate::extension::events::TOOL_EXECUTION_END,
@@ -2079,6 +2092,7 @@ mod tests {
                 is_error: false,
                 result: String::new(),
                 duration_ms: 0,
+                details: None,
             },
             AgentEvent::CheckpointSaved {
                 checkpoint_id: "cp".into(),
@@ -2114,6 +2128,42 @@ mod tests {
         for event in events {
             let json = serde_json::to_string(&event).expect("serialize");
             assert!(!json.is_empty());
+        }
+    }
+
+    #[test]
+    fn tool_call_complete_details_omitted_when_none() {
+        // SMOODEV-2717: absent details ⇒ wire byte-identical to pre-change, so
+        // older clients/runners are unaffected.
+        let event = AgentEvent::ToolCallComplete {
+            iteration: 1,
+            tool_name: "echo".into(),
+            is_error: false,
+            result: "hi".into(),
+            duration_ms: 3,
+            details: None,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(!json.contains("details"), "None must not serialize a details key: {json}");
+    }
+
+    #[test]
+    fn tool_call_complete_details_forwarded_verbatim_when_some() {
+        // SMOODEV-2717: structured details ride the event un-truncated so the SEP
+        // server can render artifact cards from real tool data.
+        let details = serde_json::json!({ "traceId": "abc123", "errorCount": 47 });
+        let event = AgentEvent::ToolCallComplete {
+            iteration: 1,
+            tool_name: "observability.errors_top".into(),
+            is_error: false,
+            result: "top errors…".into(),
+            duration_ms: 12,
+            details: Some(details.clone()),
+        };
+        let round_tripped: AgentEvent = serde_json::from_str(&serde_json::to_string(&event).expect("serialize")).expect("deserialize");
+        match round_tripped {
+            AgentEvent::ToolCallComplete { details: Some(d), .. } => assert_eq!(d, details),
+            other => panic!("expected ToolCallComplete with details, got {other:?}"),
         }
     }
 
