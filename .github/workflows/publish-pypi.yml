@@ -56,7 +56,7 @@ jobs:
             - name: Install uv
               uses: astral-sh/setup-uv@v5
               with:
-                  version: '0.7.8'
+                  version: '0.12.2'
 
             # Gate the publish on a green build before we touch the registry.
             - name: Sync (locked)
