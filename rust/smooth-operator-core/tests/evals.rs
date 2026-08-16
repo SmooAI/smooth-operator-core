@@ -178,7 +178,13 @@ async fn eval_aggregate_mean_clears_threshold() {
     }
 
     let corpus = corpus();
-    let judge_model = std::env::var("SMOOTH_AGENT_JUDGE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    // `.filter(!empty)` because the nightly workflow exports the var from a
+    // workflow_dispatch input — EMPTY STRING on cron/blank dispatch, not unset.
+    // An empty model reaches the gateway as `model=` → 400 (first live run).
+    let judge_model = std::env::var("SMOOTH_AGENT_JUDGE_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let judge = LlmClient::new(gateway_config(&api_key, &judge_model));
 
     // Tiers are scored separately: core must clear the real bar, hard sits on a

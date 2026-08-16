@@ -44,7 +44,11 @@ public class EvalTests
         var apiKey = Environment.GetEnvironmentVariable("SMOOAI_GATEWAY_KEY");
         Skip.If(string.IsNullOrWhiteSpace(apiKey), "SMOOAI_GATEWAY_KEY unset/empty — skipping live-gateway eval suite.");
 
-        var judgeModel = Environment.GetEnvironmentVariable("SMOOTH_AGENT_JUDGE_MODEL") ?? DefaultModel;
+        // IsNullOrWhiteSpace, not ??: the nightly workflow exports this var from a
+        // workflow_dispatch input — EMPTY STRING on cron/blank dispatch, not unset.
+        // An empty model name throws in the OpenAI client (first live run).
+        var judgeModelEnv = Environment.GetEnvironmentVariable("SMOOTH_AGENT_JUDGE_MODEL");
+        var judgeModel = string.IsNullOrWhiteSpace(judgeModelEnv) ? DefaultModel : judgeModelEnv;
         using var agentClient = Gateway(apiKey!, DefaultModel);
         using var judgeClient = Gateway(apiKey!, judgeModel);
 
@@ -92,7 +96,11 @@ public class EvalTests
         var apiKey = Environment.GetEnvironmentVariable("SMOOAI_GATEWAY_KEY");
         Skip.If(string.IsNullOrWhiteSpace(apiKey), "SMOOAI_GATEWAY_KEY unset/empty — skipping live-gateway hard-eval suite.");
 
-        var judgeModel = Environment.GetEnvironmentVariable("SMOOTH_AGENT_JUDGE_MODEL") ?? DefaultModel;
+        // IsNullOrWhiteSpace, not ??: the nightly workflow exports this var from a
+        // workflow_dispatch input — EMPTY STRING on cron/blank dispatch, not unset.
+        // An empty model name throws in the OpenAI client (first live run).
+        var judgeModelEnv = Environment.GetEnvironmentVariable("SMOOTH_AGENT_JUDGE_MODEL");
+        var judgeModel = string.IsNullOrWhiteSpace(judgeModelEnv) ? DefaultModel : judgeModelEnv;
         using var agentClient = Gateway(apiKey!, DefaultModel);
         using var judgeClient = Gateway(apiKey!, judgeModel);
 
