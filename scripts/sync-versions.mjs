@@ -69,6 +69,16 @@ const anchors = [
         path: "go/version.go",
         pattern: /(const Version = ")[^"]+(")/,
     },
+    {
+        // uv.lock records the local editable package's version and `uv sync
+        // --locked` (the first step of py-checks) HARD-FAILS when it drifts from
+        // pyproject. Every version bump that skipped this line turned py-checks
+        // red on main until someone hand-refreshed the lock — syncing it here
+        // ends that treadmill.
+        label: "Python lockfile (uv.lock local package version)",
+        path: "python/core/uv.lock",
+        pattern: /(name = "smooai-smooth-operator-core"\nversion = ")[^"]+(")/,
+    },
 ];
 
 let touched = 0;
