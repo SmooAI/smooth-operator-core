@@ -1,4 +1,5 @@
 using Microsoft.Extensions.AI;
+using SmooAI.SmoothOperator.Core.Extensions;
 
 namespace SmooAI.SmoothOperator.Core;
 
@@ -97,6 +98,21 @@ public sealed class AgentOptions
     /// reference's deferred-tools / <c>tool_search</c> behaviour.
     /// </summary>
     public IList<AITool> DeferredTools { get; } = new List<AITool>();
+
+    /// <summary>
+    /// Wires a SEP extension host into this agent — the C# sibling of Rust's
+    /// <c>Agent::with_extension_host</c> and Go's <c>AgentOptions.Extensions</c>.
+    /// <para>
+    /// <see cref="ExtensionHost"/> implements <see cref="IExtensionHooks"/>; the interface exists so
+    /// the loop-wiring tests can stub the seam (the host is sealed and only constructible via
+    /// <c>Empty()</c> or a real subprocess load).
+    /// </para>
+    /// <para>
+    /// <c>null</c> (the default) means the agent loop behaves exactly as it did before extensions
+    /// existed — no dispatch, no hook calls, no extra allocation.
+    /// </para>
+    /// </summary>
+    public IExtensionHooks? Extensions { get; set; }
 
     /// <summary>
     /// Soft ceiling (estimated tokens) on the conversation sent to the model. When exceeded,

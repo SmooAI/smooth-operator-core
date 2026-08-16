@@ -135,12 +135,44 @@ public abstract class HostDelegate
 public sealed class DefaultHostDelegate : HostDelegate { }
 
 /// <summary>
+/// The seam through which a SEP extension host participates in the agent loop — the C# sibling of
+/// Go's <c>ExtensionHooks</c> and Rust's <c>Agent::with_extension_host</c>. Set it on
+/// <see cref="AgentOptions.Extensions"/>.
+/// <para>
+/// This is an interface purely for TESTABILITY, not for layering: unlike Go there is no import
+/// cycle to break here, but <see cref="ExtensionHost"/> is sealed with a private constructor and is
+/// only reachable via <c>Empty()</c> or <c>LoadAsync</c> (real subprocesses), so the loop-wiring
+/// tests need a stub. It also matches how every other seam in this engine is expressed
+/// (<c>IToolHook</c>, <c>IKnowledgeBase</c>, <c>IHumanGate</c>). <see cref="ExtensionHost"/>
+/// implements it with the members it already had.
+/// </para>
+/// </summary>
+public interface IExtensionHooks
+{
+    /// <summary>Eager tools, already namespaced <c>&lt;extension&gt;.&lt;tool&gt;</c>. Merged into the
+    /// agent's tool set as ORDINARY tools — visible, dispatched, and permission-gated exactly like
+    /// natives, with no special casing.</summary>
+    IReadOnlyList<AITool> Tools();
+
+    /// <summary>Deferred tools: hidden from the model until <c>tool_search</c> promotes them.</summary>
+    IReadOnlyList<AITool> DeferredTools();
+
+    /// <summary>Folds the <c>tool_call</c> hook chain over one pending call BEFORE it executes —
+    /// a veto blocks it, a proceed may carry rewritten arguments.</summary>
+    Task<FoldedHook> RunToolCallHookAsync(string tool, JsonNode arguments);
+
+    /// <summary>Fans a turn event out to subscribed extensions. Fire-and-forget: observe events are
+    /// lossy by contract and never block the turn.</summary>
+    void DispatchEvent(string @event, JsonNode? payload);
+}
+
+/// <summary>
 /// Orchestrates the set of loaded extensions in load order: hook chaining, non-blocking event
 /// fanout, tool proxies, and the ext→host delegate seam. Mirrors the Rust <c>ExtensionHost</c>. The
 /// security-critical parts (<see cref="FoldHookChain"/>, <see cref="ValidateCommandContext"/>) are
 /// pure functions so they can be tested exhaustively against adversarial inputs.
 /// </summary>
-public sealed class ExtensionHost
+public sealed class ExtensionHost : IExtensionHooks
 {
     /// <summary>The SEP protocol version this host implements.</summary>
     public const int ProtocolVersion = 1;
