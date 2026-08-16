@@ -97,7 +97,7 @@ public sealed class SmoothAgent
             var response = await CallModelAsync(working, chatOptions, cancellationToken).ConfigureAwait(false);
             Accumulate(usage, response.Usage);
             lastText = response.Text ?? string.Empty;
-            cost.Record(response.ModelId, response.Usage, LookupPricing(response.ModelId));
+            cost.RecordWithGatewayCost(response.ModelId, response.Usage, ResponseGatewayCost(response), LookupPricing(response.ModelId));
             working.AddRange(response.Messages);
             newThisTurn.AddRange(response.Messages);
             await MaybeCheckpointAsync(thread, newThisTurn, iterations, CheckpointStrategy.AfterEachIteration, cancellationToken).ConfigureAwait(false);
@@ -126,6 +126,36 @@ public sealed class SmoothAgent
 
         thread?.AddRange(newThisTurn);
         return new AgentRunResponse(newThisTurn, usage, iterations, cost, budgetHit);
+    }
+
+
+    /// <summary>
+    /// The gateway's authoritative cost for a response, when the client surfaced one.
+    /// <para>The engine takes an injected <see cref="IChatClient"/>, whose parsed
+    /// response carries no HTTP headers — the cost lives ONLY in a response header. So
+    /// this reads the documented seam: a <c>gatewayCostUsd</c> entry on the response's
+    /// <see cref="ChatResponse.AdditionalProperties"/>, which a client wrapping the raw
+    /// HTTP call attaches via <see cref="GatewayCost.Parse(System.Net.Http.Headers.HttpHeaders)"/>.
+    /// Absent it, null — unmeasured, and the local pricing estimate is used instead of
+    /// a bogus $0.</para>
+    /// </summary>
+    private static decimal? ResponseGatewayCost(ChatResponse response)
+    {
+        if (response.AdditionalProperties is not { } props)
+        {
+            return null;
+        }
+        if (!props.TryGetValue("gatewayCostUsd", out var raw) || raw is null)
+        {
+            return null;
+        }
+        return raw switch
+        {
+            decimal d when d > 0m => d,
+            double dbl when dbl > 0 => (decimal)dbl,
+            string str => GatewayCost.Parse(name => name == "x-cost-usd" ? str : null),
+            _ => null,
+        };
     }
 
     private ModelPricing? LookupPricing(string? modelId) =>

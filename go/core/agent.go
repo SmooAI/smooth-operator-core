@@ -53,6 +53,12 @@ type ChatResponse struct {
 	Content   string
 	ToolCalls []ToolCall
 	Usage     Usage
+	// GatewayCostUSD is the gateway's AUTHORITATIVE cost for this request, read
+	// from its response header. nil means "unmeasured" — the caller falls back to
+	// local ModelPricing. It is deliberately not 0: a real zero and an absent
+	// header must stay distinct, or a gateway that reports no cost silently pins
+	// spend at zero.
+	GatewayCostUSD *float64
 }
 
 // ChatClient is the minimal OpenAI-compatible surface the agent needs. The
@@ -74,6 +80,10 @@ type ChatChunk struct {
 	ToolCallDeltas []ToolCallDelta
 	// Usage, when non-nil, reports cumulative token usage (gateways send it last).
 	Usage *Usage
+	// CostUSD, when non-nil, is the gateway's authoritative cost for the whole
+	// request, read from the response headers before the body was consumed. It
+	// arrives on the FIRST chunk, not the last.
+	CostUSD *float64
 }
 
 // ToolCallDelta is one tool-call fragment within a streamed chunk.
@@ -577,7 +587,7 @@ func (a *SmoothAgent) run(ctx context.Context, message string, history []ChatMes
 		if err != nil {
 			return AgentRunResponse{}, fmt.Errorf("model call: %w", err)
 		}
-		tracker.Record(model, resp.Usage, a.options.Pricing)
+		tracker.RecordWithGatewayCost(model, resp.Usage, resp.GatewayCostUSD, a.options.Pricing)
 		lastText = resp.Content
 
 		assistantMsg := ChatMessage{Role: "assistant", Content: resp.Content, ToolCalls: resp.ToolCalls}
@@ -789,9 +799,13 @@ func (a *SmoothAgent) runStream(ctx context.Context, sc StreamingChatClient, mes
 		partials := map[int]*ToolCall{}
 		var order []int
 		var usage Usage
+		var gatewayCost *float64
 		for chunk := range chunks {
 			if chunk.Usage != nil {
 				usage = *chunk.Usage
+			}
+			if chunk.CostUSD != nil {
+				gatewayCost = chunk.CostUSD
 			}
 			if chunk.ContentDelta != "" {
 				content.WriteString(chunk.ContentDelta)
@@ -819,7 +833,7 @@ func (a *SmoothAgent) runStream(ctx context.Context, sc StreamingChatClient, mes
 			assembled = append(assembled, *partials[idx])
 		}
 
-		tracker.Record(model, usage, a.options.Pricing)
+		tracker.RecordWithGatewayCost(model, usage, gatewayCost, a.options.Pricing)
 		lastText = content.String()
 
 		assistantMsg := ChatMessage{Role: "assistant", Content: lastText, ToolCalls: assembled}

@@ -18,8 +18,8 @@ import type { SmoothAgentThread } from './thread.js';
 import type { Memory } from './memory.js';
 import type { Reranker } from './rerank.js';
 import { compact } from './compaction.js';
-import { CostTracker } from './cost.js';
-import type { CostBudget, ModelPricing, Usage } from './cost.js';
+import { CostTracker, parseGatewayCost } from './cost.js';
+import type { CostBudget, HeaderLike, ModelPricing, Usage } from './cost.js';
 import type { HumanGate } from './humanGate.js';
 import { isApproved } from './humanGate.js';
 import type { Knowledge } from './knowledge.js';
@@ -405,6 +405,22 @@ export function effectiveMaxTokens(configured: number, ceiling?: number): number
     return Math.max(1, Math.min(configured, ceiling));
 }
 
+/**
+ * The gateway's authoritative cost for a response, when the client surfaced one.
+ *
+ * The engine takes an injected OpenAI-compatible client, and the SDK's parsed
+ * response carries no headers — the cost lives ONLY in a response header. So this
+ * reads two shapes, in order: a `gatewayCostUsd` a wrapping client already parsed
+ * and attached, or raw `headers` hanging off the response (what
+ * `openai`'s `.withResponse()` gives you). Absent both, `undefined` — unmeasured,
+ * and the local pricing estimate is used instead of a bogus $0.
+ */
+function responseGatewayCost(response: unknown): number | undefined {
+    const r = response as { gatewayCostUsd?: number; headers?: unknown } | null | undefined;
+    if (typeof r?.gatewayCostUsd === 'number' && r.gatewayCostUsd > 0) return r.gatewayCostUsd;
+    return parseGatewayCost(r?.headers as HeaderLike | undefined);
+}
+
 /** Pull token usage from an OpenAI-shaped response, defaulting to zero when absent. */
 function extractUsage(usage: { prompt_tokens?: number | null; completion_tokens?: number | null } | null | undefined): Usage {
     return { promptTokens: usage?.prompt_tokens ?? 0, completionTokens: usage?.completion_tokens ?? 0 };
@@ -617,7 +633,7 @@ export class SmoothAgent {
                     max_tokens: effectiveMaxTokens(this.options.maxTokens ?? DEFAULTS.maxTokens, this.options.modelMaxOutput),
                     ...metadataField(this.options.metadata),
                 });
-                tracker.record(model, extractUsage(response.usage), this.options.pricing);
+                tracker.recordWithGatewayCost(model, extractUsage(response.usage), responseGatewayCost(response), this.options.pricing);
                 const choice = response.choices[0].message;
                 lastText = choice.content ?? '';
     
@@ -781,7 +797,7 @@ export class SmoothAgent {
                     .sort((a, b) => a[0] - b[0])
                     .map(([, p]) => ({ id: p.id, function: { name: p.name, arguments: p.arguments } }));
 
-                tracker.record(model, extractUsage(assembled.usage), this.options.pricing);
+                tracker.recordWithGatewayCost(model, extractUsage(assembled.usage), responseGatewayCost(assembled), this.options.pricing);
                 lastText = assembled.content;
 
                 const assistantMsg: Record<string, unknown> = { role: 'assistant', content: assembled.content };

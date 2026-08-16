@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,6 +32,47 @@ func NewGatewayClient(baseURL, apiKey string) *GatewayClient {
 		APIKey:     apiKey,
 		HTTPClient: &http.Client{Timeout: 60 * time.Second},
 	}
+}
+
+// gatewayCostHeaders are the response headers the LLM gateway reports per-request
+// cost in, in PRECEDENCE order. Mirrors the Rust reference's parseGatewayCost
+// candidate list exactly (rust/smooth-operator-core/src/llm.rs).
+//
+// LiteLLM splits cost across a few headers: `-margin-amount` is what the caller
+// actually pays (includes the gateway's configured markup), `-original` is the raw
+// upstream cost, and the bare `x-litellm-response-cost` is the legacy shape older
+// versions emit. The last two are generic fallbacks for other OpenAI-compatible
+// gateways that echo a cost header.
+var gatewayCostHeaders = []string{
+	"x-litellm-response-cost-margin-amount",
+	"x-litellm-response-cost-original",
+	"x-litellm-response-cost",
+	"x-response-cost",
+	"x-cost-usd",
+}
+
+// parseGatewayCost reads the gateway's authoritative per-request cost from a
+// response's headers, taking the FIRST NON-ZERO candidate.
+//
+// Returns nil when every candidate is absent OR reports zero. That distinction is
+// the whole point: nil means "unmeasured", so the caller falls back to local
+// ModelPricing, whereas locking in 0 would pin cost at zero for the rest of the
+// dispatch. LiteLLM's config on llm.smoo.ai currently reports 0 for `smooth-*`
+// aliases on every response, so taking a zero at face value silently zeroes real
+// spend.
+func parseGatewayCost(h http.Header) *float64 {
+	for _, name := range gatewayCostHeaders {
+		v := strings.TrimSpace(h.Get(name))
+		if v == "" {
+			continue
+		}
+		cost, err := strconv.ParseFloat(v, 64)
+		if err != nil || cost <= 0 {
+			continue
+		}
+		return &cost
+	}
+	return nil
 }
 
 // ── wire shapes (OpenAI /chat/completions) ──────────────────────────────────
@@ -167,8 +209,9 @@ func (g *GatewayClient) Chat(ctx context.Context, req ChatRequest) (ChatResponse
 	}
 	msg := wresp.Choices[0].Message
 	out := ChatResponse{
-		Content: msg.Content,
-		Usage:   Usage{PromptTokens: wresp.Usage.PromptTokens, CompletionTokens: wresp.Usage.CompletionTokens},
+		Content:        msg.Content,
+		Usage:          Usage{PromptTokens: wresp.Usage.PromptTokens, CompletionTokens: wresp.Usage.CompletionTokens},
+		GatewayCostUSD: parseGatewayCost(resp.Header),
 	}
 	for _, tc := range msg.ToolCalls {
 		out.ToolCalls = append(out.ToolCalls, ToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
@@ -204,10 +247,20 @@ func (g *GatewayClient) ChatStream(ctx context.Context, req ChatRequest) (<-chan
 		return nil, fmt.Errorf("gateway %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 
+	// Must be read BEFORE the body is consumed — once the SSE stream is being
+	// scanned the headers are gone. This is the bug the Rust fix (core#102) was
+	// about: the streaming path went straight to the body and dropped them.
+	streamCost := parseGatewayCost(resp.Header)
+
 	ch := make(chan ChatChunk)
 	go func() {
 		defer close(ch)
 		defer resp.Body.Close()
+		// Cost rides the first chunk so the consumer folds it even if the stream
+		// errors before any usage arrives.
+		if streamCost != nil {
+			ch <- ChatChunk{CostUSD: streamCost}
+		}
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
