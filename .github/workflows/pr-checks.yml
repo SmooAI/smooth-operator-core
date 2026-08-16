@@ -4,6 +4,10 @@ on:
     pull_request:
         branches: [main]
         types: [opened, synchronize]
+    # push on main keeps the README's workflow-status badge live (a
+    # pull_request-only workflow has no default-branch runs to badge).
+    push:
+        branches: [main]
 
 env:
     CARGO_TERM_COLOR: always
