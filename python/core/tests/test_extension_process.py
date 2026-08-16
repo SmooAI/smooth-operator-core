@@ -10,12 +10,14 @@ from pathlib import Path
 import pytest
 
 from smooth_operator_core.extension.process import (
+    ENV_PASSTHROUGH,
     OBSERVE_QUEUE_CAP,
     DefaultInboundHandler,
     ExtensionProcess,
     ObserveLane,
     SpawnSpec,
     backoff_for,
+    build_child_env,
 )
 from smooth_operator_core.extension.protocol import method
 
@@ -124,3 +126,38 @@ async def test_request_on_dead_process_raises() -> None:
     await proc.shutdown(2.0)
     with pytest.raises(RuntimeError, match="not alive"):
         await proc.request(method.PING, {}, 1.0)
+
+
+# ---- subprocess hardening: env scrubbing, exhaustively ----
+
+
+def test_build_child_env_scrubs_ambient_secrets_keeps_allowlist_and_explicit() -> None:
+    # A fake host env: two allow-listed vars + secrets that must NOT pass.
+    host = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/home/tester",
+        "AWS_SECRET_ACCESS_KEY": "super-secret",
+        "GITHUB_TOKEN": "ghp_leak",
+        "SOME_RANDOM_VAR": "x",
+    }
+
+    env = build_child_env(host, {"SEP_PROTO": "1"})
+
+    # Allow-listed launch essentials + the manifest's explicit var pass through.
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["HOME"] == "/home/tester"
+    assert env["SEP_PROTO"] == "1"
+    # The lethal-trifecta concern: ambient secrets are SCRUBBED.
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "SOME_RANDOM_VAR" not in env
+
+
+def test_build_child_env_explicit_overrides_passthrough() -> None:
+    assert build_child_env({"PATH": "/host/path"}, {"PATH": "/ext/path"})["PATH"] == "/ext/path"
+
+
+def test_build_child_env_unset_allowlisted_var_is_absent() -> None:
+    assert build_child_env({}, {}) == {}
+    # The allow-list is launch essentials only — no secret-shaped name in it.
+    assert "AWS_SECRET_ACCESS_KEY" not in ENV_PASSTHROUGH

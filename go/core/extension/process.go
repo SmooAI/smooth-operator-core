@@ -74,9 +74,56 @@ func (DefaultInboundHandler) HandleNotification(string, json.RawMessage) {}
 type SpawnSpec struct {
 	Command string
 	Args    []string
-	Env     map[string]string
+	// Env is the extra env the extension legitimately needs (its manifest
+	// [run] env, SEP-protocol vars). These are the ONLY env the child sees
+	// beyond the small EnvPassthrough allow-list — the host's full environment
+	// is scrubbed so ambient secrets can't leak in. See buildChildEnv.
+	Env map[string]string
 	// Cwd is the working directory for the child (the extension's root); "" inherits.
 	Cwd string
+}
+
+// EnvPassthrough is the ONLY host environment variables passed through to an
+// extension subprocess. Everything else is scrubbed (see buildChildEnv) so
+// ambient secrets — cloud creds (AWS_SECRET_ACCESS_KEY), API tokens,
+// GITHUB_TOKEN, … — can never leak into an extension via inherited env (the
+// lethal-trifecta concern).
+//
+// These are launch essentials only, and none is secret:
+//   - PATH — resolve a bare-name interpreter (node, python3) and its own
+//     subprocess lookups. Without it a non-absolute Command won't even start.
+//   - HOME — interpreters read user config/caches from it; some abort without it.
+//   - LANG / LC_ALL / LC_CTYPE — locale; python3 errors on non-ASCII I/O unset.
+//   - TMPDIR — where the child writes temp files (macOS/BSD).
+//   - TERM — interpreters that probe for a tty degrade gracefully with it.
+//   - SystemRoot — Windows: node.exe/python.exe fail to start without it.
+//
+// SEP-protocol vars and anything else an extension legitimately needs come
+// through its manifest [run] env (carried in SpawnSpec.Env), NOT from here — so
+// adding a var is a deliberate, per-extension act, never ambient.
+var EnvPassthrough = []string{"PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "SystemRoot"}
+
+// buildChildEnv builds the exact environment an extension child sees: the
+// EnvPassthrough allow-list pulled from the host (via lookup), then explicit
+// (the manifest env) overlaid on top so an extension can still *set* — but never
+// silently *inherit* — any var. lookup is injected so this is a pure,
+// exhaustively testable function (the caller passes os.LookupEnv).
+func buildChildEnv(lookup func(string) (string, bool), explicit map[string]string) []string {
+	env := make(map[string]string, len(EnvPassthrough)+len(explicit))
+	for _, k := range EnvPassthrough {
+		if v, ok := lookup(k); ok {
+			env[k] = v
+		}
+	}
+	// Manifest env wins on collision (an extension may legitimately override PATH).
+	for k, v := range explicit {
+		env[k] = v
+	}
+	out := make([]string, 0, len(env))
+	for k, v := range env {
+		out = append(out, k+"="+v)
+	}
+	return out
 }
 
 type pendingResult struct {
@@ -223,10 +270,10 @@ func Spawn(spec SpawnSpec, handler InboundHandler) (*ExtensionProcess, error) {
 // for one generation. Shared by Spawn and Respawn.
 func (p *ExtensionProcess) startConnection(myGeneration uint64) (*connection, error) {
 	cmd := exec.Command(p.spec.Command, p.spec.Args...)
-	cmd.Env = os.Environ()
-	for k, v := range p.spec.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	// Scrub the host environment: the child sees only the EnvPassthrough
+	// essentials + the manifest's explicit env. A non-nil cmd.Env REPLACES the
+	// ambient environment rather than adding to it.
+	cmd.Env = buildChildEnv(os.LookupEnv, p.spec.Env)
 	if p.spec.Cwd != "" {
 		cmd.Dir = p.spec.Cwd
 	}

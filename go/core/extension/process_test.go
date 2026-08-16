@@ -3,6 +3,7 @@ package extension
 import (
 	"encoding/json"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -108,4 +109,58 @@ func TestDefaultHandlerAnswersPingOnly(t *testing.T) {
 	if _, err := h.HandleRequest("session/send_message", nil); err == nil || err.Code != CodeMethodNotFound {
 		t.Errorf("expected MethodNotFound, got %v", err)
 	}
+}
+
+// ---- subprocess hardening: env scrubbing, exhaustively ----
+
+func TestBuildChildEnvScrubsAmbientSecretsKeepsAllowlistAndExplicit(t *testing.T) {
+	// A fake host env: two allow-listed vars + secrets that must NOT pass.
+	host := map[string]string{
+		"PATH":                  "/usr/bin:/bin",
+		"HOME":                  "/home/tester",
+		"AWS_SECRET_ACCESS_KEY": "super-secret",
+		"GITHUB_TOKEN":          "ghp_leak",
+		"SOME_RANDOM_VAR":       "x",
+	}
+	lookup := func(k string) (string, bool) { v, ok := host[k]; return v, ok }
+
+	env := envMap(buildChildEnv(lookup, map[string]string{"SEP_PROTO": "1"}))
+
+	// Allow-listed launch essentials pass through.
+	if env["PATH"] != "/usr/bin:/bin" {
+		t.Errorf("PATH = %q want /usr/bin:/bin", env["PATH"])
+	}
+	if env["HOME"] != "/home/tester" {
+		t.Errorf("HOME = %q want /home/tester", env["HOME"])
+	}
+	// The manifest's explicit (SEP-protocol) var passes through.
+	if env["SEP_PROTO"] != "1" {
+		t.Errorf("SEP_PROTO = %q want 1", env["SEP_PROTO"])
+	}
+	// The lethal-trifecta concern: ambient secrets are SCRUBBED.
+	for _, k := range []string{"AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "SOME_RANDOM_VAR"} {
+		if _, ok := env[k]; ok {
+			t.Errorf("%s must not inherit into the child env", k)
+		}
+	}
+}
+
+func TestBuildChildEnvExplicitOverridesPassthrough(t *testing.T) {
+	host := map[string]string{"PATH": "/host/path"}
+	lookup := func(k string) (string, bool) { v, ok := host[k]; return v, ok }
+	env := envMap(buildChildEnv(lookup, map[string]string{"PATH": "/ext/path"}))
+	if env["PATH"] != "/ext/path" {
+		t.Errorf("manifest env must win on collision: PATH = %q", env["PATH"])
+	}
+}
+
+// envMap turns the KEY=VALUE slice exec.Cmd wants back into a map for assertions.
+func envMap(kvs []string) map[string]string {
+	out := map[string]string{}
+	for _, kv := range kvs {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			out[k] = v
+		}
+	}
+	return out
 }

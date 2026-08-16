@@ -34,6 +34,10 @@ public sealed class SpawnSpec
 {
     public required string Command { get; init; }
     public List<string> Args { get; init; } = new();
+    /// <summary>Extra env vars the extension legitimately needs (its manifest <c>[run] env</c>,
+    /// SEP-protocol vars). These are the ONLY env the child sees beyond the small
+    /// <see cref="ExtensionProcess.EnvPassthrough"/> allow-list — the host's full environment is
+    /// scrubbed so ambient secrets can't leak in. See <see cref="ExtensionProcess.BuildChildEnv"/>.</summary>
     public Dictionary<string, string> Env { get; init; } = new();
     /// <summary>Working directory for the child (the extension's root).</summary>
     public string? Cwd { get; init; }
@@ -58,6 +62,52 @@ public sealed class ExtensionProcess : IDisposable
 
     /// <summary>Idle interval after which the host should health-probe with <c>ping</c>.</summary>
     public static readonly TimeSpan PingIdle = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// The ONLY host environment variables passed through to an extension subprocess. Everything
+    /// else is scrubbed (see <see cref="BuildChildEnv"/>) so ambient secrets — cloud creds
+    /// (<c>AWS_SECRET_ACCESS_KEY</c>), API tokens, <c>GITHUB_TOKEN</c>, … — can never leak into an
+    /// extension via inherited env (the lethal-trifecta concern).
+    /// <para>These are launch essentials only, and none is secret: <c>PATH</c> (resolve a bare-name
+    /// interpreter and its own subprocess lookups), <c>HOME</c> (interpreters read user config and
+    /// caches from it), <c>LANG</c>/<c>LC_ALL</c>/<c>LC_CTYPE</c> (locale — python3 errors on
+    /// non-ASCII I/O unset), <c>TMPDIR</c> (child temp files on macOS/BSD), <c>TERM</c> (tty probes
+    /// degrade gracefully), <c>SystemRoot</c> (Windows: node.exe/python.exe fail to start without
+    /// it).</para>
+    /// <para>SEP-protocol vars and anything else an extension legitimately needs come through its
+    /// manifest <c>[run] env</c> (carried in <see cref="SpawnSpec.Env"/>), NOT from here — so adding
+    /// a var is a deliberate, per-extension act, never ambient.</para>
+    /// </summary>
+    public static readonly string[] EnvPassthrough =
+    {
+        "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "SystemRoot",
+    };
+
+    /// <summary>Build the exact environment an extension child sees: the
+    /// <see cref="EnvPassthrough"/> allow-list pulled from the host (via <paramref name="lookup"/>),
+    /// then <paramref name="explicitEnv"/> (the manifest env) overlaid on top so an extension can
+    /// still <em>set</em> — but never silently <em>inherit</em> — any var. <paramref name="lookup"/>
+    /// is injected so this is a pure, exhaustively testable function (the caller passes
+    /// <see cref="Environment.GetEnvironmentVariable(string)"/>).</summary>
+    public static Dictionary<string, string> BuildChildEnv(
+        Func<string, string?> lookup,
+        IReadOnlyDictionary<string, string> explicitEnv)
+    {
+        var env = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var key in EnvPassthrough)
+        {
+            if (lookup(key) is { } value)
+            {
+                env[key] = value;
+            }
+        }
+        // Manifest env wins on collision (an extension may legitimately override PATH).
+        foreach (var (k, v) in explicitEnv)
+        {
+            env[k] = v;
+        }
+        return env;
+    }
 
     /// <summary>Bounded depth of the per-connection observe (<c>event</c>) lane. Past this, the OLDEST
     /// event is shed and an <c>events_lost</c> marker is delivered on recovery.</summary>
@@ -109,7 +159,11 @@ public sealed class ExtensionProcess : IDisposable
         {
             psi.ArgumentList.Add(arg);
         }
-        foreach (var (k, v) in _spec.Env)
+        // Scrub the host environment: the child sees only the EnvPassthrough essentials + the
+        // manifest's explicit env. ProcessStartInfo.Environment starts PRE-POPULATED with this
+        // process's environment, so it must be cleared before the allow-list is applied.
+        psi.Environment.Clear();
+        foreach (var (k, v) in BuildChildEnv(Environment.GetEnvironmentVariable, _spec.Env))
         {
             psi.Environment[k] = v;
         }

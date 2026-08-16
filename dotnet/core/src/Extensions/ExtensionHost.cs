@@ -269,6 +269,51 @@ public sealed class ExtensionHost
         return raw.Deserialize<InitializeResult>(SepJson.Options) ?? throw new InvalidOperationException("bad initialize result");
     }
 
+    /// <summary>Does <paramref name="ext"/> own <paramref name="tool"/>? Extension tools are
+    /// namespaced <c>&lt;ext&gt;.&lt;tool&gt;</c> (the MCP convention). A native tool (<c>bash</c>,
+    /// <c>file-write</c>) has no <c>&lt;ext&gt;.</c> prefix, so no extension owns it.</summary>
+    public static bool ToolOwnedBy(string ext, string tool) => tool.StartsWith($"{ext}.", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Security guard for a <c>tool_call</c> Modify. The <c>tool_call</c> hook fires over EVERY
+    /// pending call the model made — native tools (<c>bash</c>, <c>file-write</c>) included — and a
+    /// Modify is otherwise applied verbatim as a full <c>{tool, arguments}</c> replacement. Without
+    /// this guard, enabling ANY extension lets its <c>tool_call</c> hook silently rewrite a native
+    /// call's arguments, or redirect it to a different tool, with zero oversight.
+    /// <para>A Modify is honored only when both hold; otherwise it is downgraded to Continue (the
+    /// ORIGINAL call is preserved) and logged: (1) it does not change which tool runs — the
+    /// <c>tool</c> field is immutable across a hook, so redirecting call A to a different tool is
+    /// never legitimate; (2) the acting extension OWNS the tool being called
+    /// (<c>&lt;ext&gt;.&lt;tool&gt;</c>), so a Modify targeting a native tool or another extension's
+    /// tool is rejected.</para>
+    /// <para>Continue/Block are returned untouched — an extension blocking any call is always safe
+    /// and useful; only MUTATION is scoped.</para>
+    /// </summary>
+    public static HookOutcome GuardToolCallModify(string actingExt, string callTool, HookOutcome outcome)
+    {
+        if (outcome is not HookOutcome.Modify modify)
+        {
+            return outcome;
+        }
+        // (1) The `tool` field is immutable.
+        if ((modify.Patch as JsonObject)?["tool"]?.GetValue<string>() is { } patchedTool && patchedTool != callTool)
+        {
+            Console.Error.WriteLine(
+                $"SEP security: extension \"{actingExt}\" tool_call Modify tried to change the tool "
+                + $"({callTool} -> {patchedTool}); rejected (original call preserved)");
+            return new HookOutcome.Continue();
+        }
+        // (2) The extension may only rewrite the arguments of a tool it owns.
+        if (!ToolOwnedBy(actingExt, callTool))
+        {
+            Console.Error.WriteLine(
+                $"SEP security: extension \"{actingExt}\" tool_call Modify targeted tool \"{callTool}\" "
+                + "it does not own; rejected (original call preserved). Block is still allowed.");
+            return new HookOutcome.Continue();
+        }
+        return outcome;
+    }
+
     /// <summary>Effective event subscriptions: what the extension asked for at handshake, clamped to
     /// what its manifest <c>[capabilities] events</c> declared. An empty declared list means "no
     /// declared filter" → trust the handshake as-is; a non-empty list is the outer bound the
@@ -328,6 +373,12 @@ public sealed class ExtensionHost
         }
         var ctx = Context(Tier.Command);
         JsonNode current = input;
+        // The tool the model actually wants to run, captured once. `tool_call` Modify verdicts are
+        // scoped to this tool via GuardToolCallModify; it never changes across the chain (the guard
+        // enforces immutability).
+        var callTool = hook == HookType.ToolCall
+            ? (input as JsonObject)?["tool"]?.GetValue<string>() ?? string.Empty
+            : string.Empty;
 
         foreach (var ext in _extensions)
         {
@@ -345,6 +396,13 @@ public sealed class ExtensionHost
                 try
                 {
                     var outcome = value.Deserialize<HookOutcome>(SepJson.Options)!;
+                    // Security guard: a `tool_call` Modify may only rewrite the args of a tool the
+                    // acting extension owns, and may never redirect the call. Other hooks are
+                    // unaffected.
+                    if (hook == HookType.ToolCall)
+                    {
+                        outcome = GuardToolCallModify(ext.Name, callTool, outcome);
+                    }
                     step = new HookStep.Replied { Outcome = outcome };
                 }
                 catch

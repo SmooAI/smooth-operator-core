@@ -139,6 +139,55 @@ def fold_hook_chain(hook: HookType, input_value: Any, steps: list[HookStep]) -> 
     return FoldedHook.proceed(current)
 
 
+def tool_owned_by(ext: str, tool: str) -> bool:
+    """Does ``ext`` own ``tool``? Extension tools are namespaced ``<ext>.<tool>`` (the
+    MCP convention). A native tool (``bash``, ``file-write``) has no ``<ext>.`` prefix,
+    so no extension owns it."""
+    return tool.startswith(f"{ext}.")
+
+
+def guard_tool_call_modify(acting_ext: str, call_tool: str, outcome: HookOutcome) -> HookOutcome:
+    """Security guard for a ``tool_call`` modify. The ``tool_call`` hook fires over
+    EVERY pending call the model made — native tools (``bash``, ``file-write``)
+    included — and a ``modify`` is otherwise applied verbatim as a full
+    ``{tool, arguments}`` replacement. Without this guard, enabling ANY extension lets
+    its ``tool_call`` hook silently rewrite a native call's arguments, or redirect it to
+    a different tool, with zero oversight.
+
+    A ``modify`` is honored only when both hold; otherwise it is downgraded to
+    ``continue`` (the ORIGINAL call is preserved) and logged:
+
+    1. It does not change which tool runs — the ``tool`` field is immutable across a
+       hook. Redirecting call A to a different tool is never legitimate.
+    2. The acting extension OWNS the tool being called (``<ext>.<tool>``). A modify
+       targeting a native tool or another extension's tool is rejected.
+
+    ``continue``/``block`` are returned untouched — an extension blocking any call is
+    always safe and useful; only MUTATION is scoped."""
+    if outcome.action != "modify":
+        return outcome
+    # (1) The ``tool`` field is immutable.
+    patched_tool = outcome.patch.get("tool") if isinstance(outcome.patch, dict) else None
+    if isinstance(patched_tool, str) and patched_tool != call_tool:
+        _log.warning(
+            "SEP security: extension %s tool_call modify tried to change the tool (%s -> %s); rejected (original call preserved)",
+            acting_ext,
+            call_tool,
+            patched_tool,
+        )
+        return HookOutcome(action="continue")
+    # (2) The extension may only rewrite the arguments of a tool it owns.
+    if not tool_owned_by(acting_ext, call_tool):
+        _log.warning(
+            "SEP security: extension %s tool_call modify targeted tool %s it does not own; "
+            "rejected (original call preserved). Block is still allowed.",
+            acting_ext,
+            call_tool,
+        )
+        return HookOutcome(action="continue")
+    return outcome
+
+
 def effective_subscriptions(declared: list[str], requested: list[str]) -> set[str]:
     """Effective event subscriptions: what the extension asked for at handshake,
     clamped to what its manifest ``[capabilities] events`` declared. An empty declared
@@ -434,6 +483,13 @@ class ExtensionHost:
         if not self._extensions:
             return FoldedHook.proceed(input_value)
         ctx = self.context(Tier.COMMAND).to_dict()
+        # The tool the model actually wants to run, captured once. ``tool_call``
+        # modify verdicts are scoped to this tool via :func:`guard_tool_call_modify`;
+        # it never changes across the chain (the guard enforces immutability).
+        call_tool = ""
+        if hook is HookType.TOOL_CALL and isinstance(input_value, dict):
+            tool = input_value.get("tool")
+            call_tool = tool if isinstance(tool, str) else ""
         current = input_value
         for ext in self._extensions:
             params = {"hook": hook.as_str(), "context": ctx, "input": current}
@@ -442,6 +498,11 @@ class ExtensionHost:
                 raw = await ext.process.request(method.HOOK, params, timeout)
                 try:
                     outcome = HookOutcome.from_dict(raw)
+                    # Security guard: a ``tool_call`` modify may only rewrite the args
+                    # of a tool the acting extension owns, and may never redirect the
+                    # call. Other hooks are unaffected.
+                    if hook is HookType.TOOL_CALL:
+                        outcome = guard_tool_call_modify(ext.name, call_tool, outcome)
                     step = HookStep.replied(outcome)
                 except (ValueError, TypeError, AttributeError) as exc:
                     _log.warning("extension %s: malformed hook outcome; treating as failure (%s)", ext.name, exc)

@@ -556,6 +556,53 @@ func (h *ExtensionHost) DispatchEvent(event string, payload json.RawMessage) {
 	}
 }
 
+// toolOwnedBy reports whether ext owns tool. Extension tools are namespaced
+// <ext>.<tool> (the MCP convention). A native tool (bash, file-write) has no
+// <ext>. prefix, so no extension owns it.
+func toolOwnedBy(ext, tool string) bool {
+	rest, ok := strings.CutPrefix(tool, ext)
+	return ok && strings.HasPrefix(rest, ".")
+}
+
+// guardToolCallModify is the security guard for a tool_call Modify. The
+// tool_call hook fires over EVERY pending call the model made — native tools
+// (bash, file-write) included — and a modify is otherwise applied verbatim as a
+// full {tool, arguments} replacement. Without this guard, enabling ANY extension
+// lets its tool_call hook silently rewrite a native call's arguments, or
+// redirect it to a different tool, with zero oversight.
+//
+// A modify is honored only when both hold; otherwise it is downgraded to
+// continue (the ORIGINAL call is preserved) and logged:
+//
+//  1. It does not change which tool runs — the tool field is immutable across a
+//     hook. Redirecting call A to a different tool is never legitimate.
+//  2. The acting extension OWNS the tool being called (<ext>.<tool>). A modify
+//     targeting a native tool or another extension's tool is rejected.
+//
+// continue/block are returned untouched — an extension blocking any call is
+// always safe and useful; only MUTATION is scoped.
+func guardToolCallModify(actingExt, callTool string, outcome HookOutcome) HookOutcome {
+	if outcome.Action != ActionModify {
+		return outcome
+	}
+	// (1) The tool field is immutable.
+	var patch struct {
+		Tool *string `json:"tool"`
+	}
+	if err := json.Unmarshal(outcome.Patch, &patch); err == nil && patch.Tool != nil && *patch.Tool != callTool {
+		fmt.Fprintf(os.Stderr, "SEP security: extension %q tool_call Modify tried to change the tool (%s → %s); rejected (original call preserved)\n",
+			actingExt, callTool, *patch.Tool)
+		return HookOutcome{Action: ActionContinue}
+	}
+	// (2) The extension may only rewrite the arguments of a tool it owns.
+	if !toolOwnedBy(actingExt, callTool) {
+		fmt.Fprintf(os.Stderr, "SEP security: extension %q tool_call Modify targeted tool %q it does not own; rejected (original call preserved). Block is still allowed.\n",
+			actingExt, callTool)
+		return HookOutcome{Action: ActionContinue}
+	}
+	return outcome
+}
+
 // RunHook runs a hook across every extension in load order, folding the chain.
 // Each extension sees the prior extension's patch. Fail-open/closed per HookType.
 func (h *ExtensionHost) RunHook(ctx context.Context, hook HookType, input json.RawMessage) FoldedHook {
@@ -564,6 +611,17 @@ func (h *ExtensionHost) RunHook(ctx context.Context, hook HookType, input json.R
 	}
 	current := input
 	cmdCtx := h.Context(TierCommand)
+	// The tool the model actually wants to run, captured once. tool_call Modify
+	// verdicts are scoped to this tool via guardToolCallModify; it never changes
+	// across the chain (the guard enforces immutability).
+	var callTool string
+	if hook == HookToolCall {
+		var in struct {
+			Tool string `json:"tool"`
+		}
+		_ = json.Unmarshal(input, &in)
+		callTool = in.Tool
+	}
 	for _, e := range h.extensions {
 		params, _ := json.Marshal(map[string]any{"hook": hook.String(), "context": cmdCtx, "input": current})
 		timeout := e.hookTimeout
@@ -579,6 +637,12 @@ func (h *ExtensionHost) RunHook(ctx context.Context, hook HookType, input json.R
 			if err := json.Unmarshal(reply, &outcome); err != nil {
 				step = failedStep()
 			} else {
+				// Security guard: a tool_call Modify may only rewrite the args of
+				// a tool the acting extension owns, and may never redirect the
+				// call. Other hooks are unaffected.
+				if hook == HookToolCall {
+					outcome = guardToolCallModify(e.name, callTool, outcome)
+				}
 				step = repliedStep(outcome)
 			}
 		}

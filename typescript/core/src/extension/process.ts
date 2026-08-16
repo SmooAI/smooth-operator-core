@@ -65,9 +65,53 @@ export class DefaultInboundHandler implements InboundHandler {
 export interface SpawnSpec {
     command: string;
     args: string[];
+    /**
+     * Extra env vars the extension legitimately needs (its manifest `[run] env`,
+     * SEP-protocol vars). These are the ONLY env the child sees beyond the small
+     * {@link ENV_PASSTHROUGH} allow-list — the host's full environment is
+     * scrubbed so ambient secrets can't leak in. See {@link buildChildEnv}.
+     */
     env: Record<string, string>;
     /** Working directory for the child (the extension's root). */
     cwd?: string;
+}
+
+/**
+ * The ONLY host environment variables passed through to an extension subprocess.
+ * Everything else is scrubbed (see {@link buildChildEnv}) so ambient secrets —
+ * cloud creds (`AWS_SECRET_ACCESS_KEY`), API tokens, `GITHUB_TOKEN`, … — can
+ * never leak into an extension via inherited env (the lethal-trifecta concern).
+ *
+ * These are launch essentials only, and none is secret:
+ * - `PATH` — resolve a bare-name interpreter (`node`, `python3`) and its own
+ *   subprocess lookups. Without it a non-absolute `command` won't even start.
+ * - `HOME` — interpreters read user config/caches from it; some abort without it.
+ * - `LANG` / `LC_ALL` / `LC_CTYPE` — locale; python3 errors on non-ASCII I/O unset.
+ * - `TMPDIR` — where the child writes temp files (macOS/BSD).
+ * - `TERM` — interpreters that probe for a tty degrade gracefully with it.
+ * - `SystemRoot` — Windows: `node.exe`/`python.exe` fail to start without it.
+ *
+ * SEP-protocol vars and anything else an extension legitimately needs come
+ * through its manifest `[run] env` (carried in {@link SpawnSpec.env}), NOT from
+ * here — so adding a var is a deliberate, per-extension act, never ambient.
+ */
+export const ENV_PASSTHROUGH: readonly string[] = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR', 'TERM', 'SystemRoot'];
+
+/**
+ * Build the exact environment an extension child sees: the {@link ENV_PASSTHROUGH}
+ * allow-list pulled from the host (via `lookup`), then `explicit` (the manifest
+ * env) overlaid on top so an extension can still *set* — but never silently
+ * *inherit* — any var. `lookup` is injected so this is a pure, exhaustively
+ * testable function (the caller passes `process.env`).
+ */
+export function buildChildEnv(lookup: Record<string, string | undefined>, explicit: Record<string, string>): Record<string, string> {
+    const env: Record<string, string> = {};
+    for (const key of ENV_PASSTHROUGH) {
+        const value = lookup[key];
+        if (value !== undefined) env[key] = value;
+    }
+    // Manifest env wins on collision (an extension may legitimately override PATH).
+    return { ...env, ...explicit };
 }
 
 interface Pending {
@@ -157,7 +201,10 @@ export class ExtensionProcess {
     private startConnection(myGeneration: number): Connection {
         const child = spawn(this.spec.command, this.spec.args, {
             cwd: this.spec.cwd,
-            env: { ...process.env, ...this.spec.env },
+            // Scrub the host environment: the child sees only the ENV_PASSTHROUGH
+            // essentials + the manifest's explicit env. An explicit `env` REPLACES
+            // the ambient environment rather than adding to it.
+            env: buildChildEnv(process.env, this.spec.env),
             stdio: ['pipe', 'pipe', 'pipe'],
         }) as ChildProcessWithoutNullStreams;
         child.on('error', (err) => {
