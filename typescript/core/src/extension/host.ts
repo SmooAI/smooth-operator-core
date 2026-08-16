@@ -121,6 +121,54 @@ export function foldHookChain(hook: HookType, input: unknown, steps: readonly Ho
 }
 
 /**
+ * Does `ext` own `tool`? Extension tools are namespaced `<ext>.<tool>` (the MCP
+ * convention). A native tool (`bash`, `file-write`) has no `<ext>.` prefix, so no
+ * extension owns it.
+ */
+export function toolOwnedBy(ext: string, tool: string): boolean {
+    return tool.startsWith(`${ext}.`);
+}
+
+/**
+ * Security guard for a `tool_call` Modify. The `tool_call` hook fires over EVERY
+ * pending call the model made — native tools (`bash`, `file-write`) included —
+ * and a `modify` is otherwise applied verbatim as a full `{tool, arguments}`
+ * replacement. Without this guard, enabling ANY extension lets its `tool_call`
+ * hook silently rewrite a native call's arguments, or redirect it to a different
+ * tool, with zero oversight.
+ *
+ * A `modify` is honored only when both hold; otherwise it is downgraded to
+ * `continue` (the ORIGINAL call is preserved) and logged:
+ *
+ * 1. It does not change which tool runs — the `tool` field is immutable across a
+ *    hook. Redirecting call A to a different tool is never legitimate.
+ * 2. The acting extension OWNS the tool being called (`<ext>.<tool>`). A modify
+ *    targeting a native tool or another extension's tool is rejected.
+ *
+ * `continue`/`block` are returned untouched — an extension blocking any call is
+ * always safe and useful; only MUTATION is scoped.
+ */
+export function guardToolCallModify(actingExt: string, callTool: string, outcome: HookOutcome): HookOutcome {
+    if (outcome.action !== 'modify') return outcome;
+    // (1) The `tool` field is immutable.
+    const patchedTool = (outcome.patch as { tool?: unknown } | null | undefined)?.tool;
+    if (typeof patchedTool === 'string' && patchedTool !== callTool) {
+        console.warn(
+            `SEP security: extension "${actingExt}" tool_call modify tried to change the tool (${callTool} → ${patchedTool}); rejected (original call preserved)`,
+        );
+        return { action: 'continue' };
+    }
+    // (2) The extension may only rewrite the arguments of a tool it owns.
+    if (!toolOwnedBy(actingExt, callTool)) {
+        console.warn(
+            `SEP security: extension "${actingExt}" tool_call modify targeted tool "${callTool}" it does not own; rejected (original call preserved). Block is still allowed.`,
+        );
+        return { action: 'continue' };
+    }
+    return outcome;
+}
+
+/**
  * Effective event subscriptions: what the extension asked for at handshake,
  * clamped to what its manifest `[capabilities] events` declared. An empty declared
  * list means "no declared filter" → trust the handshake as-is; a non-empty list is
@@ -447,6 +495,10 @@ export class ExtensionHost {
     async runHook(hook: HookType, input: unknown): Promise<FoldedHook> {
         if (this.extensions.length === 0) return { kind: 'proceed', value: input };
         const ctx = this.context('command');
+        // The tool the model actually wants to run, captured once. `tool_call`
+        // modify verdicts are scoped to this tool via `guardToolCallModify`; it
+        // never changes across the chain (the guard enforces immutability).
+        const callTool = hook === 'tool_call' ? ((input as { tool?: unknown } | null | undefined)?.tool ?? '') : '';
         let current = input;
         for (const ext of this.extensions) {
             const params = { hook, context: ctx, input: current };
@@ -455,7 +507,14 @@ export class ExtensionHost {
             try {
                 const value = await ext.process.request(method.HOOK, params, timeout);
                 try {
-                    step = { kind: 'replied', outcome: parseHookOutcome(value) };
+                    // Security guard: a `tool_call` modify may only rewrite the
+                    // args of a tool the acting extension owns, and may never
+                    // redirect the call. Other hooks are unaffected.
+                    const outcome = parseHookOutcome(value);
+                    step = {
+                        kind: 'replied',
+                        outcome: hook === 'tool_call' ? guardToolCallModify(ext.name, String(callTool), outcome) : outcome,
+                    };
                 } catch {
                     step = { kind: 'failed' };
                 }

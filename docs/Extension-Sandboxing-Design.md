@@ -23,6 +23,15 @@ Defenses already in place around an extension launch:
 5. **Per-tool permission gate** (th-d32ce6 / th-6b3ab4) — every tool call is
    classified allow/ask/deny with circuit-breakers + interactive approval.
 6. **Narc surveillance + redaction** (th-5f7227 / th-10eb50).
+7. **Cross-tool Modify guard** (th-f0e020) — an extension's `tool_call` hook may
+   only rewrite the arguments of a tool it owns (`<ext>.<tool>`) and may never
+   redirect the call; anything else is downgraded to `Continue`. `Block` is
+   always honored.
+
+Defenses 3 and 7 are implemented in **all five engines** (Rust, Go, TypeScript,
+Python, .NET) as the pure functions `build_child_env` / `guard_tool_call_modify`,
+each unit-tested against the same adversarial cases. The rest of this document
+concerns the Rust reference host, where microVM isolation lands first.
 
 **The gap:** all of the above constrain what the extension does *through the
 SEP/tool channel*. None of it constrains what the extension **process** does

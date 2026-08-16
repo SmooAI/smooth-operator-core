@@ -16,7 +16,9 @@ export * from './protocol.js';
 export * from './manifest.js';
 export {
     backoffFor,
+    buildChildEnv,
     DefaultInboundHandler,
+    ENV_PASSTHROUGH,
     ExtensionProcess,
     type InboundHandler,
     OBSERVE_QUEUE_CAP,
@@ -30,6 +32,7 @@ export {
     ExtensionHost,
     foldHookChain,
     type FoldedHook,
+    guardToolCallModify,
     hookDefaultTimeoutMs,
     hookFailClosed,
     type HostDelegate,
@@ -37,6 +40,7 @@ export {
     type HookType,
     hookTypeFromName,
     type LoadFailure,
+    toolOwnedBy,
     validateCommandContext,
 } from './host.js';
 export { ExtensionTool, TOOL_EXECUTE_TIMEOUT_MS } from './tool_proxy.js';

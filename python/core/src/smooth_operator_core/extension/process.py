@@ -20,6 +20,7 @@ import json
 import logging
 import os
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -76,9 +77,46 @@ class SpawnSpec:
 
     command: str
     args: list[str] = field(default_factory=list)
+    #: Extra env vars the extension legitimately needs (its manifest ``[run] env``,
+    #: SEP-protocol vars). These are the ONLY env the child sees beyond the small
+    #: :data:`ENV_PASSTHROUGH` allow-list — the host's full environment is scrubbed
+    #: so ambient secrets can't leak in. See :func:`build_child_env`.
     env: dict[str, str] = field(default_factory=dict)
     #: Working directory for the child (the extension's root).
     cwd: Optional[Path] = None
+
+
+#: The ONLY host environment variables passed through to an extension subprocess.
+#: Everything else is scrubbed (see :func:`build_child_env`) so ambient secrets —
+#: cloud creds (``AWS_SECRET_ACCESS_KEY``), API tokens, ``GITHUB_TOKEN``, … — can
+#: never leak into an extension via inherited env (the lethal-trifecta concern).
+#:
+#: These are launch essentials only, and none is secret:
+#:
+#: - ``PATH`` — resolve a bare-name interpreter (``node``, ``python3``) and its own
+#:   subprocess lookups. Without it a non-absolute ``command`` won't even start.
+#: - ``HOME`` — interpreters read user config/caches from it; some abort without it.
+#: - ``LANG`` / ``LC_ALL`` / ``LC_CTYPE`` — locale; python3 errors on non-ASCII I/O unset.
+#: - ``TMPDIR`` — where the child writes temp files (macOS/BSD).
+#: - ``TERM`` — interpreters that probe for a tty degrade gracefully with it.
+#: - ``SystemRoot`` — Windows: ``node.exe``/``python.exe`` fail to start without it.
+#:
+#: SEP-protocol vars and anything else an extension legitimately needs come through
+#: its manifest ``[run] env`` (carried in :attr:`SpawnSpec.env`), NOT from here — so
+#: adding a var is a deliberate, per-extension act, never ambient.
+ENV_PASSTHROUGH: tuple[str, ...] = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "SystemRoot")
+
+
+def build_child_env(lookup: Mapping[str, str], explicit: Mapping[str, str]) -> dict[str, str]:
+    """Build the exact environment an extension child sees: the :data:`ENV_PASSTHROUGH`
+    allow-list pulled from the host (via ``lookup``), then ``explicit`` (the manifest
+    env) overlaid on top so an extension can still *set* — but never silently
+    *inherit* — any var. ``lookup`` is injected so this is a pure, exhaustively
+    testable function (the caller passes ``os.environ``)."""
+    env = {key: lookup[key] for key in ENV_PASSTHROUGH if key in lookup}
+    # Manifest env wins on collision (an extension may legitimately override PATH).
+    env.update(explicit)
+    return env
 
 
 class ObserveLane:
@@ -150,7 +188,10 @@ class ExtensionProcess:
     async def _start_connection(self, my_generation: int) -> None:
         """Spawn the child and wire the reader/writer/stderr tasks for one
         generation. Shared by :meth:`spawn` and :meth:`respawn`."""
-        env = {**os.environ, **self._spec.env}
+        # Scrub the host environment: the child sees only the ENV_PASSTHROUGH
+        # essentials + the manifest's explicit env. An explicit ``env`` REPLACES
+        # the ambient environment rather than adding to it.
+        env = build_child_env(os.environ, self._spec.env)
         proc = await asyncio.create_subprocess_exec(
             self._spec.command,
             *self._spec.args,

@@ -28,6 +28,8 @@ from .host import (
     HostDelegate,
     effective_subscriptions,
     fold_hook_chain,
+    guard_tool_call_modify,
+    tool_owned_by,
     validate_command_context,
 )
 from .manifest import (
@@ -42,11 +44,13 @@ from .manifest import (
     project_dir,
 )
 from .process import (
+    ENV_PASSTHROUGH,
     DefaultInboundHandler,
     ExtensionProcess,
     InboundHandler,
     SpawnSpec,
     backoff_for,
+    build_child_env,
 )
 from .protocol import (
     Context,
@@ -100,13 +104,17 @@ __all__ = [
     "SpawnSpec",
     "Tier",
     "WorkspaceInfo",
+    "ENV_PASSTHROUGH",
     "backoff_for",
+    "build_child_env",
     "codes",
     "default_global_dir",
     "discover",
     "effective_subscriptions",
     "fold_hook_chain",
+    "guard_tool_call_modify",
     "method",
     "project_dir",
+    "tool_owned_by",
     "validate_command_context",
 ]
