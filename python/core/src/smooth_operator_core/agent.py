@@ -90,6 +90,12 @@ class AgentOptions:
     #: from the gateway's ``/model/info`` (EPIC th-1cc9fa). Mirrors the Rust
     #: reference's ``AgentConfig.model_max_output`` / ``with_model_ceiling``.
     model_max_output: int | None = None
+    #: Opaque mapping forwarded verbatim as every model request's top-level
+    #: ``metadata`` field (LiteLLM records it on spend logs — e.g. an agent slug
+    #: so per-agent LLM spend is queryable at the gateway). ``None`` or empty ⇒
+    #: the kwarg is never sent, byte-identical to unset. Mirrors the Rust
+    #: engine's ``AgentConfig.with_metadata``.
+    metadata: dict[str, Any] | None = None
     temperature: float = 0.0
     knowledge: Knowledge | None = None
     knowledge_top_k: int = 4
@@ -214,10 +220,17 @@ class ToolCallEvent:
 
 @dataclass(frozen=True)
 class ToolResultEvent:
-    """A tool's result, emitted after it finishes."""
+    """A tool's result, emitted after it finishes.
+
+    ``details`` carries the structured, UI-facing payload a ``post_call`` hook
+    attached to the :class:`~smooth_operator_core.hooks.ToolResult` (``None``
+    when none) — forwarded verbatim and un-truncated, never shown to the model.
+    Mirrors the Rust engine's ``AgentEvent::ToolCallComplete.details``.
+    """
 
     name: str
     result: str
+    details: Any | None = None
     type: str = "tool_result"
 
 
@@ -598,15 +611,17 @@ class SmoothAgent:
                 # Results surface in original call order so the stream stays deterministic.
                 if self._options.parallel_tool_calls and len(tool_calls) > 1:
                     results = await asyncio.gather(
-                        *(self._dispatch_tool(tc["name"], tc["arguments"], search) for tc in tool_calls)
+                        *(self._dispatch_tool_result(tc["name"], tc["arguments"], search) for tc in tool_calls)
                     )
                 else:
-                    results = [await self._dispatch_tool(tc["name"], tc["arguments"], search) for tc in tool_calls]
+                    results = [
+                        await self._dispatch_tool_result(tc["name"], tc["arguments"], search) for tc in tool_calls
+                    ]
                 for tc, result in zip(tool_calls, results):
-                    tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result}
+                    tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result.content}
                     messages.append(tool_msg)
                     turn_messages.append(tool_msg)
-                    yield ToolResultEvent(name=tc["name"], result=result)
+                    yield ToolResultEvent(name=tc["name"], result=result.content, details=result.details)
 
             yield DoneEvent(
                 response=AgentRunResponse(
@@ -643,6 +658,8 @@ class SmoothAgent:
             temperature=self._options.temperature,
             max_tokens=effective_max_tokens(self._options.max_tokens, self._options.model_max_output),
             stream=True,
+            # Empty/None metadata sends nothing — wire-identical to unset (Rust parity).
+            **({"metadata": self._options.metadata} if self._options.metadata else {}),
         )
 
     async def _call_model(self, messages: list[dict[str, Any]], tool_specs: list[dict[str, Any]] | None) -> Any:
@@ -663,6 +680,8 @@ class SmoothAgent:
                     tools=tool_specs,
                     temperature=self._options.temperature,
                     max_tokens=effective_max_tokens(self._options.max_tokens, self._options.model_max_output),
+                    # Empty/None metadata sends nothing — wire-identical to unset (Rust parity).
+                    **({"metadata": self._options.metadata} if self._options.metadata else {}),
                 )
             except Exception:
                 if attempt >= self._options.max_retries:
@@ -673,14 +692,25 @@ class SmoothAgent:
                     await asyncio.sleep(delay_ms / 1000)
 
     async def _dispatch_tool(self, name: str, raw_arguments: str, search: ToolSearch | None) -> str:
+        return (await self._dispatch_tool_result(name, raw_arguments, search)).content
+
+    async def _dispatch_tool_result(self, name: str, raw_arguments: str, search: ToolSearch | None) -> ToolResult:
+        """``_dispatch_tool`` returning the full :class:`ToolResult`, so callers
+        that surface results to a UI (:meth:`run_stream`) can forward the
+        structured ``details`` a ``post_call`` hook attached — the model itself
+        only ever sees ``content``. Mirrors the Rust engine's
+        ``AgentEvent::ToolCallComplete.details``."""
         import json
+
+        def err_result(content: str) -> ToolResult:
+            return ToolResult(content=content, is_error=True)
 
         # Enforce the role's tool clearance before dispatch: a forbidden tool is
         # never executed — the model is told it isn't permitted, mirroring how the
         # loop surfaces other tool errors.
         clearance = self._options.clearance
         if clearance is not None and not clearance.is_allowed(name):
-            return f"error: tool '{name}' is not permitted for this role"
+            return err_result(f"error: tool '{name}' is not permitted for this role")
 
         # Resolve the tool: eager tools first, then the built-in ``tool_search``
         # meta-tool, then deferred tools that have been promoted. An unpromoted
@@ -692,11 +722,11 @@ class SmoothAgent:
             else:
                 tool = search.tool_by_name(name)
         if tool is None:
-            return f"error: unknown tool '{name}'"
+            return err_result(f"error: unknown tool '{name}'")
         try:
             args = json.loads(raw_arguments) if raw_arguments else {}
         except json.JSONDecodeError:
-            return f"error: tool '{name}' received invalid JSON arguments"
+            return err_result(f"error: tool '{name}' received invalid JSON arguments")
 
         # Human-in-the-loop: pause for approval before running a flagged (write/sensitive)
         # tool. A denial is fed back to the model as a result — the tool never runs.
@@ -706,7 +736,7 @@ class SmoothAgent:
             request = HumanApprovalRequest(tool_name=name, arguments=args, prompt=f"Approve calling tool '{name}'?")
             decision = await gate.request_approval(request)
             if not decision.is_approved:
-                return f"Denied by human: {decision.reason or 'no reason given'}"
+                return err_result(f"Denied by human: {decision.reason or 'no reason given'}")
 
         # Tool-call lifecycle hooks (parity with the Rust ``ToolHook`` trait). The
         # effective chain (built in __init__) prepends a PermissionHook when a
@@ -722,7 +752,7 @@ class SmoothAgent:
             try:
                 await hook.pre_call(call)
             except Exception as exc:  # noqa: BLE001 — a blocking hook informs the model, it doesn't crash the turn
-                return f"blocked by hook: {exc}"
+                return err_result(f"blocked by hook: {exc}")
 
         try:
             result = ToolResult(content=await tool.execute(call.arguments), is_error=False)
@@ -738,7 +768,7 @@ class SmoothAgent:
             except Exception:  # noqa: BLE001 — post-hook failure must not surface; result still returns
                 pass
 
-        return result.content
+        return result
 
 
 def delegate_tool(name: str, description: str, child: SmoothAgent, task_property: str = "task") -> FunctionTool:

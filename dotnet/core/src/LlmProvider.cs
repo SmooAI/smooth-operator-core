@@ -102,7 +102,11 @@ public sealed class MockLlmProvider : IChatClient
 
     private ChatResponse Next(IEnumerable<ChatMessage> messages, ChatOptions? options)
     {
-        _recorded.Add(new RecordedCall(messages.ToList(), options?.Tools?.ToList(), options?.MaxOutputTokens));
+        _recorded.Add(new RecordedCall(
+            messages.ToList(),
+            options?.Tools?.ToList(),
+            options?.MaxOutputTokens,
+            options?.AdditionalProperties?.TryGetValue("metadata", out var md) == true ? md : null));
         if (_script.Count == 0)
         {
             throw new InvalidOperationException("MockLlmProvider: no scripted response left.");
@@ -116,8 +120,10 @@ public sealed class MockLlmProvider : IChatClient
     }
 
     /// <summary>One request the mock received, captured for assertions. <see cref="MaxOutputTokens"/>
-    /// is the request's clamped <c>max_tokens</c> (null when the agent left it unset).</summary>
-    public sealed record RecordedCall(IList<ChatMessage> Messages, IReadOnlyList<AITool>? Tools, int? MaxOutputTokens = null);
+    /// is the request's clamped <c>max_tokens</c> (null when the agent left it unset).
+    /// <see cref="Metadata"/> is the request's top-level <c>metadata</c> object pulled from
+    /// <see cref="ChatOptions.AdditionalProperties"/> (null when the agent sent none).</summary>
+    public sealed record RecordedCall(IList<ChatMessage> Messages, IReadOnlyList<AITool>? Tools, int? MaxOutputTokens = null, object? Metadata = null);
 
     private readonly record struct Outcome(bool IsError, ChatResponse? Response, string? ErrorMessage)
     {

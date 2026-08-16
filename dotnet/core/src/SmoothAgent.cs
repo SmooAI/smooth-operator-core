@@ -314,7 +314,8 @@ public sealed class SmoothAgent
         // max_tokens unset). Keeps a budget from exceeding what the model can physically emit
         // (EPIC th-1cc9fa).
         var maxTokens = _options.EffectiveMaxTokens;
-        if (tools.Count == 0 && maxTokens is null)
+        var metadata = _options.Metadata is { Count: > 0 } m ? m : null;
+        if (tools.Count == 0 && maxTokens is null && metadata is null)
         {
             return null;
         }
@@ -327,6 +328,12 @@ public sealed class SmoothAgent
         if (maxTokens is { } budget)
         {
             chatOptions.MaxOutputTokens = budget;
+        }
+        if (metadata is not null)
+        {
+            // Empty metadata never reaches here — unset stays byte-identical on the
+            // wire (Rust parity: with_metadata filters empty maps to None).
+            chatOptions.AdditionalProperties = new AdditionalPropertiesDictionary { ["metadata"] = metadata };
         }
         return chatOptions;
     }
