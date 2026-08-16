@@ -187,6 +187,13 @@ func DelegateTool(name, description string, child *SmoothAgent) Tool {
 
 // AgentOptions configures a SmoothAgent turn. Mirrors the sibling cores' options.
 type AgentOptions struct {
+	// Extensions wires a SEP extension host into this agent — the Go sibling of
+	// Rust's `Agent::with_extension_host`. Supply it with
+	// `extension.NewAgentBridge(host)`. Its tools are merged into the agent's
+	// tool set, and its hook lanes run at the same points Rust runs them.
+	// nil (the default) leaves the loop exactly as it was before extensions.
+	Extensions ExtensionHooks
+
 	Instructions  string
 	Model         string
 	MaxIterations int
@@ -360,6 +367,17 @@ func NewSmoothAgent(client ChatClient, options AgentOptions) *SmoothAgent {
 	if client == nil {
 		panic("core: client is required")
 	}
+	// Extension tools join as ORDINARY tools (already namespaced
+	// `<extension>.<tool>`), so they are visible to the model, dispatched, and
+	// permission-gated by exactly the same machinery as native tools — the same
+	// no-special-casing property the Rust host has. Eager tools go into the
+	// visible set; deferred ones stay hidden until `tool_search` promotes them.
+	if options.Extensions != nil {
+		options.Tools = append(options.Tools, options.Extensions.ExtensionTools()...)
+		options.DeferredTools = append(options.DeferredTools, options.Extensions.ExtensionDeferredTools()...)
+	}
+	// NOTE: deferred tools are deliberately NOT in byName — an unpromoted
+	// deferred tool must resolve to nothing until `tool_search` promotes it.
 	byName := make(map[string]Tool, len(options.Tools))
 	for _, t := range options.Tools {
 		byName[t.Name()] = t
@@ -468,6 +486,8 @@ func (a *SmoothAgent) RunThread(ctx context.Context, message string, thread *Smo
 }
 
 func (a *SmoothAgent) run(ctx context.Context, message string, history []ChatMessage, thread *SmoothAgentThread) (AgentRunResponse, error) {
+	a.sepDispatch(sepTurnStart, map[string]any{"agent_id": a.options.Model})
+
 	messages := make([]ChatMessage, 0, len(history)+2)
 	if system := a.buildSystem(message); system != "" {
 		messages = append(messages, ChatMessage{Role: "system", Content: system})
@@ -566,10 +586,12 @@ func (a *SmoothAgent) run(ctx context.Context, message string, history []ChatMes
 
 		// Stop early if this turn has hit its token/cost budget.
 		if tracker.Exceeds(a.options.Budget) {
+			a.sepTurnComplete(iteration, lastText)
 			return AgentRunResponse{Text: lastText, Iterations: iteration, ToolCalls: toolCalls, Usage: tracker.Usage, CostUSD: tracker.CostUSD, BudgetExceeded: true}, nil
 		}
 
 		if len(resp.ToolCalls) == 0 {
+			a.sepTurnComplete(iteration, lastText)
 			return AgentRunResponse{Text: lastText, Iterations: iteration, ToolCalls: toolCalls, Usage: tracker.Usage, CostUSD: tracker.CostUSD}, nil
 		}
 
@@ -578,10 +600,21 @@ func (a *SmoothAgent) run(ctx context.Context, message string, history []ChatMes
 		// one — but always append the results in the original ToolCalls order so the
 		// transcript stays deterministic. dispatchTool turns failures/denials into a
 		// result string, so a panicking sibling can't abort the others.
-		results := make([]string, len(resp.ToolCalls))
-		if a.options.ParallelToolCalls && len(resp.ToolCalls) > 1 {
+		// SEP `tool_call` hook: fold over EVERY pending call before any of them
+		// run, so an extension can veto or rewrite arguments. Vetoed calls never
+		// reach dispatchTool; their veto reason becomes the tool result so the
+		// model learns why. With no host configured this returns the input
+		// untouched. The registry's own gates still apply afterward.
+		planned, sepBlocks := a.sepToolCallPlan(ctx, resp.ToolCalls)
+
+		results := make([]string, len(planned))
+		if a.options.ParallelToolCalls && len(planned) > 1 {
 			var wg sync.WaitGroup
-			for i, tc := range resp.ToolCalls {
+			for i, tc := range planned {
+				if reason, blocked := sepBlocks[tc.ID]; blocked {
+					results[i] = sepBlockedResult(reason)
+					continue
+				}
 				wg.Add(1)
 				go func(i int, tc ToolCall) {
 					defer wg.Done()
@@ -590,17 +623,22 @@ func (a *SmoothAgent) run(ctx context.Context, message string, history []ChatMes
 			}
 			wg.Wait()
 		} else {
-			for i, tc := range resp.ToolCalls {
+			for i, tc := range planned {
+				if reason, blocked := sepBlocks[tc.ID]; blocked {
+					results[i] = sepBlockedResult(reason)
+					continue
+				}
 				results[i] = a.dispatchTool(ctx, tc, search)
 			}
 		}
-		for i, tc := range resp.ToolCalls {
+		for i, tc := range planned {
 			toolMsg := ChatMessage{Role: "tool", ToolCallID: tc.ID, Content: results[i]}
 			messages = append(messages, toolMsg)
 			turnMessages = append(turnMessages, toolMsg)
 		}
 	}
 
+	a.sepTurnComplete(maxIter, lastText)
 	return AgentRunResponse{Text: lastText, Iterations: maxIter, ToolCalls: toolCalls, Usage: tracker.Usage, CostUSD: tracker.CostUSD}, nil
 }
 
