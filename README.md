@@ -217,7 +217,7 @@ let agent = Agent::new(config, registry)
     .with_deny_policy(Arc::new(policy));
 ```
 
-A deny-policy match is a **hard deny of circuit-breaker tier** — no stored grant waives it, no mode downgrades it. That's the difference between "we asked the model nicely" and "it structurally cannot." And it's identical across all five languages.
+A deny-policy match is a **hard deny of circuit-breaker tier** — no stored grant waives it, no mode downgrades it. That's the difference between "we asked the model nicely" and "it structurally cannot." The deny-policy surface (TOML rules + predicate seam + permission gate) is ported to all five languages; the deepest hardening around *extensions* (subprocess sandboxing, integrity gates) is furthest along in Rust — see [docs/Polyglot-Engines.md](./docs/Polyglot-Engines.md) for the honest parity picture.
 
 ---
 
