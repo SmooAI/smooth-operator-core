@@ -67,6 +67,9 @@ type wireRequest struct {
 	Temperature float64       `json:"temperature"`
 	MaxTokens   int           `json:"max_tokens"`
 	Stream      bool          `json:"stream,omitempty"`
+	// Top-level OpenAI-compat `metadata` object — LiteLLM records it on spend
+	// logs. omitempty keeps the wire byte-identical when unset (Rust parity).
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 // wireStreamChunk is one OpenAI streaming chunk (`data: {...}` SSE payload).
@@ -105,7 +108,7 @@ type wireResponse struct {
 
 // buildWireRequest translates a ChatRequest into the OpenAI wire shape.
 func buildWireRequest(req ChatRequest, stream bool) wireRequest {
-	wreq := wireRequest{Model: req.Model, Temperature: req.Temperature, MaxTokens: req.MaxTokens, Stream: stream}
+	wreq := wireRequest{Model: req.Model, Temperature: req.Temperature, MaxTokens: req.MaxTokens, Stream: stream, Metadata: normalizeMetadata(req.Metadata)}
 	for _, m := range req.Messages {
 		wm := wireMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
 		for _, tc := range m.ToolCalls {

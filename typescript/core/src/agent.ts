@@ -102,6 +102,14 @@ export interface AgentOptions {
      * (EPIC th-1cc9fa).
      */
     modelMaxOutput?: number;
+    /**
+     * Opaque object forwarded verbatim as every model request's top-level
+     * `metadata` field (LiteLLM records it on spend logs — e.g. an agent slug so
+     * per-agent LLM spend is queryable at the gateway). Omitted / empty ⇒ the
+     * field never appears on the wire, byte-identical to unset. Mirrors the Rust
+     * engine's `AgentConfig.with_metadata`.
+     */
+    metadata?: Record<string, unknown>;
     temperature?: number;
     knowledge?: Knowledge;
     knowledgeTopK?: number;
@@ -294,7 +302,18 @@ export interface ChatClientLike {
 export type StreamEvent =
     | { type: 'text'; text: string }
     | { type: 'tool_call'; name: string; arguments: string }
-    | { type: 'tool_result'; name: string; result: string }
+    | {
+          type: 'tool_result';
+          name: string;
+          result: string;
+          /**
+           * Structured, UI-facing payload a postCall hook attached to the
+           * {@link ToolResult} (undefined when none) — forwarded verbatim and
+           * un-truncated, never shown to the model. Mirrors the Rust engine's
+           * `AgentEvent::ToolCallComplete.details`.
+           */
+          details?: unknown;
+      }
     | { type: 'done'; response: AgentRunResponse };
 
 /** An assistant message assembled from streamed {@link ChatChunk} deltas. */
@@ -326,6 +345,15 @@ function sleep(ms: number): Promise<void> {
  * `undefined` / `0` (or any non-positive value) ⇒ passthrough (no clamp), mirroring
  * the Rust engine's `LlmClient::effective_max_tokens` (EPIC th-1cc9fa).
  */
+/**
+ * Spreadable `{ metadata }` fragment for a model request body. Empty or absent
+ * metadata yields `{}` so the wire stays byte-identical when unset (Rust
+ * parity: `with_metadata` filters empty maps to `None`).
+ */
+export function metadataField(metadata?: Record<string, unknown>): { metadata?: Record<string, unknown> } {
+    return metadata && Object.keys(metadata).length > 0 ? { metadata } : {};
+}
+
 export function effectiveMaxTokens(configured: number, ceiling?: number): number {
     if (ceiling === undefined || ceiling <= 0) return configured;
     return Math.max(1, Math.min(configured, ceiling));
@@ -468,6 +496,7 @@ export class SmoothAgent {
                     ...(tools ? { tools } : {}),
                     temperature: this.options.temperature ?? DEFAULTS.temperature,
                     max_tokens: effectiveMaxTokens(this.options.maxTokens ?? DEFAULTS.maxTokens, this.options.modelMaxOutput),
+                    ...metadataField(this.options.metadata),
                 });
                 tracker.record(model, extractUsage(response.usage), this.options.pricing);
                 const choice = response.choices[0].message;
@@ -594,6 +623,7 @@ export class SmoothAgent {
                     ...(tools ? { tools } : {}),
                     temperature: this.options.temperature ?? DEFAULTS.temperature,
                     max_tokens: effectiveMaxTokens(this.options.maxTokens ?? DEFAULTS.maxTokens, this.options.modelMaxOutput),
+                    ...metadataField(this.options.metadata),
                     stream: true,
                 });
                 for await (const chunk of stream) {
@@ -656,20 +686,20 @@ export class SmoothAgent {
                 // Reuse the SAME dispatch path as `run` (clearance, human-gate, tool_search,
                 // JSON parsing, error-to-string, parallelToolCalls). Results are surfaced in
                 // original call order so the event stream stays deterministic.
-                let results: string[];
+                let results: ToolResult[];
                 if (this.options.parallelToolCalls && calls.length > 1) {
-                    results = await Promise.all(calls.map((tc) => this.dispatchTool(tc.function.name, tc.function.arguments, search, tc.id)));
+                    results = await Promise.all(calls.map((tc) => this.dispatchToolResult(tc.function.name, tc.function.arguments, search, tc.id)));
                 } else {
                     results = [];
                     for (const tc of calls) {
-                        results.push(await this.dispatchTool(tc.function.name, tc.function.arguments, search, tc.id));
+                        results.push(await this.dispatchToolResult(tc.function.name, tc.function.arguments, search, tc.id));
                     }
                 }
                 for (let i = 0; i < calls.length; i++) {
-                    const toolMsg: Record<string, unknown> = { role: 'tool', tool_call_id: calls[i].id, content: results[i] };
+                    const toolMsg: Record<string, unknown> = { role: 'tool', tool_call_id: calls[i].id, content: results[i].content };
                     messages.push(toolMsg);
                     turnMessages.push(toolMsg);
-                    yield { type: 'tool_result', name: calls[i].function.name, result: results[i] };
+                    yield { type: 'tool_result', name: calls[i].function.name, result: results[i].content, details: results[i].details };
                 }
             }
 
@@ -710,12 +740,23 @@ export class SmoothAgent {
     }
 
     private async dispatchTool(name: string, rawArgs: string, search?: ToolSearch, callId = ''): Promise<string> {
+        return (await this.dispatchToolResult(name, rawArgs, search, callId)).content;
+    }
+
+    /**
+     * dispatchTool returning the full {@link ToolResult}, so callers that surface
+     * results to a UI (runStream) can forward the structured `details` a postCall
+     * hook attached — the model itself only ever sees `content`. Mirrors the Rust
+     * engine's `AgentEvent::ToolCallComplete.details`.
+     */
+    private async dispatchToolResult(name: string, rawArgs: string, search?: ToolSearch, callId = ''): Promise<ToolResult> {
+        const errResult = (content: string): ToolResult => ({ toolCallId: callId, content, isError: true });
         // Enforce the role's tool clearance before dispatch: a forbidden tool is
         // never executed — the model is told it isn't permitted, mirroring how the
         // loop surfaces other tool errors.
         const clearance = this.options.clearance;
         if (clearance && !clearance.isAllowed(name)) {
-            return `error: tool '${name}' is not permitted for this role`;
+            return errResult(`error: tool '${name}' is not permitted for this role`);
         }
 
         // Resolve the tool: eager tools first, then the built-in `tool_search`
@@ -725,12 +766,12 @@ export class SmoothAgent {
         if (!tool && search) {
             tool = name === search.name ? search : search.toolByName(name);
         }
-        if (!tool) return `error: unknown tool '${name}'`;
+        if (!tool) return errResult(`error: unknown tool '${name}'`);
         let args: Record<string, unknown>;
         try {
             args = rawArgs ? JSON.parse(rawArgs) : {};
         } catch {
-            return `error: tool '${name}' received invalid JSON arguments`;
+            return errResult(`error: tool '${name}' received invalid JSON arguments`);
         }
 
         // Native permission gate: classify the call (circuit-breakers → hard deny,
@@ -741,7 +782,7 @@ export class SmoothAgent {
             try {
                 await this.permissionHook.preCall({ id: name, name, arguments: args });
             } catch (err) {
-                return `error: tool '${name}' blocked by permission policy: ${err instanceof Error ? err.message : String(err)}`;
+                return errResult(`error: tool '${name}' blocked by permission policy: ${err instanceof Error ? err.message : String(err)}`);
             }
         }
 
@@ -751,7 +792,7 @@ export class SmoothAgent {
         if (gate && this.options.requiresApproval?.(name, args)) {
             const decision = await gate({ toolName: name, arguments: args, prompt: `Approve calling tool '${name}'?` });
             if (!isApproved(decision)) {
-                return `Denied by human: ${decision.reason ?? 'no reason given'}`;
+                return errResult(`Denied by human: ${decision.reason ?? 'no reason given'}`);
             }
         }
 
@@ -765,7 +806,7 @@ export class SmoothAgent {
             try {
                 await hook.preCall(call);
             } catch (err) {
-                return `blocked by hook: ${err instanceof Error ? err.message : String(err)}`;
+                return errResult(`blocked by hook: ${err instanceof Error ? err.message : String(err)}`);
             }
         }
 
@@ -792,7 +833,7 @@ export class SmoothAgent {
             }
         }
 
-        return result.content;
+        return result;
     }
 }
 

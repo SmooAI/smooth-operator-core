@@ -35,10 +35,15 @@ class ToolResult:
     """The result of executing a tool, handed to :meth:`ToolHook.post_call` as a
     **mutable** object. Rewriting :attr:`content` in a ``post_call`` hook is the
     redaction seam — the mutated content is what reaches the model and transcript.
-    Mirrors the Rust ``ToolResult`` (content + ``is_error``)."""
+    Mirrors the Rust ``ToolResult`` (content + ``is_error`` + ``details``).
+
+    :attr:`details` is optional structured, UI-facing data (diffs, tables, trace
+    ids) a ``post_call`` hook may attach. It is forwarded verbatim on the
+    stream's ``tool_result`` event and never reaches the model."""
 
     content: str
     is_error: bool = False
+    details: Any | None = None
 
 
 class ToolHook:

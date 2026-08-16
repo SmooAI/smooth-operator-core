@@ -39,6 +39,13 @@ type ChatRequest struct {
 	Tools       []ToolSpec
 	Temperature float64
 	MaxTokens   int
+	// Metadata is an optional opaque object forwarded as the top-level
+	// `metadata` field of the OpenAI-compatible request body (LiteLLM records
+	// it on spend logs, giving per-caller cost attribution at the gateway).
+	// nil means the field is omitted from the wire entirely; the agent
+	// normalizes an empty map to nil so unset stays byte-identical. Mirrors
+	// the Rust engine's ChatRequest.metadata (with_metadata).
+	Metadata map[string]any
 }
 
 // ChatResponse is the assistant's reply (content and/or tool calls).
@@ -115,11 +122,16 @@ const (
 //     UNLESS the turn ends in an error (see RunStream's error contract).
 type StreamEvent struct {
 	Kind      StreamEventKind
-	Text      string           // StreamText
-	Name      string           // StreamToolCall / StreamToolResult
-	Arguments string           // StreamToolCall
-	Result    string           // StreamToolResult
-	Response  AgentRunResponse // StreamDone
+	Text      string // StreamText
+	Name      string // StreamToolCall / StreamToolResult
+	Arguments string // StreamToolCall
+	Result    string // StreamToolResult
+	// Details carries the structured, UI-facing payload a PostCall hook
+	// attached to the ToolResult (nil when none) — forwarded verbatim and
+	// un-truncated on StreamToolResult, never shown to the model. Mirrors the
+	// Rust engine's AgentEvent::ToolCallComplete.details.
+	Details  any              // StreamToolResult
+	Response AgentRunResponse // StreamDone
 }
 
 // Tool is a callable the agent may invoke.
@@ -280,6 +292,22 @@ type AgentOptions struct {
 	// runs after with a mutable *ToolResult it may redact. Nil (the default) → no
 	// hooks, behaviour unchanged. Mirrors the Rust engine's ToolRegistry hook chain.
 	Hooks []ToolHook
+	// Metadata is forwarded verbatim as every model request's top-level
+	// `metadata` object (LiteLLM spend-log attribution — e.g. an agent slug so
+	// per-agent LLM spend is queryable at the gateway). A nil or empty map
+	// sends nothing: the wire stays byte-identical when unset. Mirrors the
+	// Rust engine's AgentConfig.with_metadata.
+	Metadata map[string]any
+}
+
+// normalizeMetadata maps an empty metadata object to nil so that "unset" and
+// "empty" are byte-identical on the wire (Rust parity: with_metadata filters
+// empty maps to None).
+func normalizeMetadata(m map[string]any) map[string]any {
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }
 
 // AgentRunResponse is the result of a turn.
@@ -524,6 +552,7 @@ func (a *SmoothAgent) run(ctx context.Context, message string, history []ChatMes
 			Tools:       tools,
 			Temperature: a.options.Temperature,
 			MaxTokens:   maxTokens,
+			Metadata:    normalizeMetadata(a.options.Metadata),
 		})
 		if err != nil {
 			return AgentRunResponse{}, fmt.Errorf("model call: %w", err)
@@ -713,6 +742,7 @@ func (a *SmoothAgent) runStream(ctx context.Context, sc StreamingChatClient, mes
 		chunks, err := sc.ChatStream(ctx, ChatRequest{
 			Model: model, Messages: messages, Tools: tools,
 			Temperature: a.options.Temperature, MaxTokens: maxTokens,
+			Metadata: normalizeMetadata(a.options.Metadata),
 		})
 		if err != nil {
 			return fmt.Errorf("model stream: %w", err)
@@ -776,27 +806,27 @@ func (a *SmoothAgent) runStream(ctx context.Context, sc StreamingChatClient, mes
 		// Reuse the SAME dispatch path as Run (clearance, human-gate, tool_search,
 		// JSON parsing, error-to-string, ParallelToolCalls). Results surface in
 		// original call order so the event stream stays deterministic.
-		results := make([]string, len(assembled))
+		results := make([]ToolResult, len(assembled))
 		if a.options.ParallelToolCalls && len(assembled) > 1 {
 			var wg sync.WaitGroup
 			for i, tc := range assembled {
 				wg.Add(1)
 				go func(i int, tc ToolCall) {
 					defer wg.Done()
-					results[i] = a.dispatchTool(ctx, tc, search)
+					results[i] = a.dispatchToolResult(ctx, tc, search)
 				}(i, tc)
 			}
 			wg.Wait()
 		} else {
 			for i, tc := range assembled {
-				results[i] = a.dispatchTool(ctx, tc, search)
+				results[i] = a.dispatchToolResult(ctx, tc, search)
 			}
 		}
 		for i, tc := range assembled {
-			toolMsg := ChatMessage{Role: "tool", ToolCallID: tc.ID, Content: results[i]}
+			toolMsg := ChatMessage{Role: "tool", ToolCallID: tc.ID, Content: results[i].Content}
 			messages = append(messages, toolMsg)
 			turnMessages = append(turnMessages, toolMsg)
-			out <- StreamEvent{Kind: StreamToolResult, Name: tc.Name, Result: results[i]}
+			out <- StreamEvent{Kind: StreamToolResult, Name: tc.Name, Result: results[i].Content, Details: results[i].Details}
 		}
 	}
 
@@ -834,11 +864,22 @@ func (a *SmoothAgent) callModel(ctx context.Context, req ChatRequest) (ChatRespo
 }
 
 func (a *SmoothAgent) dispatchTool(ctx context.Context, tc ToolCall, search *ToolSearch) string {
+	return a.dispatchToolResult(ctx, tc, search).Content
+}
+
+// dispatchToolResult is dispatchTool returning the full ToolResult, so callers
+// that surface results to a UI (runStream) can forward the structured Details a
+// PostCall hook attached — the model itself only ever sees Content. Mirrors the
+// Rust engine's AgentEvent::ToolCallComplete.details.
+func (a *SmoothAgent) dispatchToolResult(ctx context.Context, tc ToolCall, search *ToolSearch) ToolResult {
+	errResult := func(msg string) ToolResult {
+		return ToolResult{ToolCallID: tc.ID, Content: msg, IsError: true}
+	}
 	// Enforce the role's tool clearance before dispatch: a forbidden tool is never
 	// executed — the model is told it isn't permitted, mirroring how the loop
 	// surfaces other tool errors.
 	if a.options.Clearance != nil && !a.options.Clearance.IsAllowed(tc.Name) {
-		return fmt.Sprintf("error: tool '%s' is not permitted for this role", tc.Name)
+		return errResult(fmt.Sprintf("error: tool '%s' is not permitted for this role", tc.Name))
 	}
 
 	// Resolve the tool: eager tools first, then the built-in tool_search meta-tool,
@@ -853,12 +894,12 @@ func (a *SmoothAgent) dispatchTool(ctx context.Context, tc ToolCall, search *Too
 		}
 	}
 	if !ok {
-		return fmt.Sprintf("error: unknown tool '%s'", tc.Name)
+		return errResult(fmt.Sprintf("error: unknown tool '%s'", tc.Name))
 	}
 	args := map[string]any{}
 	if tc.Arguments != "" {
 		if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil {
-			return fmt.Sprintf("error: tool '%s' received invalid JSON arguments", tc.Name)
+			return errResult(fmt.Sprintf("error: tool '%s' received invalid JSON arguments", tc.Name))
 		}
 	}
 
@@ -867,7 +908,7 @@ func (a *SmoothAgent) dispatchTool(ctx context.Context, tc ToolCall, search *Too
 	// fail-closed Ask) is fed back to the model as a result — the tool never runs.
 	if a.permGate != nil {
 		if err := a.permGate.Check(ctx, tc.Name, args); err != nil {
-			return fmt.Sprintf("error: tool '%s' %v", tc.Name, err)
+			return errResult(fmt.Sprintf("error: tool '%s' %v", tc.Name, err))
 		}
 	}
 
@@ -877,14 +918,14 @@ func (a *SmoothAgent) dispatchTool(ctx context.Context, tc ToolCall, search *Too
 		req := HumanApprovalRequest{ToolName: tc.Name, Arguments: args, Prompt: fmt.Sprintf("Approve calling tool '%s'?", tc.Name)}
 		decision, err := a.options.HumanGate(ctx, req)
 		if err != nil {
-			return fmt.Sprintf("error: human gate for tool '%s' failed: %v", tc.Name, err)
+			return errResult(fmt.Sprintf("error: human gate for tool '%s' failed: %v", tc.Name, err))
 		}
 		if !decision.IsApproved() {
 			reason := decision.Reason
 			if reason == "" {
 				reason = "no reason given"
 			}
-			return fmt.Sprintf("Denied by human: %s", reason)
+			return errResult(fmt.Sprintf("Denied by human: %s", reason))
 		}
 	}
 
@@ -892,7 +933,7 @@ func (a *SmoothAgent) dispatchTool(ctx context.Context, tc ToolCall, search *Too
 	// (the model is told, mirroring the Rust engine's "blocked by hook" result).
 	for _, h := range a.options.Hooks {
 		if err := h.PreCall(ctx, tc); err != nil {
-			return fmt.Sprintf("blocked by hook: %v", err)
+			return errResult(fmt.Sprintf("blocked by hook: %v", err))
 		}
 	}
 
@@ -910,5 +951,5 @@ func (a *SmoothAgent) dispatchTool(ctx context.Context, tc ToolCall, search *Too
 	for _, h := range a.options.Hooks {
 		_ = h.PostCall(ctx, tc, &result)
 	}
-	return result.Content
+	return result
 }

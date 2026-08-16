@@ -13,6 +13,11 @@ type ToolResult struct {
 	Content string
 	// IsError is true when the tool failed (or a PreCall hook blocked it).
 	IsError bool
+	// Details is optional structured, UI-facing data (diffs, tables, trace
+	// ids) a PostCall hook may attach. It is forwarded verbatim on the
+	// stream's StreamToolResult event and never reaches the model. Mirrors
+	// the Rust engine's ToolResult.details.
+	Details any
 }
 
 // ToolHook observes and can gate/redact tool calls, mirroring the Rust engine's

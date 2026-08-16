@@ -25,6 +25,16 @@ public sealed class AgentOptions
     public int MaxIterations { get; set; } = 8;
 
     /// <summary>
+    /// Opaque values forwarded verbatim as every model request's top-level <c>metadata</c>
+    /// object (via <see cref="ChatOptions.AdditionalProperties"/> — an OpenAI-compat client
+    /// serializes it as the request's <c>metadata</c> field, which LiteLLM records on spend
+    /// logs, e.g. an agent slug so per-agent LLM spend is queryable at the gateway).
+    /// <c>null</c> or empty ⇒ nothing is sent, byte-identical to unset. Mirrors the Rust
+    /// engine's <c>AgentConfig.with_metadata</c>.
+    /// </summary>
+    public IReadOnlyDictionary<string, object?>? Metadata { get; set; }
+
+    /// <summary>
     /// Budget cap on the tokens the model may EMIT per turn (the request's <c>max_tokens</c>).
     /// <c>null</c> (the default) leaves it unset — the provider's own default applies, behavior
     /// unchanged. Mirrors the Rust engine's <c>LlmConfig.max_tokens</c>. Always clamped down to
