@@ -615,6 +615,16 @@ pub enum StreamEvent {
         arguments_chunk: String,
     },
     Usage(Usage),
+    /// Authoritative per-request cost from the gateway's response headers
+    /// (`x-litellm-response-cost` et al, see `parse_gateway_cost`). Headers are
+    /// only readable before the SSE body is consumed, so the streaming paths
+    /// parse them up front and emit this as the first event. Pearl th-11f9bb:
+    /// without it every streamed turn fell back to local `ModelPricing`, which
+    /// prices aliased routes (`smooth-*`) at $0 — the source of $0 cost in the
+    /// bench leaderboard, `th code`'s status bar and the daemon spend ledger.
+    Cost {
+        usd: f64,
+    },
     /// Concrete upstream model the gateway resolved this stream to.
     /// Carries the `model` field from the SSE chunks. Pearl th-a10c2d.
     Model {
@@ -1201,11 +1211,19 @@ impl LlmClient {
             }
         };
 
+        // Must be read BEFORE the body is consumed. Pearl th-11f9bb.
+        let gateway_cost_usd = parse_gateway_cost(resp.headers());
         let byte_stream = resp.bytes_stream();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<StreamEvent>>(256);
 
         tokio::spawn(async move {
+            if let Some(usd) = gateway_cost_usd {
+                if tx.send(Ok(StreamEvent::Cost { usd })).await.is_err() {
+                    return;
+                }
+            }
+
             let mut buffer = String::new();
             let mut stream = byte_stream;
 
@@ -1568,10 +1586,18 @@ impl LlmClient {
             anyhow::bail!("Anthropic API error {status} after {attempt} attempt(s): {body}");
         }
 
+        // Must be read BEFORE the body is consumed. Pearl th-11f9bb.
+        let gateway_cost_usd = parse_gateway_cost(resp.headers());
         let byte_stream = resp.bytes_stream();
         let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<StreamEvent>>(256);
 
         tokio::spawn(async move {
+            if let Some(usd) = gateway_cost_usd {
+                if tx.send(Ok(StreamEvent::Cost { usd })).await.is_err() {
+                    return;
+                }
+            }
+
             let mut buffer = String::new();
             let mut stream = byte_stream;
             // Track per-content-block kind so we know how to interpret
@@ -2176,6 +2202,7 @@ pub async fn accumulate_stream_events(mut stream: Pin<Box<dyn Stream<Item = anyh
     let mut finish_reason = String::from("stop");
     let mut usage = Usage::default();
     let mut resolved_model: Option<String> = None;
+    let mut gateway_cost_usd: Option<f64> = None;
 
     // Track tool calls keyed by index (stable across chunks; `id` is only sent once
     // on some providers like MiniMax, `index` is sent on every chunk). Value is
@@ -2213,6 +2240,9 @@ pub async fn accumulate_stream_events(mut stream: Pin<Box<dyn Stream<Item = anyh
             }
             StreamEvent::Usage(u) => {
                 usage = u;
+            }
+            StreamEvent::Cost { usd } => {
+                gateway_cost_usd = Some(usd);
             }
             StreamEvent::Model { name } => {
                 // Capture the first non-empty model name and ignore
@@ -2299,7 +2329,7 @@ pub async fn accumulate_stream_events(mut stream: Pin<Box<dyn Stream<Item = anyh
         finish_reason,
         usage,
         rate_limit: None,
-        gateway_cost_usd: None,
+        gateway_cost_usd,
         resolved_model,
         reasoning_content: if reasoning.is_empty() { None } else { Some(reasoning) },
     })
@@ -3646,6 +3676,93 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             "expected a retry after the 503, saw {} request(s)",
             hits.load(Ordering::SeqCst)
         );
+    }
+
+    /// Serve an SSE stream with `extra_headers` injected into the 200 response
+    /// and return what `chat_stream` + the accumulator make of it. Shared by the
+    /// gateway-cost tests below.
+    async fn stream_response_with_headers(extra_headers: &str) -> LlmResponse {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let headers = extra_headers.to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let headers = headers.clone();
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await; // drain request headers (best-effort)
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\ndata: [DONE]\n\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n{headers}content-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let mut config = LlmConfig::openrouter("test-key");
+        config.api_url = format!("http://{addr}");
+        config.model = "test-model".into();
+        let client = LlmClient::new(config);
+
+        let user = Message::user("hello");
+        let msgs = vec![&user];
+        let stream = client.chat_stream(&msgs, &[]).await.expect("chat_stream should succeed");
+        accumulate_stream_events(stream).await.expect("accumulate should succeed")
+    }
+
+    /// Pearl th-11f9bb: llm.smoo.ai reports per-request cost ONLY in the
+    /// `x-litellm-response-cost` response header — never in the SSE body. The
+    /// streaming path read the body only, so `gateway_cost_usd` stayed `None`,
+    /// the agent fell back to local `ModelPricing` (which prices `smooth-*`
+    /// aliases at $0), and every downstream cost readout showed $0. Headers are
+    /// only available before the body is consumed, so this asserts the value
+    /// survives the parse-then-stream ordering.
+    #[tokio::test]
+    async fn chat_stream_reads_gateway_cost_header() {
+        let response = stream_response_with_headers("x-litellm-response-cost: 1.47e-05\r\n").await;
+        assert_eq!(response.gateway_cost_usd, Some(1.47e-05), "gateway cost header must reach LlmResponse");
+        // The stream still accumulates normally alongside the cost event.
+        assert_eq!(response.content, "hi");
+        assert_eq!(response.usage.total_tokens, 12);
+    }
+
+    /// The margin-bearing header wins over the raw upstream cost, matching the
+    /// non-streaming path's `parse_gateway_cost` precedence.
+    #[tokio::test]
+    async fn chat_stream_prefers_margin_cost_header() {
+        let response = stream_response_with_headers("x-litellm-response-cost-original: 1.0e-05\r\nx-litellm-response-cost-margin-amount: 3.0e-05\r\n").await;
+        assert_eq!(response.gateway_cost_usd, Some(3.0e-05));
+    }
+
+    /// A gateway that sends no cost header must leave `gateway_cost_usd` at
+    /// `None` so the caller falls back to local `ModelPricing` rather than
+    /// locking in a bogus zero.
+    #[tokio::test]
+    async fn chat_stream_without_cost_header_yields_none() {
+        let response = stream_response_with_headers("").await;
+        assert_eq!(response.gateway_cost_usd, None);
+        assert_eq!(response.content, "hi");
+    }
+
+    /// The accumulator must carry a `Cost` event onto the response — this is the
+    /// seam the SSE paths use, and the one an extension provider would reuse.
+    #[tokio::test]
+    async fn accumulate_stream_events_captures_cost_event() {
+        use futures_util::stream;
+
+        let events: Vec<anyhow::Result<StreamEvent>> = vec![
+            Ok(StreamEvent::Cost { usd: 0.0042 }),
+            Ok(StreamEvent::Delta { content: "ok".into() }),
+            Ok(StreamEvent::Done { finish_reason: "stop".into() }),
+        ];
+        let stream: Pin<Box<dyn Stream<Item = anyhow::Result<StreamEvent>> + Send>> = Box::pin(stream::iter(events));
+        let response = accumulate_stream_events(stream).await.unwrap();
+        assert_eq!(response.gateway_cost_usd, Some(0.0042));
+        assert_eq!(response.content, "ok");
     }
 
     #[test]
