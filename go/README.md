@@ -6,7 +6,7 @@
   <a href="../LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
   <img src="https://img.shields.io/badge/tests-26%20passing-success" alt="26 tests passing" />
   <img src="https://img.shields.io/badge/serverless%20%C2%B7%20polyglot%20%C2%B7%20TDD-6f42c1" alt="serverless · polyglot · TDD" />
-  <a href="https://lom.smoo.ai"><img src="https://img.shields.io/badge/hosted-lom.smoo.ai-0aa" alt="lom.smoo.ai" /></a>
+  <a href="https://smoo.ai/th"><img src="https://img.shields.io/badge/platform-smoo.ai%2Fth-FF6B6C?style=for-the-badge&labelColor=020618" alt="smoo.ai/th"></a>
 </p>
 
 ---
@@ -160,7 +160,7 @@ Generated with [`go-jsonschema`](https://github.com/atombender/go-jsonschema) (p
 
 ## Smoo-powered or bring-your-own
 
-Point the transport at the hosted **[lom.smoo.ai](https://lom.smoo.ai)** endpoint, or at your own self-hosted `smooth-operator-server` — same protocol, same client.
+Point the transport at your own self-hosted `smooth-operator-server` — same protocol, same client.
 
 ## License
 

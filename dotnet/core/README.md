@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://smoo.ai/th"><img src="https://img.shields.io/badge/Smoo_AI-platform-00A6A6?style=for-the-badge&labelColor=020618" alt="Smoo AI"></a>
   <a href="https://github.com/SmooAI/smooth-operator-core/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-F49F0A?style=for-the-badge&labelColor=020618" alt="license"></a>
-  <a href="https://lom.smoo.ai"><img src="https://img.shields.io/badge/hosted-lom.smoo.ai-FF6B6C?style=for-the-badge&labelColor=020618" alt="lom.smoo.ai"></a>
+  <a href="https://smoo.ai/th"><img src="https://img.shields.io/badge/platform-smoo.ai%2Fth-FF6B6C?style=for-the-badge&labelColor=020618" alt="smoo.ai/th"></a>
 </p>
 
 <p align="center">
@@ -125,11 +125,11 @@ sealed class DenyDbWriter : IDenyPredicate
 
 - 🚀 **Smooth on the platform** — [smoo.ai/th](https://smoo.ai/th)
 - 🧰 **More open source from Smoo AI** — [smoo.ai/open-source](https://smoo.ai/open-source)
-- 🧩 **Run it hosted** — [lom.smoo.ai](https://lom.smoo.ai)
+- 🧩 **Smoo-hosted** — smooth-operator runs the [Smoo AI](https://smoo.ai) platform in production
 
 ## Links
 
-- [**lom.smoo.ai**](https://lom.smoo.ai) — run it hosted
+- [**smoo.ai**](https://smoo.ai) — the platform this engine runs in production
 - [smooth-operator-core](https://github.com/SmooAI/smooth-operator-core) — the polyglot engine repo
 - [Polyglot Engines](https://github.com/SmooAI/smooth-operator-core/blob/main/docs/Polyglot-Engines.md) — install + hello-agent in all five languages
 - [smoo.ai](https://smoo.ai) — the product · [smoo.ai/open-source](https://smoo.ai/open-source) — more open source
