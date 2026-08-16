@@ -91,6 +91,12 @@ pub struct AgentConfig {
     /// `None` = unknown → no clamp. The host sources it per-turn from the
     /// gateway's `/model/info` for the resolved model. (EPIC th-1cc9fa.)
     pub model_max_output: Option<u32>,
+    /// Passthrough `metadata` stamped on every LLM request this agent makes
+    /// (forwarded verbatim as top-level `metadata` on the `/chat/completions`
+    /// body). Set via [`Self::with_metadata`]; `None`/empty = byte-identical
+    /// wire. Lets a host attribute per-agent LLM spend (the LiteLLM gateway
+    /// records `metadata` on its spend logs).
+    pub request_metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// A message injected into a running agent's conversation from outside the loop.
@@ -134,6 +140,7 @@ impl AgentConfig {
             prior_messages: Vec::new(),
             next_user_images: Vec::new(),
             model_max_output: None,
+            request_metadata: None,
         }
     }
 
@@ -143,6 +150,20 @@ impl AgentConfig {
     #[must_use]
     pub fn with_model_ceiling(mut self, ceiling: Option<u32>) -> Self {
         self.model_max_output = ceiling;
+        self
+    }
+
+    /// Attach passthrough `metadata` to every LLM request this agent makes,
+    /// forwarded verbatim as top-level `metadata` on the `/chat/completions`
+    /// body (see [`LlmClient::with_metadata`]). A host resolving per-agent
+    /// config per turn stamps a tag here — e.g. `{ "smooai_agent_slug": ... }`
+    /// so the LiteLLM gateway attributes spend per agent. `None` (default) or
+    /// an empty map = byte-identical wire. Applies only to the [`LlmClient`]
+    /// the agent builds from [`Self::llm`]; a custom [`LlmProvider`] injected
+    /// into the running agent owns its own request shape.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: Option<serde_json::Map<String, serde_json::Value>>) -> Self {
+        self.request_metadata = metadata.filter(|m| !m.is_empty());
         self
     }
 
@@ -840,7 +861,11 @@ impl Agent {
 
         let llm: Arc<dyn LlmProvider> = match &self.llm_provider {
             Some(provider) => Arc::clone(provider),
-            None => Arc::new(LlmClient::new(self.config.llm.clone()).with_model_ceiling(self.config.model_max_output)),
+            None => Arc::new(
+                LlmClient::new(self.config.llm.clone())
+                    .with_model_ceiling(self.config.model_max_output)
+                    .with_metadata(self.config.request_metadata.clone()),
+            ),
         };
 
         for iteration in 1..=self.config.max_iterations {
@@ -1073,7 +1098,11 @@ impl Agent {
 
         let llm: Arc<dyn LlmProvider> = match &self.llm_provider {
             Some(provider) => Arc::clone(provider),
-            None => Arc::new(LlmClient::new(self.config.llm.clone()).with_model_ceiling(self.config.model_max_output)),
+            None => Arc::new(
+                LlmClient::new(self.config.llm.clone())
+                    .with_model_ceiling(self.config.model_max_output)
+                    .with_metadata(self.config.request_metadata.clone()),
+            ),
         };
 
         for iteration in 1..=self.config.max_iterations {
@@ -1763,6 +1792,18 @@ mod tests {
         assert_eq!(test_config().model_max_output, None);
         assert_eq!(test_config().with_model_ceiling(Some(8_192)).model_max_output, Some(8_192));
         assert_eq!(test_config().with_model_ceiling(None).model_max_output, None);
+    }
+
+    #[test]
+    fn agent_config_metadata_defaults_none_sets_and_normalizes_empty() {
+        assert_eq!(test_config().request_metadata, None);
+
+        let tag = serde_json::json!({ "smooai_agent_slug": "observability-analyst" }).as_object().unwrap().clone();
+        assert_eq!(test_config().with_metadata(Some(tag.clone())).request_metadata, Some(tag));
+
+        // Empty map and None both normalize to no metadata (byte-identical wire).
+        assert_eq!(test_config().with_metadata(Some(serde_json::Map::new())).request_metadata, None);
+        assert_eq!(test_config().with_metadata(None).request_metadata, None);
     }
 
     // ----- pearl th-operator-verify-rule: with_verify_tests_before_done -----
