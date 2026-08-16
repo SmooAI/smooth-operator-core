@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11"
 
 [[package]]
@@ -415,7 +415,7 @@ wheels = [
 
 [[package]]
 name = "smooai-smooth-operator-core"
-version = "1.7.2"
+version = "1.7.1"
 source = { editable = "." }
 dependencies = [
     { name = "openai" },
