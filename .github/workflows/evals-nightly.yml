@@ -1,0 +1,126 @@
+# Nightly LIVE eval run across all five engines.
+#
+# The eval suites are gated on SMOOTH_AGENT_E2E=1 + SMOOAI_GATEWAY_KEY and skip
+# cleanly without them — which, until this workflow existed, meant they had NEVER
+# run in CI in any language. The per-PR workflows still run only the offline drift
+# guard (cheap, no credentials); this is where the scenarios actually meet a model.
+#
+# Every engine runs the SAME corpus: spec/evals/scenarios.json.
+#
+# REQUIRES the repository secret SMOOAI_GATEWAY_KEY. Without it each job's suite
+# self-skips and the run is green-but-empty — see the "verify the secret" step,
+# which fails loudly instead of letting a silent skip look like a pass.
+name: Evals (nightly, live)
+
+on:
+    schedule:
+        # 07:00 UTC daily — after the US evening, before the EU morning.
+        - cron: '0 7 * * *'
+    workflow_dispatch:
+        inputs:
+            judge_model:
+                description: 'Judge model override (SMOOTH_AGENT_JUDGE_MODEL)'
+                required: false
+                default: ''
+
+concurrency:
+    group: evals-nightly
+    cancel-in-progress: false
+
+env:
+    SMOOTH_AGENT_E2E: '1'
+    SMOOAI_GATEWAY_KEY: ${{ secrets.SMOOAI_GATEWAY_KEY }}
+    SMOOTH_AGENT_JUDGE_MODEL: ${{ inputs.judge_model }}
+
+jobs:
+    # One cheap job so a missing secret is ONE red line, not five confusing skips.
+    preflight:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Verify the gateway secret is present
+              run: |
+                  if [ -z "$SMOOAI_GATEWAY_KEY" ]; then
+                      echo "::error::SMOOAI_GATEWAY_KEY is not set on this repository."
+                      echo "The eval suites self-skip without it, so the nightly would report"
+                      echo "success while running zero scenarios. Set it under"
+                      echo "Settings → Secrets and variables → Actions."
+                      exit 1
+                  fi
+                  echo "gateway key present (${#SMOOAI_GATEWAY_KEY} chars)"
+
+    rust:
+        needs: preflight
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        steps:
+            - uses: actions/checkout@v4
+            - uses: dtolnay/rust-toolchain@stable
+            - name: Install protoc
+              run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  workspaces: rust
+            - name: Evals
+              working-directory: rust
+              run: cargo test -p smooai-smooth-operator-core --test evals -- --nocapture
+
+    go:
+        needs: preflight
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-go@v5
+              with:
+                  go-version: '1.26'
+                  cache-dependency-path: go/core/go.sum
+            - name: Evals
+              working-directory: go/core
+              run: go test -run TestEval -v -timeout 40m .
+
+    typescript:
+        needs: preflight
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        steps:
+            - uses: actions/checkout@v4
+            - uses: pnpm/action-setup@v4
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+                  cache: 'pnpm'
+            - run: pnpm install --frozen-lockfile
+            - name: Evals
+              working-directory: typescript/core
+              run: pnpm exec vitest run test/evals.test.ts
+
+    python:
+        needs: preflight
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        steps:
+            - uses: actions/checkout@v4
+            - uses: astral-sh/setup-uv@v5
+              with:
+                  version: '0.7.8'
+            - name: Sync (locked)
+              working-directory: python/core
+              run: uv sync --locked
+            - name: Evals
+              working-directory: python/core
+              run: uv run pytest tests/test_evals.py -s -q
+
+    dotnet:
+        needs: preflight
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-dotnet@v4
+              with:
+                  dotnet-version: '8.0.x'
+            - name: Evals
+              run: |
+                  dotnet test dotnet/SmooAI.SmoothOperator.Core.slnx \
+                      -c Release --verbosity normal \
+                      --filter "FullyQualifiedName~EvalTests"

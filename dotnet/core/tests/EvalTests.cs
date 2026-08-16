@@ -16,21 +16,18 @@ public class EvalTests
 {
     private const string GatewayUrl = "https://llm.smoo.ai/v1";
     private const string DefaultModel = "claude-haiku-4-5";
-    private const double AggregateMeanThreshold = 4.0;
 
-    // Lenient floor for the hard suite: a single hard scenario scoring 1–2 should not redden the
-    // suite, but a broad collapse (most failing) should — the improvement dashboard, mirroring the
-    // Rust extended_judge.
-    private const double HardAggregateMeanFloor = 3.0;
+    // A RATCHET, not a duplicate of the corpus. Comparing the loaded set against the file catches a
+    // language that subsets or mis-parses it, but not a scenario deleted from the file itself —
+    // both sides shrink together and every language stays green. This floor is what makes a
+    // deletion loud. Raise it when you add scenarios; lowering it should require saying why.
+    private const int MinScenarios = 15;
 
     private readonly ITestOutputHelper _output;
 
     public EvalTests(ITestOutputHelper output) => _output = output;
 
-    private const string SupportPrompt =
-        "You are SmooAI's customer support agent. Answer using ONLY the knowledge provided to you. " +
-        "If the knowledge does not contain the answer, clearly say you don't have that information — " +
-        "never invent facts, names, or policies. Be concise and courteous.";
+    private static string SupportPrompt => EvalScenarios.SupportPrompt;
 
     private static IChatClient Gateway(string apiKey, string model) =>
         new OpenAIClient(new ApiKeyCredential(apiKey), new OpenAIClientOptions { Endpoint = new Uri(GatewayUrl) })
@@ -75,8 +72,8 @@ public class EvalTests
 
         var mean = scores.Average();
         Assert.True(
-            mean >= AggregateMeanThreshold,
-            $"eval aggregate mean {mean:F2} < {AggregateMeanThreshold}; per-scenario scores = [{string.Join(", ", scores)}]");
+            mean >= EvalScenarios.AggregateMeanThreshold,
+            $"eval aggregate mean {mean:F2} < {EvalScenarios.AggregateMeanThreshold}; per-scenario scores = [{string.Join(", ", scores)}]");
     }
 
     /// <summary>
@@ -132,8 +129,45 @@ public class EvalTests
             (misses.Count == 0 ? "all met threshold 🎉 — consider raising the bar." : $"{misses.Count} improvement target(s): {string.Join(" | ", misses)}"));
 
         Assert.True(
-            mean >= HardAggregateMeanFloor,
-            $"hard suite collapsed: mean {mean:F2} < floor {HardAggregateMeanFloor} — a broad regression, not just one hard miss; scores = [{string.Join(", ", scores)}]");
+            mean >= EvalScenarios.HardAggregateMeanThreshold,
+            $"hard suite collapsed: mean {mean:F2} < floor {EvalScenarios.HardAggregateMeanThreshold} — a broad regression, not just one hard miss; scores = [{string.Join(", ", scores)}]");
+    }
+
+    /// <summary>
+    /// The drift guard: runs OFFLINE in normal CI. Asserts the scenario set this suite would
+    /// execute is exactly the set in spec/evals/scenarios.json — same count, same ids — so a
+    /// language that subsets, filters or mis-parses the corpus goes red here instead of quietly
+    /// running a forked suite (which is how THIS corpus drifted).
+    /// </summary>
+    [Fact]
+    public void EvalCorpus_MatchesSharedSpec()
+    {
+        var fileIds = EvalScenarios.FileScenarioIds;
+        var loadedIds = EvalScenarios.AllScenarios.Select(s => s.Name).ToList();
+
+        Assert.Equal(fileIds.Count, loadedIds.Count);
+        Assert.Equal(fileIds.OrderBy(x => x, StringComparer.Ordinal), loadedIds.OrderBy(x => x, StringComparer.Ordinal));
+        Assert.Equal(loadedIds.Count, loadedIds.Distinct(StringComparer.Ordinal).Count());
+
+        // The core + hard tiers must partition the corpus — no scenario silently unrun.
+        Assert.Equal(loadedIds.Count, EvalScenarios.All.Count + EvalScenarios.Hard.Count);
+        Assert.NotEmpty(EvalScenarios.All);
+
+        Assert.True(
+            loadedIds.Count >= MinScenarios,
+            $"corpus shrank: {loadedIds.Count} scenarios < ratchet floor {MinScenarios} — a scenario was deleted from spec/evals/scenarios.json");
+
+        // Every scenario must be runnable (docs already resolved by the loader, which throws on a
+        // bad key). Catches a malformed corpus before a nightly burns gateway spend finding it.
+        foreach (var scenario in EvalScenarios.AllScenarios)
+        {
+            Assert.NotEmpty(scenario.UserTurns);
+            Assert.False(string.IsNullOrWhiteSpace(scenario.GroundTruth), $"{scenario.Name} ground truth");
+            Assert.False(string.IsNullOrWhiteSpace(scenario.Rubric), $"{scenario.Name} rubric");
+        }
+
+        Assert.False(string.IsNullOrWhiteSpace(EvalScenarios.SupportPrompt));
+        Assert.False(string.IsNullOrWhiteSpace(EvalScenarios.JudgeSystemPrompt));
     }
 
     // Always-on (no network): the judge JSON parser tolerates stray prose / markdown fences.
