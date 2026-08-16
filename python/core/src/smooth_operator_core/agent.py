@@ -14,8 +14,9 @@ when the C# core grew past Phase 0.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Awaitable, Callable, Protocol, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Protocol, Union
 
 from .cast import Clearance
 from .checkpoint import Checkpoint, CheckpointStore
@@ -30,6 +31,15 @@ from .permission import AutoMode, PermissionHook
 from .rerank import NoopReranker, Reranker
 from .thread import SmoothAgentThread
 from .tool_search import ToolSearch
+
+if TYPE_CHECKING:  # import only for typing — never at runtime
+    from .extension.host import ExtensionHost
+
+#: SEP event names the agent loop emits. Mirrors the Rust host's
+#: ``extension::events`` constants.
+_SEP_TURN_START = "turn_start"
+_SEP_TURN_END = "turn_end"
+_SEP_MESSAGE_END = "message_end"
 
 
 def effective_max_tokens(max_tokens: int, model_max_output: int | None) -> int:
@@ -148,6 +158,12 @@ class AgentOptions:
     #: schema payload small when there are many rarely-used tools. An unpromoted
     #: deferred tool is NOT dispatchable.
     deferred_tools: list[Tool] = field(default_factory=list)
+    #: A loaded SEP :class:`~smooth_operator_core.extension.host.ExtensionHost` to
+    #: wire into this agent — the Python sibling of Rust's
+    #: ``Agent::with_extension_host``. Its tools are merged into the agent's tool
+    #: set and its hook lanes run at the same points Rust runs them. ``None`` (the
+    #: default) leaves the loop exactly as it was before extensions existed.
+    extensions: ExtensionHost | None = None
     #: Approximate token budget for the context window. Before each model call,
     #: older non-system messages are dropped (sliding window) to stay under it.
     #: ``0`` disables compaction.
@@ -271,6 +287,17 @@ class SmoothAgent:
             raise ValueError("chat_client is required")
         self._client = chat_client
         self._options = options
+        # Extension tools join as ORDINARY tools (already namespaced
+        # ``<extension>.<tool>``), so the model sees them, the loop dispatches them,
+        # and the existing permission/clearance machinery gates them with no special
+        # casing — the same property the Rust host has. Deferred ones go to
+        # ``deferred_tools`` and stay hidden (and undispatchable) until
+        # ``tool_search`` promotes them.
+        if options.extensions is not None:
+            options.tools = [*options.tools, *options.extensions.tools()]
+            options.deferred_tools = [*options.deferred_tools, *options.extensions.deferred_tools()]
+        # NOTE: deferred tools are deliberately absent from ``_tools_by_name`` — an
+        # unpromoted deferred tool must resolve to nothing.
         self._tools_by_name = {t.name: t for t in options.tools}
 
         # Assemble the effective hook chain. When a permission mode and/or deny policy
@@ -335,6 +362,58 @@ class SmoothAgent:
             for t in visible
         ]
 
+    # ---- SEP extension seam -------------------------------------------------
+
+    def _sep_dispatch(self, event: str, payload: dict[str, Any]) -> None:
+        """Fan a turn event out to subscribed extensions. Fire and forget: observe
+        events are lossy by contract and never block the turn."""
+        if self._options.extensions is None:
+            return
+        self._options.extensions.dispatch_event(event, payload)
+
+    def _sep_turn_complete(self, iterations: int, content: str) -> None:
+        """Emit the pair of end-of-turn events in the order Rust emits them:
+        ``message_end`` carrying the final assistant text, then ``turn_end``."""
+        if self._options.extensions is None:
+            return
+        self._sep_dispatch(_SEP_MESSAGE_END, {"iteration": iterations, "content": content})
+        self._sep_dispatch(_SEP_TURN_END, {"agent_id": self._options.model, "iterations": iterations})
+
+    async def _sep_tool_call_plan(self, tool_calls: list[Any]) -> list[tuple[Any, str, str | None]]:
+        """Fold the ``tool_call`` hook over every pending call BEFORE any of them run
+        — the Python sibling of Rust's ``sep_tool_call_plan``.
+
+        Returns one ``(tool_call, arguments, blocked_reason)`` per input call, in
+        order: ``blocked_reason`` set means the call must not execute; otherwise
+        ``arguments`` is the (possibly hook-rewritten) JSON string to run with.
+        Rewrites are already scoped by the host's cross-tool guard — an extension
+        may only rewrite a tool it owns, and may never redirect the call.
+
+        With no host configured every call passes through untouched.
+        """
+        host = self._options.extensions
+        if host is None:
+            return [(tc, tc.function.arguments, None) for tc in tool_calls]
+
+        plan: list[tuple[Any, str, str | None]] = []
+        for tc in tool_calls:
+            raw = tc.function.arguments
+            try:
+                parsed = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                parsed = {}
+            folded = await host.run_tool_call_hook(tc.function.name, parsed)
+            if folded.blocked:
+                plan.append((tc, raw, folded.reason or "blocked by extension"))
+                continue
+            # A Modify outcome replaces the whole ``{tool, arguments}`` hook input;
+            # lift its ``arguments`` back out. Anything else leaves the call as-is.
+            patched = raw
+            if isinstance(folded.value, dict) and "arguments" in folded.value:
+                patched = json.dumps(folded.value["arguments"])
+            plan.append((tc, patched, None))
+        return plan
+
     async def run(
         self,
         message: str,
@@ -349,6 +428,7 @@ class SmoothAgent:
         assistant (+ tool) messages are appended back to it before returning. The
         thread takes precedence over ``history`` as the prior context.
         """
+        self._sep_dispatch(_SEP_TURN_START, {"agent_id": self._options.model})
         messages: list[dict[str, Any]] = []
         system = self._build_system(message)
         if system:
@@ -409,6 +489,7 @@ class SmoothAgent:
 
                 # Stop early if this turn has hit its token/cost budget.
                 if tracker.exceeds(self._options.budget):
+                    self._sep_turn_complete(iteration, last_text)
                     return AgentRunResponse(
                         text=last_text,
                         iterations=iteration,
@@ -419,6 +500,7 @@ class SmoothAgent:
                     )
 
                 if not choice.tool_calls:
+                    self._sep_turn_complete(iteration, last_text)
                     return AgentRunResponse(
                         text=last_text,
                         iterations=iteration,
@@ -428,27 +510,31 @@ class SmoothAgent:
                     )
 
                 tool_call_count += len(choice.tool_calls)
-                if self._options.parallel_tool_calls and len(choice.tool_calls) > 1:
+                # SEP ``tool_call`` hook: folded over EVERY pending call before any of
+                # them run, so an extension can veto or rewrite arguments. A vetoed
+                # call never reaches _dispatch_tool; its reason becomes the tool result
+                # so the model learns why. The registry's own hooks still apply after.
+                plan = await self._sep_tool_call_plan(choice.tool_calls)
+
+                async def _run_planned(tc: Any, args: str, blocked: str | None) -> str:
+                    if blocked is not None:
+                        return f"error: blocked by extension: {blocked}"
+                    return await self._dispatch_tool(tc.function.name, args, search)
+
+                if self._options.parallel_tool_calls and len(plan) > 1:
                     # Dispatch all tool calls concurrently, but append the results in the
                     # original tool_calls order so the transcript stays deterministic. Each
                     # _dispatch_tool already turns failures/denials into a result string, so
                     # gather never sees an exception that would cancel its siblings.
-                    results = await asyncio.gather(
-                        *(
-                            self._dispatch_tool(tc.function.name, tc.function.arguments, search)
-                            for tc in choice.tool_calls
-                        )
-                    )
+                    results = await asyncio.gather(*(_run_planned(tc, args, blocked) for tc, args, blocked in plan))
                 else:
-                    results = [
-                        await self._dispatch_tool(tc.function.name, tc.function.arguments, search)
-                        for tc in choice.tool_calls
-                    ]
+                    results = [await _run_planned(tc, args, blocked) for tc, args, blocked in plan]
                 for tc, result in zip(choice.tool_calls, results):
                     tool_msg = {"role": "tool", "tool_call_id": tc.id, "content": result}
                     messages.append(tool_msg)
                     turn_messages.append(tool_msg)
 
+            self._sep_turn_complete(self._options.max_iterations, last_text)
             return AgentRunResponse(
                 text=last_text,
                 iterations=self._options.max_iterations,
