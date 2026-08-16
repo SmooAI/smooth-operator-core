@@ -1,6 +1,9 @@
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.Extensions.AI;
+using SmooAI.SmoothOperator.Core.Extensions;
 
 namespace SmooAI.SmoothOperator.Core;
 
@@ -28,13 +31,29 @@ public sealed class SmoothAgent
     private readonly Dictionary<string, AIFunction> _functions;
     private readonly ToolSearch? _toolSearch;
     private readonly PermissionHook? _permissionHook;
+    private readonly IReadOnlyList<AITool> _eagerTools;
 
     public SmoothAgent(IChatClient chatClient, AgentOptions options)
     {
         _chatClient = chatClient ?? throw new ArgumentNullException(nameof(chatClient));
         _options = options ?? throw new ArgumentNullException(nameof(options));
-        _functions = options.Tools.OfType<AIFunction>().ToDictionary(f => f.Name, StringComparer.Ordinal);
-        _toolSearch = options.DeferredTools.Count > 0 ? new ToolSearch(options.DeferredTools.OfType<AIFunction>()) : null;
+
+        // SEP: an extension host's EAGER tools join the ordinary tool set — visible to the model,
+        // dispatched, and permission-gated exactly like natives, no special casing. Its DEFERRED
+        // tools join the tool_search pool and stay invisible until promoted.
+        //
+        // Merged into locals, never back onto `options`: unlike Go (where AgentOptions is a value
+        // copy) AgentOptions is a shared object here, so appending to it would leak into the caller
+        // and double-add on a second SmoothAgent built from the same options.
+        _eagerTools = options.Extensions is null
+            ? (IReadOnlyList<AITool>)options.Tools.ToList()
+            : options.Tools.Concat(options.Extensions.Tools()).ToList();
+        var deferred = options.Extensions is null
+            ? (IReadOnlyList<AITool>)options.DeferredTools.ToList()
+            : options.DeferredTools.Concat(options.Extensions.DeferredTools()).ToList();
+
+        _functions = _eagerTools.OfType<AIFunction>().ToDictionary(f => f.Name, StringComparer.Ordinal);
+        _toolSearch = deferred.Count > 0 ? new ToolSearch(deferred.OfType<AIFunction>()) : null;
         // The permission gate is opt-in: it engages only when a mode or a deny policy is configured.
         // Attaching just a deny policy still runs the full engine (defaulting to Ask). This keeps every
         // existing agent byte-identical to before. An Ask routes to the same IHumanGate seam.
@@ -63,6 +82,9 @@ public sealed class SmoothAgent
         var cost = new CostTracker();
         BudgetExceeded? budgetHit = null;
         var iterations = 0;
+        var lastText = string.Empty;
+
+        SepDispatch(SepTurnStart, new JsonObject { ["agent_id"] = SepAgentId });
 
         while (true)
         {
@@ -74,6 +96,7 @@ public sealed class SmoothAgent
             var chatOptions = BuildChatOptions();
             var response = await CallModelAsync(working, chatOptions, cancellationToken).ConfigureAwait(false);
             Accumulate(usage, response.Usage);
+            lastText = response.Text ?? string.Empty;
             cost.Record(response.ModelId, response.Usage, LookupPricing(response.ModelId));
             working.AddRange(response.Messages);
             newThisTurn.AddRange(response.Messages);
@@ -96,6 +119,10 @@ public sealed class SmoothAgent
             newThisTurn.Add(toolMessage);
             await MaybeCheckpointAsync(thread, newThisTurn, iterations, CheckpointStrategy.AfterToolCall, cancellationToken).ConfigureAwait(false);
         }
+
+        // Every exit above (budget blown, no more tool calls, iteration cap) breaks to here, so one
+        // call covers them all — the events fire on EVERY termination, not just the happy path.
+        SepTurnComplete(iterations, lastText);
 
         thread?.AddRange(newThisTurn);
         return new AgentRunResponse(newThisTurn, usage, iterations, cost, budgetHit);
@@ -152,6 +179,9 @@ public sealed class SmoothAgent
         var working = await SeedConversationAsync(message, thread, cancellationToken).ConfigureAwait(false);
         var newThisTurn = new List<ChatMessage> { working[^1] };
         var iterations = 0;
+        var lastText = string.Empty;
+
+        SepDispatch(SepTurnStart, new JsonObject { ["agent_id"] = SepAgentId });
 
         while (true)
         {
@@ -172,6 +202,7 @@ public sealed class SmoothAgent
             }
 
             var response = updates.ToChatResponse();
+            lastText = response.Text ?? string.Empty;
             working.AddRange(response.Messages);
             newThisTurn.AddRange(response.Messages);
             await MaybeCheckpointAsync(thread, newThisTurn, iterations, CheckpointStrategy.AfterEachIteration, cancellationToken).ConfigureAwait(false);
@@ -191,6 +222,10 @@ public sealed class SmoothAgent
             yield return new ChatResponseUpdate(toolMessage.Role, toolMessage.Contents);
             await MaybeCheckpointAsync(thread, newThisTurn, iterations, CheckpointStrategy.AfterToolCall, cancellationToken).ConfigureAwait(false);
         }
+
+        // Same single-exit reasoning as RunAsync: both breaks land here, so the stream path emits
+        // the identical event pair (stream parity).
+        SepTurnComplete(iterations, lastText);
 
         thread?.AddRange(newThisTurn);
     }
@@ -301,7 +336,7 @@ public sealed class SmoothAgent
 
     private ChatOptions? BuildChatOptions()
     {
-        var tools = new List<AITool>(_options.Tools);
+        var tools = new List<AITool>(_eagerTools);
         if (_toolSearch is not null)
         {
             // Advertise the tool_search meta-tool plus any deferred tools promoted so far. The
@@ -338,6 +373,83 @@ public sealed class SmoothAgent
         return chatOptions;
     }
 
+    // ── SEP seam ────────────────────────────────────────────────────────────────
+    // The C# siblings of go/core/extension_seam.go and Rust's sep_* helpers. Every
+    // one is a no-op when no host is configured, so the no-extension path is
+    // byte-identical to before extensions existed.
+
+    private const string SepTurnStart = "turn_start";
+    private const string SepTurnEnd = "turn_end";
+    private const string SepMessageEnd = "message_end";
+
+    /// <summary>Nil-safe event fan-out. Fire-and-forget: observe events are lossy by
+    /// contract and never block the turn.</summary>
+    private void SepDispatch(string @event, JsonNode payload) =>
+        _options.Extensions?.DispatchEvent(@event, payload);
+
+    /// <summary><c>agent_id</c> for the turn events. Go/Rust use their options' model id;
+    /// C# keeps the model on the <see cref="IChatClient"/>, so the agent's own
+    /// <see cref="AgentOptions.Name"/> is the identity here.</summary>
+    private string SepAgentId => _options.Name;
+
+    /// <summary>The pair of end-of-turn events, in the order Rust emits them:
+    /// <c>message_end</c> carrying the final assistant text, then <c>turn_end</c>.</summary>
+    private void SepTurnComplete(int iterations, string content)
+    {
+        if (_options.Extensions is null)
+        {
+            return;
+        }
+        SepDispatch(SepMessageEnd, new JsonObject { ["iteration"] = iterations, ["content"] = content });
+        SepDispatch(SepTurnEnd, new JsonObject { ["agent_id"] = SepAgentId, ["iterations"] = iterations });
+    }
+
+    /// <summary>What the model sees in place of a vetoed call's result. Phrased so the model
+    /// learns the call was refused and why, rather than seeing an empty result and retrying
+    /// blindly. Wording is byte-identical across Rust/Go/TS/C#.</summary>
+    private static string SepBlockedResult(string? reason) =>
+        string.IsNullOrEmpty(reason) ? "error: blocked by extension" : $"error: blocked by extension: {reason}";
+
+    /// <summary>
+    /// Folds the <c>tool_call</c> hook over every pending call BEFORE any of them execute.
+    /// Vetoed calls are returned as callId → reason (they never run); a proceed-with-patch
+    /// rewrites the call's arguments in place.
+    /// <para>
+    /// Rewrites are already scoped by the host's cross-tool guard: an extension may only rewrite
+    /// the arguments of a tool it owns, and may never redirect the call to a different tool.
+    /// </para>
+    /// </summary>
+    private async Task<Dictionary<string, string>?> SepToolCallPlanAsync(IList<FunctionCallContent> calls)
+    {
+        if (_options.Extensions is null || calls.Count == 0)
+        {
+            return null;
+        }
+
+        Dictionary<string, string>? blocked = null;
+        for (var i = 0; i < calls.Count; i++)
+        {
+            var call = calls[i];
+            var args = JsonSerializer.SerializeToNode(call.Arguments ?? new Dictionary<string, object?>()) ?? new JsonObject();
+            var folded = await _options.Extensions.RunToolCallHookAsync(call.Name, args).ConfigureAwait(false);
+            switch (folded)
+            {
+                case FoldedHook.Blocked b:
+                    blocked ??= new Dictionary<string, string>(StringComparer.Ordinal);
+                    blocked[call.CallId] = b.Reason;
+                    break;
+                case FoldedHook.Proceed p when p.Value["arguments"] is JsonNode patched:
+                    var rewritten = patched.Deserialize<Dictionary<string, object?>>();
+                    if (rewritten is not null)
+                    {
+                        calls[i] = new FunctionCallContent(call.CallId, call.Name, rewritten);
+                    }
+                    break;
+            }
+        }
+        return blocked;
+    }
+
     private static List<FunctionCallContent> ExtractToolCalls(IEnumerable<ChatMessage> messages) =>
         messages.SelectMany(m => m.Contents).OfType<FunctionCallContent>().ToList();
 
@@ -360,23 +472,34 @@ public sealed class SmoothAgent
 
     private async Task<ChatMessage> ExecuteToolsAsync(IReadOnlyList<FunctionCallContent> calls, CancellationToken cancellationToken)
     {
+        // SEP tool_call fold: every pending call runs the extension hook chain BEFORE any of them
+        // execute. A veto means the tool never runs at all — the model sees the refusal in place of
+        // a result. A proceed-with-patch rewrites the call's arguments in `planned`.
+        var planned = calls.ToList();
+        var sepBlocked = await SepToolCallPlanAsync(planned).ConfigureAwait(false);
+
+        Task<FunctionResultContent> Dispatch(FunctionCallContent call) =>
+            sepBlocked is not null && sepBlocked.TryGetValue(call.CallId, out var reason)
+                ? Task.FromResult(new FunctionResultContent(call.CallId, SepBlockedResult(reason)))
+                : InvokeToolAsync(call, cancellationToken);
+
         // Dispatch the tool calls — concurrently when enabled and there's more than one — but
         // always assemble the results in the original call order so the transcript stays
         // deterministic. InvokeToolAsync turns failures/denials into a result content, so a
         // single tool's failure can't cancel its siblings under Task.WhenAll.
         List<AIContent> results;
-        if (_options.ParallelToolCalls && calls.Count > 1)
+        if (_options.ParallelToolCalls && planned.Count > 1)
         {
-            var tasks = calls.Select(call => InvokeToolAsync(call, cancellationToken)).ToList();
+            var tasks = planned.Select(Dispatch).ToList();
             var completed = await Task.WhenAll(tasks).ConfigureAwait(false);
             results = completed.Cast<AIContent>().ToList();
         }
         else
         {
-            results = new List<AIContent>(calls.Count);
-            foreach (var call in calls)
+            results = new List<AIContent>(planned.Count);
+            foreach (var call in planned)
             {
-                results.Add(await InvokeToolAsync(call, cancellationToken).ConfigureAwait(false));
+                results.Add(await Dispatch(call).ConfigureAwait(false));
             }
         }
         return new ChatMessage(ChatRole.Tool, results);
