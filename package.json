@@ -2,7 +2,7 @@
     "name": "@smooai/smooth-operator-core-monorepo",
     "version": "0.0.0",
     "private": true,
-    "description": "Polyglot AI agent orchestration core — agents, workflows, tools, checkpointing, memory, HITL, cost. The engine behind smooth-agent and lom.smoo.ai.",
+    "description": "Polyglot AI agent orchestration core — agents, workflows, tools, checkpointing, memory, HITL, cost. The engine behind Smooth Operator and the Smoo AI platform.",
     "license": "MIT",
     "repository": {
         "type": "git",
