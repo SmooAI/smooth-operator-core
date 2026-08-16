@@ -33,6 +33,12 @@
          Node echo peer for the live extension-host tests. Copied next to the test assembly so the
          tests locate them regardless of the working directory. -->
     <None Include="sep\**" CopyToOutputDirectory="PreserveNewest" />
+
+    <!-- THE shared eval corpus. Not vendored: this is a build-time copy of the single
+         source of truth at spec/evals/scenarios.json, linked into the output so the
+         tests locate it regardless of working directory. Editing the copy is pointless
+         — it is overwritten from spec/ on every build. -->
+    <None Include="..\..\..\spec\evals\scenarios.json" Link="evals\scenarios.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

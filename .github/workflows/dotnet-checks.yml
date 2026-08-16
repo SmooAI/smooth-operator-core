@@ -29,8 +29,13 @@ jobs:
             - name: Build
               run: dotnet build dotnet/SmooAI.SmoothOperator.Core.slnx -c Release --no-restore
 
+            # EvalTests is NOT filtered out: its live scenarios are SkippableFact and
+            # self-skip without SMOOTH_AGENT_E2E/SMOOAI_GATEWAY_KEY, while its offline
+            # drift guard (EvalCorpus_MatchesSharedSpec) must run on every PR — that
+            # guard is the whole point, and excluding the class is what let the .NET
+            # eval corpus fork from the other four languages unnoticed.
             - name: Test (excluding gateway-gated suites)
               run: |
                   dotnet test dotnet/SmooAI.SmoothOperator.Core.slnx \
                       -c Release --no-build --verbosity normal \
-                      --filter "FullyQualifiedName!~EvalTests&FullyQualifiedName!~LiveE2E"
+                      --filter "FullyQualifiedName!~LiveE2E"

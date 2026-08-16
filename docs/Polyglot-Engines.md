@@ -13,7 +13,7 @@ It is a library, not a service. There is no server, transport, or deployment her
 - **`smooth-operator-core`** (this repo) = the polyglot ENGINE library — the in-process agentic loop you embed in your own process. Think "LangGraph."
 - **[`smooth-operator`](https://github.com/SmooAI/smooth-operator)** (separate repo) = the SYSTEM / service that consumes the engine — server, transport, persistence, deploy. Think "Onyx."
 
-The Rust crate is the reference implementation. The other four engines mirror its **behavior**, not its exact type shapes — parity is checked by an eval suite mirrored in each language (the same scenarios, currently duplicated per language; unifying them behind one shared corpus is tracked), so idioms stay native to each language (snake_case in Python, `*Async` in C#, `error` returns in Go) while the observable behavior matches.
+The Rust crate is the reference implementation. The other four engines mirror its **behavior**, not its exact type shapes — parity is checked by an eval suite that every engine loads from ONE shared corpus, [`spec/evals/scenarios.json`](../spec/evals/scenarios.json), so idioms stay native to each language (snake_case in Python, `*Async` in C#, `error` returns in Go) while the observable behavior matches.
 
 ## Feature surface (the shared core, in all five engines)
 
@@ -212,4 +212,46 @@ Each engine lives in its own directory:
 - [`go/core`](../go/core)
 - [`dotnet/core`](../dotnet/core)
 
-Parity across all five is enforced by a shared **eval suite** — the same behavioral scenarios run against every engine — so the engines stay behavior-compatible even where their type shapes differ.
+## The eval suite
+
+Parity across all five engines is checked by an **LLM-as-judge eval suite**. Every
+engine loads the same corpus — [`spec/evals/scenarios.json`](../spec/evals/scenarios.json)
+— and none of them define scenarios in code:
+
+| Engine | Suite |
+| --- | --- |
+| Rust | `rust/smooth-operator-core/tests/evals.rs` |
+| Go | `go/core/evals_test.go` |
+| TypeScript | `typescript/core/test/evals.test.ts` |
+| Python | `python/core/tests/test_evals.py` |
+| .NET | `dotnet/core/tests/EvalTests.cs` |
+
+The corpus has two tiers: **core** (behaviors every engine must clear, judged
+against `aggregate_mean_threshold`) and **hard** (adversarial and
+developer-experience probes on a lenient floor, so one hard miss is an improvement
+target rather than a red build). Each scenario carries its knowledge-base
+documents, user turns, ground truth, judge rubric, and an `intent` line saying
+which failure it exists to catch.
+
+**How it runs.** Two things happen at different times:
+
+- **Every PR, offline, no credentials:** each language asserts the corpus it
+  loaded matches the corpus file — same count, same ids — plus a ratchet on the
+  scenario count. This is what stops an engine subsetting the suite or a scenario
+  being quietly deleted. It needs no gateway and costs nothing.
+- **Nightly, live:** [`evals-nightly.yml`](../.github/workflows/evals-nightly.yml)
+  runs all five suites against the real gateway with `SMOOTH_AGENT_E2E=1` and the
+  `SMOOAI_GATEWAY_KEY` repository secret, and scores each tier. A preflight job
+  fails loudly if that secret is missing, because the suites self-skip without it
+  and a silent skip otherwise looks exactly like a pass.
+
+Running the live suite locally is the same gate in either direction — set both
+`SMOOTH_AGENT_E2E=1` and `SMOOAI_GATEWAY_KEY`, or the suites skip.
+
+> **History worth knowing.** These scenarios were hand-duplicated in four
+> languages, each citing a canonical `rust/evals` directory that never existed in
+> this repo — Rust, the reference engine, ran zero eval scenarios. The copies had
+> already forked: .NET swapped `prompt_injection_in_kb` out of its core tier and
+> grew a hard tier no other language had. Nothing had ever run in CI, because no
+> workflow set the gating variables. The shared corpus plus the offline drift
+> guard exist so that combination can't recur silently.
