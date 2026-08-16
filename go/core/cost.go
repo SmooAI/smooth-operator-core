@@ -59,6 +59,21 @@ func (t *CostTracker) Record(model string, u Usage, pricing map[string]ModelPric
 	}
 }
 
+// RecordWithGatewayCost records usage, preferring the gateway's authoritative
+// per-request cost when it measured one. A nil cost means "unmeasured" and falls
+// back to the local ModelPricing estimate — which is the whole reason the header
+// parser returns nil rather than 0. Aliased models (smooth-*) price at $0 locally,
+// so this is often the only real number available.
+func (t *CostTracker) RecordWithGatewayCost(model string, u Usage, gatewayCostUSD *float64, pricing map[string]ModelPricing) {
+	if gatewayCostUSD == nil {
+		t.Record(model, u, pricing)
+		return
+	}
+	t.Usage.PromptTokens += u.PromptTokens
+	t.Usage.CompletionTokens += u.CompletionTokens
+	t.CostUSD += *gatewayCostUSD
+}
+
 // Exceeds reports whether the accumulated usage/cost has hit the budget.
 func (t *CostTracker) Exceeds(b *CostBudget) bool {
 	if b == nil {

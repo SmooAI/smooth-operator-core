@@ -21,7 +21,7 @@ from .agent import (
 )
 from .cast import Cast, Clearance, OperatorRole, RoleKind
 from .checkpoint import Checkpoint, CheckpointStore, InMemoryCheckpointStore
-from .cost import CostBudget, CostTracker, ModelPricing, Usage
+from .cost import GATEWAY_COST_HEADERS, CostBudget, CostTracker, ModelPricing, Usage, parse_gateway_cost
 from .deny_policy import DenyPolicy, DenyPredicate, DenyReason, DenyRules
 from .hooks import ToolCall, ToolHook, ToolResult
 from .human_gate import (
@@ -86,6 +86,7 @@ __all__ = [
     "CheckpointStore",
     "Clearance",
     "CostBudget",
+    "GATEWAY_COST_HEADERS",
     "CostTracker",
     "DelegateHumanGate",
     "DenyPolicy",
@@ -112,6 +113,7 @@ __all__ = [
     "MemoryEntry",
     "MockLlmProvider",
     "ModelPricing",
+    "parse_gateway_cost",
     "NoopReranker",
     "OperatorRole",
     "RecordedCall",

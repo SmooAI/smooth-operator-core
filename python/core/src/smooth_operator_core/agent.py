@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Proto
 from .cast import Clearance
 from .checkpoint import Checkpoint, CheckpointStore
 from .compaction import compact
-from .cost import CostBudget, CostTracker, ModelPricing, Usage
+from .cost import CostBudget, CostTracker, ModelPricing, Usage, parse_gateway_cost
 from .deny_policy import DenyPolicy
 from .hooks import ToolCall, ToolHook, ToolResult
 from .human_gate import HumanApprovalRequest, HumanGate
@@ -265,6 +265,22 @@ class DoneEvent:
 StreamEvent = Union[TextEvent, ToolCallEvent, ToolResultEvent, DoneEvent]
 
 
+def _response_gateway_cost(response: Any) -> float | None:
+    """The gateway's authoritative cost for a response, when the client surfaced one.
+
+    The engine takes an injected OpenAI-compatible client, and the SDK's parsed
+    response carries no headers — the cost lives ONLY in a response header. So this
+    reads two shapes, in order: a ``gateway_cost_usd`` a wrapping client already
+    parsed and attached, or raw ``headers`` hanging off the response (what
+    ``client.chat.completions.with_raw_response`` gives you). Absent both, ``None`` —
+    unmeasured, and the local pricing estimate is used instead of a bogus $0.
+    """
+    attached = getattr(response, "gateway_cost_usd", None)
+    if isinstance(attached, (int, float)) and attached > 0:
+        return float(attached)
+    return parse_gateway_cost(getattr(response, "headers", None))
+
+
 def _extract_usage(response: Any) -> Usage:
     """Pull token usage from an OpenAI-shaped response, defaulting to zero when
     absent (e.g. a fake client in tests)."""
@@ -469,7 +485,12 @@ class SmoothAgent:
                 # previous iteration may have promoted deferred tools into view.
                 tool_specs = self._tool_specs(search)
                 response = await self._call_model(messages, tool_specs)
-                tracker.record(self._options.model, _extract_usage(response), self._options.pricing)
+                tracker.record_with_gateway_cost(
+                    self._options.model,
+                    _extract_usage(response),
+                    _response_gateway_cost(response),
+                    self._options.pricing,
+                )
                 choice = response.choices[0].message
                 last_text = choice.content or ""
 
@@ -616,7 +637,14 @@ class SmoothAgent:
                 partials: dict[int, dict[str, str]] = {}
                 usage: Usage = Usage()
                 stream = await self._call_model_stream(messages, tool_specs)
+                # Cost lives in a response HEADER, which is gone once the SSE body is
+                # being consumed — so read it off the stream object up front, and let
+                # a chunk carry it too for clients that surface it that way.
+                gateway_cost = _response_gateway_cost(stream)
                 async for chunk in stream:
+                    chunk_cost = _response_gateway_cost(chunk)
+                    if chunk_cost is not None:
+                        gateway_cost = chunk_cost
                     chunk_usage = getattr(chunk, "usage", None)
                     if chunk_usage is not None:
                         usage = Usage(
@@ -646,7 +674,7 @@ class SmoothAgent:
                                 cur["arguments"] += fn.arguments
 
                 tool_calls = [partials[i] for i in sorted(partials)]
-                tracker.record(self._options.model, usage, self._options.pricing)
+                tracker.record_with_gateway_cost(self._options.model, usage, gateway_cost, self._options.pricing)
                 last_text = content
 
                 assistant_msg: dict[str, Any] = {"role": "assistant", "content": content}
