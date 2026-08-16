@@ -8,4 +8,4 @@ Language-neutral JSON Schemas for the smooth-operator WebSocket protocol. Every 
 - `domain/` — `conversation`, `participant`, `message`, `session`, `checkpoint`
 - `codegen/` — per-language generator config (TS, Go, .NET, Python)
 
-See [`../docs/PROTOCOL.md`](../docs/PROTOCOL.md) for the design. Schemas are lifted and generalized from the smooai monorepo's `@smooai/realtime` package.
+See the service repo's [PROTOCOL.md](https://github.com/SmooAI/smooth-operator/blob/main/docs/PROTOCOL.md) for the design. Schemas are lifted and generalized from the smooai monorepo's `@smooai/realtime` package.

@@ -13,11 +13,11 @@ It is a library, not a service. There is no server, transport, or deployment her
 - **`smooth-operator-core`** (this repo) = the polyglot ENGINE library — the in-process agentic loop you embed in your own process. Think "LangGraph."
 - **[`smooth-operator`](https://github.com/SmooAI/smooth-operator)** (separate repo) = the SYSTEM / service that consumes the engine — server, transport, persistence, deploy. Think "Onyx."
 
-The Rust crate is the reference implementation. The other four engines mirror its **behavior**, not its exact type shapes — parity is enforced by a **shared eval suite** (the same scenarios run against every engine), so idioms stay native to each language (snake_case in Python, `*Async` in C#, `error` returns in Go) while the observable behavior matches.
+The Rust crate is the reference implementation. The other four engines mirror its **behavior**, not its exact type shapes — parity is checked by an eval suite mirrored in each language (the same scenarios, currently duplicated per language; unifying them behind one shared corpus is tracked), so idioms stay native to each language (snake_case in Python, `*Async` in C#, `error` returns in Go) while the observable behavior matches.
 
-## Feature surface (at parity across all five engines)
+## Feature surface (the shared core, in all five engines)
 
-Every engine supports the same capabilities:
+Every engine supports the same core capabilities below. Beyond this shared core, the Rust reference carries surfaces still being ported (real gateway LLM client with streaming/retry/quirks, multimodal images, structured output, prompt caching, provider routing, the NarcHook secret/injection scanner, and the extension sandbox/integrity hardening) — if a capability matters to you in a non-Rust engine, check that language's package docs before assuming it:
 
 - **Agentic tool-calling loop** — observe → think → act, looping until the model answers.
 - **In-memory + vector knowledge (RAG)** — ground the turn in retrieved documents.
@@ -25,7 +25,7 @@ Every engine supports the same capabilities:
 - **Compaction** — sliding-window context-token budget keeps the prompt under a ceiling.
 - **Cost / budget** — per-model pricing, token + USD accounting, early stop on budget.
 - **Checkpointing** — persist/resume a conversation via a checkpoint store.
-- **Rerank** — rerank retrieved hits before injection (lexical reranker built in).
+- **Rerank** — rerank retrieved hits before injection (lexical reranker built into the four ports; the Rust reference delegates reranking to its host today).
 - **Sub-agents / delegation** — spawn child agents for sub-tasks.
 - **Cast** — roles + clearance (tool-access policy per role).
 - **Human-in-the-loop gate** — require approval before designated tool calls run.
@@ -43,7 +43,7 @@ Each example constructs an agent with the **mock provider** (record/replay, no n
 
 ### Rust
 
-Crate `smooai-smooth-operator-core` (lib `smooth_operator_core`), version **0.14.0**. The Rust engine names the agent `Agent` (configured with `AgentConfig`) and the mock `MockLlmClient`.
+Crate `smooai-smooth-operator-core` (lib `smooth_operator_core`), version **1.7.1**. The Rust engine names the agent `Agent` (configured with `AgentConfig`) and the mock `MockLlmClient`.
 
 ```bash
 cargo add smooai-smooth-operator-core
@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
 
 ### TypeScript
 
-npm `@smooai/smooth-operator-core`, version **0.1.0**.
+npm `@smooai/smooth-operator-core`, version **1.7.1**.
 
 ```bash
 npm install @smooai/smooth-operator-core
@@ -95,7 +95,7 @@ console.log(response.text);
 
 ### Python
 
-PyPI `smooai-smooth-operator-core`, version **1.3.0**. `run` is async.
+PyPI `smooai-smooth-operator-core`, version **1.7.1**. `run` is async.
 
 ```bash
 pip install smooai-smooth-operator-core
@@ -152,7 +152,7 @@ func main() {
 
 ### C# / .NET
 
-NuGet `SmooAI.SmoothOperator.Core`, version **1.3.0**. `RunAsync` is async. The API follows Microsoft.Extensions.AI (`MAF`) naming.
+NuGet `SmooAI.SmoothOperator.Core`, version **1.7.1**. `RunAsync` is async. The API follows Microsoft.Extensions.AI (`MAF`) naming.
 
 ```bash
 dotnet add package SmooAI.SmoothOperator.Core

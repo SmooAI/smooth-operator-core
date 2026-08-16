@@ -1,16 +1,16 @@
 <p align="center">
-  <a href="https://smoo.ai"><img src=".github/banner.png" alt="smooth-operator-core — The Rust engine for orchestrated AI agents" width="100%" /></a>
+  <a href="https://smoo.ai"><img src=".github/banner.png" alt="smooth-operator-core — One agent engine. Five languages." width="100%" /></a>
 </p>
 
 <p align="center">
   <a href="https://smoo.ai/th"><img src="https://img.shields.io/badge/Smoo_AI-platform-00A6A6?style=for-the-badge&labelColor=020618" alt="Smoo AI"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-F49F0A?style=for-the-badge&labelColor=020618" alt="license"></a>
-  <a href="https://lom.smoo.ai"><img src="https://img.shields.io/badge/hosted-lom.smoo.ai-FF6B6C?style=for-the-badge&labelColor=020618" alt="lom.smoo.ai"></a>
+  <a href="https://github.com/SmooAI/smooth-operator"><img src="https://img.shields.io/badge/5_languages_·_one_engine-FF6B6C?style=for-the-badge&labelColor=020618" alt="5 languages · one engine"></a>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-reference%20impl-FF6B6C?style=flat-square" alt="Rust reference implementation">
-  <img src="https://img.shields.io/badge/tests-passing-00A6A6?style=flat-square" alt="tests passing">
+  <a href="https://github.com/SmooAI/smooth-operator-core/actions/workflows/pr-checks.yml"><img src="https://github.com/SmooAI/smooth-operator-core/actions/workflows/pr-checks.yml/badge.svg?branch=main" alt="CI"></a>
 </p>
 
 <p align="center">
@@ -22,10 +22,12 @@
 > ### The agent brain you can point at production — because you decide what it must never do.
 >
 > One observe→think→act engine — typed tools, streaming, checkpointing, memory, cost budgets, and a permission gate with hard lines the model can't cross — native in **Rust, TypeScript, Python, Go, and C#**.
+>
+> The open-source heart of [Smoo AI](https://smoo.ai)'s Smooth Operator. **MIT-licensed. Bring your own model. You approve every write.**
 
 Most agent frameworks hand the model a pile of tools and hope for the best. `smooth-operator-core` gives you the whole loop **and the brakes**: a typed tool system with pre/post hooks, human-in-the-loop gates, per-model cost budgets — and a **deny-policy** that lets you draw lines the model can never cross, not even in bypass mode. *No prod AWS profile. No writes to the DB writer. No `rm -rf /`.* Declared once, enforced on every tool call.
 
-It's the runtime that powers the [**smooth-operator**](https://github.com/SmooAI/smooth-operator) service and [**lom.smoo.ai**](https://lom.smoo.ai) — not a notebook demo. Inspired by LangGraph, CrewAI, and Agno, with one hard difference: every surface is covered by **hundreds of fast, offline unit tests** built on a deterministic `MockLlmClient`, so the loop is verified — not vibe-coded. And it's the **same engine in five languages** — write your agent where your stack already lives.
+It's the runtime that powers the [**smooth-operator**](https://github.com/SmooAI/smooth-operator) service behind the [Smoo AI](https://smoo.ai) platform in production — not a notebook demo. Inspired by LangGraph, CrewAI, and Agno, with one hard difference: every surface is covered by **hundreds of fast, offline unit tests** built on a deterministic `MockLlmClient`, so the loop is verified — not vibe-coded. And it's the **same engine in five languages** — write your agent where your stack already lives.
 
 > The Rust implementation is the source of truth. The TypeScript, Python, Go, and C#/.NET ports mirror its surface at parity (protocol-first; see [Repository layout](#repository-layout)).
 
@@ -33,21 +35,23 @@ It's the runtime that powers the [**smooth-operator**](https://github.com/SmooAI
 
 ## Quickstart
 
-```toml
-# Cargo.toml
-[dependencies]
-smooai-smooth-operator-core = { git = "https://github.com/SmooAI/smooth-operator-core.git", branch = "main" }
-async-trait = "0.1"
-tokio = { version = "1", features = ["full"] }
-anyhow = "1"
-serde_json = "1"
-```
-
-Or, once published to crates.io _(publish pending — use the git dep above today)_:
-
 ```bash
 cargo add smooai-smooth-operator-core
+cargo add async-trait tokio --features tokio/full
+cargo add anyhow serde_json
 ```
+
+Same engine, five registries — pick your language:
+
+```bash
+cargo add smooai-smooth-operator-core                     # Rust (reference)
+npm install @smooai/smooth-operator-core                  # TypeScript
+pip install smooai-smooth-operator-core                   # Python
+go get github.com/SmooAI/smooth-operator-core/go/core     # Go
+dotnet add package SmooAI.SmoothOperator.Core             # C# / .NET
+```
+
+Install commands and a hello-agent in every language: [**docs/Polyglot-Engines.md**](./docs/Polyglot-Engines.md). The rest of this page uses Rust.
 
 A complete agent — one tool, one LLM, one `run()` — in about 40 lines:
 
@@ -215,7 +219,7 @@ let agent = Agent::new(config, registry)
     .with_deny_policy(Arc::new(policy));
 ```
 
-A deny-policy match is a **hard deny of circuit-breaker tier** — no stored grant waives it, no mode downgrades it. That's the difference between "we asked the model nicely" and "it structurally cannot." And it's identical across all five languages.
+A deny-policy match is a **hard deny of circuit-breaker tier** — no stored grant waives it, no mode downgrades it. That's the difference between "we asked the model nicely" and "it structurally cannot." The deny-policy surface (TOML rules + predicate seam + permission gate) is ported to all five languages; the deepest hardening around *extensions* (subprocess sandboxing, integrity gates) is furthest along in Rust — see [docs/Polyglot-Engines.md](./docs/Polyglot-Engines.md) for the honest parity picture.
 
 ---
 
@@ -332,7 +336,7 @@ Run them:
 
 ```bash
 cd rust/smooth-operator-core
-cargo test                                   # 337 unit tests, offline
+cargo test                                   # hundreds of unit tests, offline
 cargo test --features sqlite,postgres        # + checkpoint-store conformance
 cargo clippy --all-targets -- -D warnings
 ```
@@ -368,13 +372,12 @@ The ports follow a **protocol-first** strategy: a stable wire spec each language
 
 **Bring-your-own:** point `LlmConfig.api_url` at any OpenAI-compatible endpoint (OpenAI, an Anthropic-compatible proxy, vLLM, Ollama's OpenAI shim). Provide your own `CheckpointStore`, `Memory`, and `KnowledgeBase` impls. The engine has zero hosted dependencies — it's a library.
 
-**Smoo-powered:** point it at the SmooAI LLM gateway (`https://llm.smoo.ai/v1`) for unified billing, model routing, and cost tracking, and let [**lom.smoo.ai**](https://lom.smoo.ai) run the smooth-operator service for you — no infra to operate.
+**Smoo-powered:** point it at the SmooAI LLM gateway (`https://llm.smoo.ai/v1`) for unified billing, model routing, and cost tracking — the same gateway the [Smoo AI](https://smoo.ai) platform runs this engine against in production.
 
 ---
 
 ## Links
 
-- [**lom.smoo.ai**](https://lom.smoo.ai) — run it hosted
 - [smooth-operator](https://github.com/SmooAI/smooth-operator) — the agent service built on this engine
 - [chat-widget](https://github.com/SmooAI/chat-widget) — the embeddable widget that talks to it
 - [smoo.ai](https://smoo.ai) — the product · [github.com/SmooAI](https://github.com/SmooAI) — more open source
