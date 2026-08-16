@@ -22,6 +22,8 @@
 > ### The agent brain you can point at production — because you decide what it must never do.
 >
 > One observe→think→act engine — typed tools, streaming, checkpointing, memory, cost budgets, and a permission gate with hard lines the model can't cross — native in **Rust, TypeScript, Python, Go, and C#**.
+>
+> The open-source heart of [Smoo AI](https://smoo.ai)'s Smooth Operator. **MIT-licensed. Bring your own model. You approve every write.**
 
 Most agent frameworks hand the model a pile of tools and hope for the best. `smooth-operator-core` gives you the whole loop **and the brakes**: a typed tool system with pre/post hooks, human-in-the-loop gates, per-model cost budgets — and a **deny-policy** that lets you draw lines the model can never cross, not even in bypass mode. *No prod AWS profile. No writes to the DB writer. No `rm -rf /`.* Declared once, enforced on every tool call.
 
