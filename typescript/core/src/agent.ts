@@ -84,6 +84,39 @@ export interface ToolHook {
     postCall?(call: ToolCall, result: ToolResult): Promise<void>;
 }
 
+/**
+ * The verdict of folding the SEP `tool_call` hook chain over one pending call —
+ * shaped to match `FoldedHook` from `extension/host.ts`, declared structurally
+ * here so the agent loop needs no import from the extension subsystem.
+ */
+export type ExtensionFold = { kind: 'proceed'; value: unknown } | { kind: 'blocked'; reason: string };
+
+/**
+ * The seam through which a SEP extension host participates in the agent loop —
+ * the TypeScript sibling of Rust's `Agent::with_extension_host` and Go's
+ * `core.ExtensionHooks`. Declared structurally (the concrete `ExtensionHost`
+ * satisfies it as-is) so `agent.ts` and `extension/` stay import-cycle-free.
+ */
+export interface ExtensionHooks {
+    /** Eager tool proxies, already namespaced `<extension>.<tool>`. */
+    tools(): Tool[];
+    /** Deferred tool proxies: hidden from the model until `tool_search` promotes them. */
+    deferredTools(): Tool[];
+    /**
+     * Fold the `tool_call` hook chain over one pending call BEFORE it executes.
+     * A `blocked` verdict vetoes the call; a `proceed` value may carry rewritten
+     * `arguments` (rewrites are already scoped by the host's cross-tool guard).
+     */
+    runToolCallHook(tool: string, args: unknown): Promise<ExtensionFold>;
+    /** Fire-and-forget event fan-out to subscribed extensions; never blocks the turn. */
+    dispatchEvent(event: string, payload: unknown): void;
+}
+
+/** What the model sees in place of a vetoed call's result (Rust/Go parity). */
+function sepBlockedResult(reason: string): string {
+    return reason ? `error: blocked by extension: ${reason}` : 'error: blocked by extension';
+}
+
 export interface AgentOptions {
     instructions?: string;
     model?: string;
@@ -150,6 +183,19 @@ export interface AgentOptions {
      * deferred tool is NOT dispatchable.
      */
     deferredTools?: Tool[];
+    /**
+     * SEP extension host participating in the agent loop — the TypeScript sibling
+     * of Rust's `Agent::with_extension_host` (and Go's `AgentOptions.Extensions`).
+     * The host's eager tools are merged into {@link tools} as ORDINARY tools
+     * (visible, dispatched, and permission-gated exactly like native tools), its
+     * deferred tools into {@link deferredTools} (hidden until `tool_search`
+     * promotes them), its `tool_call` hook folds over every pending call before
+     * dispatch (veto or argument rewrite — already scoped by the host's cross-tool
+     * guard), and turn lifecycle events fan out to subscribed extensions.
+     * The concrete `ExtensionHost` satisfies this structurally — no import needed.
+     * Omitted (the default) ⇒ the loop behaves exactly as before extensions existed.
+     */
+    extensions?: ExtensionHooks;
     /**
      * Approximate token budget for the context window. Before each model call,
      * older non-system messages are dropped (sliding window) to stay under it.
@@ -371,20 +417,92 @@ export class SmoothAgent {
     /** The native permission gate, built when permissionMode/denyPolicy/permissionGrants is set; else undefined (gate off). */
     private readonly permissionHook?: PermissionHook;
 
+    private readonly options: AgentOptions;
+
     constructor(
         private readonly client: ChatClientLike,
-        private readonly options: AgentOptions = {},
+        options: AgentOptions = {},
     ) {
         if (!client) throw new Error('client is required');
-        this.toolsByName = new Map((options.tools ?? []).map((t) => [t.name, t]));
-        this.hooks = [...(options.toolHooks ?? [])];
-        if (options.permissionMode !== undefined || options.denyPolicy !== undefined || options.permissionGrants !== undefined) {
-            const hook = new PermissionHook(options.permissionMode ?? AutoMode.Ask);
-            if (options.humanGate) hook.withApprover(options.humanGate);
-            if (options.permissionGrants) hook.withGrants(options.permissionGrants);
-            if (options.denyPolicy) hook.withDenyPolicy(options.denyPolicy);
+        // Merge the extension host's tools BEFORE any lookup structures are built:
+        // eager tools become ordinary (visible, dispatched, permission-gated) tools;
+        // deferred tools join the hidden pool. Deliberately NOT added to
+        // `toolsByName` directly when deferred — an unpromoted deferred tool must
+        // stay invisible until `tool_search` promotes it (Rust/Go parity).
+        const ext = options.extensions;
+        this.options = ext
+            ? {
+                  ...options,
+                  tools: [...(options.tools ?? []), ...ext.tools()],
+                  deferredTools: [...(options.deferredTools ?? []), ...ext.deferredTools()],
+              }
+            : options;
+        this.toolsByName = new Map((this.options.tools ?? []).map((t) => [t.name, t]));
+        this.hooks = [...(this.options.toolHooks ?? [])];
+        if (this.options.permissionMode !== undefined || this.options.denyPolicy !== undefined || this.options.permissionGrants !== undefined) {
+            const hook = new PermissionHook(this.options.permissionMode ?? AutoMode.Ask);
+            if (this.options.humanGate) hook.withApprover(this.options.humanGate);
+            if (this.options.permissionGrants) hook.withGrants(this.options.permissionGrants);
+            if (this.options.denyPolicy) hook.withDenyPolicy(this.options.denyPolicy);
             this.permissionHook = hook;
         }
+    }
+
+    /** Fire-and-forget SEP event fan-out; a no-op without an extension host. */
+    private sepDispatch(event: string, payload: unknown): void {
+        this.options.extensions?.dispatchEvent(event, payload);
+    }
+
+    /**
+     * Emit the end-of-turn SEP event pair in Rust's order: `message_end` carrying
+     * the final assistant text, then `turn_end`. Called on EVERY turn exit —
+     * budget-exceeded and max-iteration included — so a subscribed extension never
+     * waits forever for an end event.
+     */
+    private sepTurnComplete(iterations: number, content: string): void {
+        if (!this.options.extensions) return;
+        const model = this.options.model ?? DEFAULTS.model;
+        this.sepDispatch('message_end', { iteration: iterations, content });
+        this.sepDispatch('turn_end', { agent_id: model, iterations });
+    }
+
+    /**
+     * Fold the SEP `tool_call` hook over every pending call before any of them
+     * execute — the TypeScript sibling of Rust's `sep_tool_call_plan` and Go's
+     * `sepToolCallPlan`. Returns the calls to run (arguments possibly rewritten)
+     * and, for any vetoed call, its id → reason. Without a host it returns the
+     * input untouched. A call whose arguments do not parse as JSON skips the hook
+     * so `dispatchTool` can surface its usual invalid-arguments error.
+     */
+    private async sepToolCallPlan(
+        calls: Array<{ id: string; function: { name: string; arguments: string } }>,
+    ): Promise<{ calls: Array<{ id: string; function: { name: string; arguments: string } }>; blocks?: Map<string, string> }> {
+        const ext = this.options.extensions;
+        if (!ext || calls.length === 0) return { calls };
+        const out: typeof calls = [];
+        let blocks: Map<string, string> | undefined;
+        for (const tc of calls) {
+            let args: unknown;
+            try {
+                args = tc.function.arguments ? JSON.parse(tc.function.arguments) : {};
+            } catch {
+                out.push(tc);
+                continue;
+            }
+            const folded = await ext.runToolCallHook(tc.function.name, args);
+            if (folded.kind === 'blocked') {
+                (blocks ??= new Map()).set(tc.id, folded.reason);
+                out.push(tc);
+                continue;
+            }
+            const patched = (folded.value as { arguments?: unknown } | null | undefined)?.arguments;
+            out.push(
+                patched !== undefined
+                    ? { ...tc, function: { ...tc.function, arguments: JSON.stringify(patched) } }
+                    : tc,
+            );
+        }
+        return { calls: out, blocks };
     }
 
     /**
@@ -482,6 +600,7 @@ export class SmoothAgent {
 
         const maxContextTokens = this.options.maxContextTokens ?? DEFAULTS.maxContextTokens;
         const model = this.options.model ?? DEFAULTS.model;
+        this.sepDispatch('turn_start', { agent_id: model });
         const tracker = new CostTracker();
         try {
             for (let iteration = 1; iteration <= maxIterations; iteration++) {
@@ -515,26 +634,39 @@ export class SmoothAgent {
 
                 // Stop early if this turn has hit its token/cost budget.
                 if (tracker.exceeds(this.options.budget)) {
+                    this.sepTurnComplete(iteration, lastText);
                     return { text: lastText, iterations: iteration, toolCalls, usage: tracker.usage, costUsd: tracker.costUsd, budgetExceeded: true };
                 }
-    
+
                 if (!choice.tool_calls || choice.tool_calls.length === 0) {
+                    this.sepTurnComplete(iteration, lastText);
                     return { text: lastText, iterations: iteration, toolCalls, usage: tracker.usage, costUsd: tracker.costUsd, budgetExceeded: false };
                 }
-    
+
                 toolCalls += choice.tool_calls.length;
+                // SEP `tool_call` hook: fold over EVERY pending call before any of
+                // them run, so an extension can veto or rewrite arguments. Vetoed
+                // calls never reach dispatchTool; their veto reason becomes the tool
+                // result so the model learns why (Rust/Go parity).
+                const { calls, blocks } = await this.sepToolCallPlan(choice.tool_calls);
                 // Dispatch the tool calls — concurrently when enabled and there's more than
                 // one — but always append the results in the original tool_calls order so the
                 // transcript stays deterministic. dispatchTool turns failures/denials into a
                 // result string, so Promise.all never rejects and cancels its siblings.
-                const calls = choice.tool_calls;
                 let results: string[];
                 if (this.options.parallelToolCalls && calls.length > 1) {
-                    results = await Promise.all(calls.map((tc) => this.dispatchTool(tc.function.name, tc.function.arguments, search, tc.id)));
+                    results = await Promise.all(
+                        calls.map((tc) => {
+                            const reason = blocks?.get(tc.id);
+                            if (reason !== undefined) return Promise.resolve(sepBlockedResult(reason));
+                            return this.dispatchTool(tc.function.name, tc.function.arguments, search, tc.id);
+                        }),
+                    );
                 } else {
                     results = [];
                     for (const tc of calls) {
-                        results.push(await this.dispatchTool(tc.function.name, tc.function.arguments, search, tc.id));
+                        const reason = blocks?.get(tc.id);
+                        results.push(reason !== undefined ? sepBlockedResult(reason) : await this.dispatchTool(tc.function.name, tc.function.arguments, search, tc.id));
                     }
                 }
                 for (let i = 0; i < calls.length; i++) {
@@ -544,6 +676,7 @@ export class SmoothAgent {
                 }
             }
 
+            this.sepTurnComplete(maxIterations, lastText);
             return { text: lastText, iterations: maxIterations, toolCalls, usage: tracker.usage, costUsd: tracker.costUsd, budgetExceeded: false };
         } finally {
             // Persist the conversation (sans system prompt, which is rebuilt each turn).
@@ -607,6 +740,7 @@ export class SmoothAgent {
 
         const maxContextTokens = this.options.maxContextTokens ?? DEFAULTS.maxContextTokens;
         const model = this.options.model ?? DEFAULTS.model;
+        this.sepDispatch('turn_start', { agent_id: model });
         const tracker = new CostTracker();
         try {
             for (let iteration = 1; iteration <= maxIterations; iteration++) {
@@ -662,6 +796,7 @@ export class SmoothAgent {
                 turnMessages.push(assistantMsg);
 
                 if (tracker.exceeds(this.options.budget)) {
+                    this.sepTurnComplete(iteration, lastText);
                     yield {
                         type: 'done',
                         response: { text: lastText, iterations: iteration, toolCalls, usage: tracker.usage, costUsd: tracker.costUsd, budgetExceeded: true },
@@ -670,6 +805,7 @@ export class SmoothAgent {
                 }
 
                 if (assembled.toolCalls.length === 0) {
+                    this.sepTurnComplete(iteration, lastText);
                     yield {
                         type: 'done',
                         response: { text: lastText, iterations: iteration, toolCalls, usage: tracker.usage, costUsd: tracker.costUsd, budgetExceeded: false },
@@ -678,7 +814,8 @@ export class SmoothAgent {
                 }
 
                 toolCalls += assembled.toolCalls.length;
-                const calls = assembled.toolCalls;
+                // SEP `tool_call` hook: same fold as `run` — veto or rewrite before dispatch.
+                const { calls, blocks } = await this.sepToolCallPlan(assembled.toolCalls);
                 // Emit a tool_call event per requested call (original order) BEFORE dispatch.
                 for (const tc of calls) {
                     yield { type: 'tool_call', name: tc.function.name, arguments: tc.function.arguments };
@@ -686,13 +823,18 @@ export class SmoothAgent {
                 // Reuse the SAME dispatch path as `run` (clearance, human-gate, tool_search,
                 // JSON parsing, error-to-string, parallelToolCalls). Results are surfaced in
                 // original call order so the event stream stays deterministic.
+                const dispatchOne = (tc: (typeof calls)[number]): Promise<ToolResult> => {
+                    const reason = blocks?.get(tc.id);
+                    if (reason !== undefined) return Promise.resolve({ toolCallId: tc.id, content: sepBlockedResult(reason), isError: true });
+                    return this.dispatchToolResult(tc.function.name, tc.function.arguments, search, tc.id);
+                };
                 let results: ToolResult[];
                 if (this.options.parallelToolCalls && calls.length > 1) {
-                    results = await Promise.all(calls.map((tc) => this.dispatchToolResult(tc.function.name, tc.function.arguments, search, tc.id)));
+                    results = await Promise.all(calls.map(dispatchOne));
                 } else {
                     results = [];
                     for (const tc of calls) {
-                        results.push(await this.dispatchToolResult(tc.function.name, tc.function.arguments, search, tc.id));
+                        results.push(await dispatchOne(tc));
                     }
                 }
                 for (let i = 0; i < calls.length; i++) {
@@ -703,6 +845,7 @@ export class SmoothAgent {
                 }
             }
 
+            this.sepTurnComplete(maxIterations, lastText);
             yield {
                 type: 'done',
                 response: { text: lastText, iterations: maxIterations, toolCalls, usage: tracker.usage, costUsd: tracker.costUsd, budgetExceeded: false },
