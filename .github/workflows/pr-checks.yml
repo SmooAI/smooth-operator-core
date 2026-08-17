@@ -42,7 +42,6 @@ jobs:
             - name: Clippy
               working-directory: rust
               run: cargo clippy --workspace --all-targets -- -D warnings
-              continue-on-error: true # pedantic + nursery lints set to warn in workspace; shouldn't block PRs
 
             - name: Test
               working-directory: rust
@@ -56,7 +55,6 @@ jobs:
             - name: Clippy (temporal feature)
               working-directory: rust
               run: cargo clippy -p smooai-smooth-operator-temporal --features temporal --all-targets -- -D warnings
-              continue-on-error: true # pedantic + nursery lints set to warn in workspace; shouldn't block PRs
 
             - name: Test (temporal feature)
               working-directory: rust
