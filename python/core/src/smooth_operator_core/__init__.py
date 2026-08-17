@@ -44,6 +44,17 @@ from .llm_provider import (
     usage,
 )
 from .memory import InMemoryMemory, Memory, MemoryEntry
+from .narc import (
+    NarcAlert,
+    NarcFinding,
+    NarcHook,
+    Severity,
+    has_injection,
+    has_secrets,
+    redact_match,
+    scan_injection,
+    scan_secrets,
+)
 from .permission import (
     Allow,
     Ask,
@@ -118,6 +129,15 @@ __all__ = [
     "LlmProvider",
     "Memory",
     "MemoryEntry",
+    "NarcAlert",
+    "NarcFinding",
+    "NarcHook",
+    "Severity",
+    "has_injection",
+    "has_secrets",
+    "redact_match",
+    "scan_injection",
+    "scan_secrets",
     "MockLlmProvider",
     "ModelPricing",
     "parse_gateway_cost",

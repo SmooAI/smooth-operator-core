@@ -44,6 +44,8 @@ export { MockLlmProvider, SCRIPTED_USAGE, textResponse, toolCallResponse } from 
 export type { LlmProvider, RecordedCall, ScriptedMessage, ScriptedUsage } from './llmProvider.js';
 export { InMemoryMemory } from './memory.js';
 export type { Memory, MemoryEntry } from './memory.js';
+export { hasInjection, hasSecrets, NarcHook, redactMatch, scanInjection, scanSecrets, Severity, severityLabel } from './narc.js';
+export type { NarcAlert, NarcFinding } from './narc.js';
 export { LexicalReranker, NoopReranker } from './rerank.js';
 export type { Reranker } from './rerank.js';
 export { SmoothAgentThread } from './thread.js';
