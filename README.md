@@ -29,7 +29,7 @@ Most agent frameworks hand the model a pile of tools and hope for the best. `smo
 
 It's the runtime that powers the [**smooth-operator**](https://github.com/SmooAI/smooth-operator) service behind the [Smoo AI](https://smoo.ai) platform in production — not a notebook demo. Inspired by LangGraph, CrewAI, and Agno, with one hard difference: every surface is covered by **hundreds of fast, offline unit tests** built on a deterministic `MockLlmClient`, so the loop is verified — not vibe-coded. And it's the **same engine in five languages** — write your agent where your stack already lives.
 
-> The Rust implementation is the source of truth. The TypeScript, Python, Go, and C#/.NET ports mirror its surface at parity (protocol-first; see [Repository layout](#repository-layout)).
+> The Rust implementation is the source of truth. The TypeScript, Python, Go, and C#/.NET ports mirror its surface at parity (protocol-first; see [Repository layout](#repository-layout)). One engine surface is still Rust-first — the extension **sandbox / integrity hardening** — and the durable-execution **backend** (Temporal) ships only for Rust, though the seam it plugs into is in all five. Everything else in [the feature list](./docs/Polyglot-Engines.md#feature-surface-the-shared-core-in-all-five-engines) is in all five today.
 
 ---
 
@@ -354,7 +354,7 @@ cargo clippy --all-targets -- -D warnings
 
 ## Repository layout
 
-This is a multi-language SmooAI package. The Rust crate is the reference; the other four are **native ports at parity** — the same engine, idiomatic in each language, held to a shared eval suite. Each ships to its language's registry with its own README landing page. For install commands and a hello-agent example in every language, see [**docs/Polyglot-Engines.md**](./docs/Polyglot-Engines.md).
+This is a multi-language SmooAI package. The Rust crate is the reference; the other four are **native ports at parity** — the same engine, idiomatic in each language, held to shared corpora that all five replay: the eval scenarios ([`spec/evals/scenarios.json`](./spec/evals/scenarios.json)), the Narc secret/injection detection set ([`spec/narc/corpus.json`](./spec/narc/corpus.json)), and the provider-routing table ([`spec/providers/routing.json`](./spec/providers/routing.json)). Each corpus is generated from the Rust reference and replayed by Rust too, so the reference cannot drift away from its own ports unnoticed. Each ships to its language's registry with its own README landing page. For install commands and a hello-agent example in every language, see [**docs/Polyglot-Engines.md**](./docs/Polyglot-Engines.md).
 
 | Language | Directory | Package | Registry |
 | --- | --- | --- | --- |
