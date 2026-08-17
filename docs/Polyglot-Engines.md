@@ -17,7 +17,7 @@ The Rust crate is the reference implementation. The other four engines mirror it
 
 ## Feature surface (the shared core, in all five engines)
 
-Every engine supports the same core capabilities below. Beyond this shared core, the Rust reference carries surfaces still being ported (real gateway LLM client with streaming/retry/quirks, multimodal images, structured output, prompt caching, provider routing, the NarcHook secret/injection scanner, and the extension sandbox/integrity hardening) — if a capability matters to you in a non-Rust engine, check that language's package docs before assuming it:
+Every engine supports the same core capabilities below. Beyond this shared core, the Rust reference carries surfaces still being ported (multimodal images, structured output, prompt caching, provider routing, the NarcHook secret/injection scanner, and the extension sandbox/integrity hardening) — if a capability matters to you in a non-Rust engine, check that language's package docs before assuming it. A real gateway LLM client is no longer one of them: all five now ship one, though the Rust client's provider quirks/routing remain ahead.
 
 - **Agentic tool-calling loop** — observe → think → act, looping until the model answers.
 - **In-memory + vector knowledge (RAG)** — ground the turn in retrieved documents.
@@ -31,7 +31,7 @@ Every engine supports the same core capabilities below. Beyond this shared core,
 - **Cast** — roles + clearance (tool-access policy per role).
 - **Human-in-the-loop gate** — require approval before designated tool calls run.
 - **Conversation thread** — carry a conversation across multiple `run` calls.
-- **`LlmProvider` seam + `MockLlmProvider`** — inject any OpenAI-compatible client; a deterministic record/replay mock drives the offline tests.
+- **`LlmProvider` seam + `MockLlmProvider`** — inject any OpenAI-compatible client; a deterministic record/replay mock drives the offline tests, and a shipped real HTTP client talks to a live gateway (see [Talking to a real gateway](#talking-to-a-real-gateway)).
 - **Deferred tools + `tool_search`** — hide rarely-used tool schemas behind a built-in `tool_search` meta-tool the model calls to promote the ones it needs.
 - **Typed workflow graph** — a node/edge workflow engine alongside the agent loop.
 - **Parallel tool calls** — dispatch ≥2 tool calls concurrently (transcript order preserved).
@@ -170,6 +170,23 @@ Console.WriteLine(response.Text);
 ```
 
 `new SmoothAgent(chatClient, options)` takes an `IChatClient` (the `MockLlmProvider` implements it) and an `AgentOptions`. `await agent.RunAsync(...)` returns an `AgentRunResponse`; `response.Text` is the final assistant message. (`RunStreamingAsync` is the streaming variant.)
+
+## Talking to a real gateway
+
+The examples above use the mock so they run with no credentials. Every engine also ships a **real** client for any OpenAI-compatible `/chat/completions` endpoint — the SmooAI gateway (`https://llm.smoo.ai/v1`), or anything that speaks the same wire. The mock stays the default/test seam; the real client is opt-in, so an unwired consumer behaves exactly as before.
+
+| Engine     | Construct                                                              | Implementation                                                       |
+| ---------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Rust       | built from `config.llm` when no provider is injected                    | native (`src/llm.rs`)                                                 |
+| TypeScript | `createGatewayClient({ baseURL, apiKey })`                              | thin adapter over the `openai` SDK (already a dependency)             |
+| Python     | `GatewayLlmProvider(base_url=…, api_key=…)`                             | thin adapter over the `openai` SDK (already a dependency)             |
+| Go         | `core.NewGatewayClient(baseURL, apiKey)`                                | native `net/http` (`go/core/openai.go`)                               |
+| C# / .NET  | `new GatewayChatClient(baseUrl, apiKey, model)`                         | native `HttpClient` — no added NuGet dependency                       |
+
+All five do the same two things beyond the plain wire format, and both are easy to get wrong:
+
+- **Read the gateway cost header before the body.** Per-request cost is reported ONLY in a response header, and on the **streaming** path those headers are unreachable once the SSE body is being consumed. Each client parses them up front and carries the cost forward (on the response when blocking; on a leading chunk when streaming), so it folds into the turn's `costUsd` even if the stream errors before usage arrives. Reading them after iterating the stream silently finds nothing — the regression fixed in Rust by core#102 and swept across the ports by core#121. The candidate list and its first-**non-zero** precedence is shared: `x-litellm-response-cost-margin-amount` → `-original` → `x-litellm-response-cost` → `x-response-cost` → `x-cost-usd`. A header that is present and reports `0` is NOT a recorded $0 — it falls through, and if nothing measures, the local pricing estimate is used instead.
+- **Send `metadata` only when set.** The top-level OpenAI-compat `metadata` object (LiteLLM records it on spend logs) is omitted entirely when unset, keeping the request byte-identical to a client that never knew about the field.
 
 ## Streaming
 

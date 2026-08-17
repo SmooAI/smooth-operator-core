@@ -24,6 +24,7 @@ from .checkpoint import Checkpoint, CheckpointStore, InMemoryCheckpointStore
 from .context import FileRef, load_project_context, parse_file_references
 from .cost import GATEWAY_COST_HEADERS, CostBudget, CostTracker, ModelPricing, Usage, parse_gateway_cost
 from .deny_policy import DenyPolicy, DenyPredicate, DenyReason, DenyRules
+from .gateway_client import GatewayLlmProvider
 from .hooks import ToolCall, ToolHook, ToolResult
 from .human_gate import (
     DelegateHumanGate,
@@ -99,6 +100,7 @@ __all__ = [
     "load_project_context",
     "parse_file_references",
     "FunctionTool",
+    "GatewayLlmProvider",
     "delegate_tool",
     "effective_max_tokens",
     "HashEmbedder",
