@@ -67,6 +67,10 @@ export function createGatewayClient(options: GatewayClientOptions): ChatClientLi
  */
 export function gatewayClientFrom(sdk: OpenAI): ChatClientLike {
     return {
+        // Surfaced so the agent can gate Anthropic prompt-cache markers on the route
+        // it is actually talking to (see cacheControl.ts). Read off the SDK so a
+        // hand-constructed client reports its real base URL, not a re-declared one.
+        apiBaseUrl: sdk.baseURL,
         chat: {
             completions: {
                 async create(body: Record<string, unknown>) {

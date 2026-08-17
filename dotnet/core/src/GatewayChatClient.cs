@@ -280,6 +280,12 @@ public sealed class GatewayChatClient : IChatClient
         {
             body["response_format"] = responseFormat;
         }
+        // Anthropic prompt-cache markers, gated on the model + route. A no-op for every
+        // other upstream, so the body stays byte-identical on the OpenAI/Gemini/Groq paths.
+        if (CacheControl.SupportsAnthropicCacheControl((string?)body["model"], _endpoint.ToString()))
+        {
+            CacheControl.Apply(body);
+        }
 
         return new HttpRequestMessage(HttpMethod.Post, _endpoint)
         {
