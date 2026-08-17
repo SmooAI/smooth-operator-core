@@ -5,8 +5,9 @@ Every assertion here is a round-trip: an ``http.server`` speaking the OpenAI
 :class:`GatewayLlmProvider` and a live :class:`SmoothAgent`. Nothing is mocked below
 the socket, so these cover the things a mock cannot: that the SSE framing parses,
 that ``metadata`` reaches the wire (and is ABSENT when unset), and above all that
-the cost header is read on the streaming path — where it is gone the moment the SSE
-body is consumed (the regression core#102 fixed in Rust).
+the cost header is read on the streaming path. The response headers survive the body
+being consumed just fine; the regression core#102 fixed in Rust was keeping only the
+stream and dropping the response, leaving nothing to read a header off at all.
 """
 
 from __future__ import annotations

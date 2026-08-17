@@ -6,8 +6,10 @@
  * {@link createGatewayClient} and a live {@link SmoothAgent}. Nothing is mocked
  * below the socket, so these cover the things a mock cannot: that the SSE framing
  * parses, that `metadata` reaches the wire (and is ABSENT when unset), and above
- * all that the cost header is read on the streaming path — where it is gone the
- * moment the SSE body is consumed (the regression core#102 fixed in Rust).
+ * all that the cost header is read on the streaming path. The response headers
+ * survive the body being consumed just fine; the regression core#102 fixed in Rust
+ * was keeping only the stream and dropping the response, leaving nothing to read a
+ * header off at all.
  */
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
