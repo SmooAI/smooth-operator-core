@@ -173,7 +173,7 @@ let agent = Agent::new(config, registry).with_checkpoint_store(checkpoints);
 | An agent loop you can **trust** | observe→think→act with iteration caps, parallel tool calls, and a typed `AgentEvent` stream |
 | **Typed tools** with guardrails | `Tool` trait + `ToolRegistry`, with pre/post hooks for surveillance, secret detection, prompt-injection guards |
 | **Deny what must never run** | `PermissionHook` gate (`AutoMode`: ask / accept-edits / deny-unmatched / bypass) + hard circuit-breakers + a consumer `DenyPolicy` (declarative TOML rules + semantic predicates) |
-| **Stateful graphs** (a LangGraph analog) | `Workflow<S>` / `WorkflowBuilder<S>` with conditional edges and typed state |
+| **Stateful graphs** (a LangGraph analog) | `Workflow<S>` / `WorkflowBuilder<S>` with conditional edges and typed state, plus `sub_workflow_node` to run a whole child graph to completion inside one parent step |
 | **Resume after a crash** | `CheckpointStore`: in-memory, file, SQLite, or Postgres |
 | **RAG + memory** | `KnowledgeBase` / `Memory` traits (with in-memory impls) as clean seams |
 | **Humans in the loop** | `ConfirmationHook` + human channels for gated tool calls |
