@@ -82,6 +82,7 @@ from .permission_grants import (
 )
 from .prompt_cache import PROMPT_CACHE_BOUNDARY, PromptCache
 from .rerank import LexicalReranker, NoopReranker, Reranker
+from .structured import ResponseFormat, json_schema_format, response_format_field, structured_json
 from .thread import SmoothAgentThread
 from .tool_search import ToolSearch
 from .vector import Embedder, HashEmbedder, VectorKnowledge
@@ -145,12 +146,16 @@ __all__ = [
     "PROMPT_CACHE_BOUNDARY",
     "PromptCache",
     "NoopReranker",
+    "json_schema_format",
+    "response_format_field",
     "OperatorRole",
     "RecordedCall",
     "Reranker",
+    "ResponseFormat",
     "RoleKind",
     "SmoothAgent",
     "SmoothAgentThread",
+    "structured_json",
     "Tool",
     "ToolCall",
     "ToolHook",
