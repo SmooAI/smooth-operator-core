@@ -37,6 +37,35 @@ export {
     toolCategory,
 } from './permission.js';
 export type { Category, Verdict } from './permission.js';
+export {
+    ALL_PRESETS,
+    Activity,
+    ApiFormat,
+    anthropicProvider,
+    buildModelInfoUrl,
+    defaultModelRouting,
+    fetchModelInfo,
+    googleProvider,
+    kimiCodeProvider,
+    kimiProvider,
+    llmGatewayProvider,
+    modelSlot,
+    ollamaProvider,
+    openAiProvider,
+    openRouterProvider,
+    parseModelInfo,
+    Preset,
+    presetFromName,
+    presetProviderId,
+    ProviderRegistry,
+    quirkKeys,
+    quirksDebugSnapshot,
+    quirksForModel,
+    slotFor,
+    smooaiGatewayProvider,
+    withFallback,
+} from './providers.js';
+export type { LlmConfig, ModelQuirks, ModelRouting, ModelSlot, PresetInfo, ProviderConfig, ResolvedModel } from './providers.js';
 export { hostMatchesGlob, PermissionGrants } from './permissionGrants.js';
 export type { GrantQuery } from './permissionGrants.js';
 export { DenyPolicy, DenyRules, globMatch } from './denyPolicy.js';

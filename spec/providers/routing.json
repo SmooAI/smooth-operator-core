@@ -1,0 +1,642 @@
+{
+    "$comment": "SHARED provider-routing corpus \u2014 the cross-language drift gate for model routing (rust/smooth-operator-core/src/providers.rs), per-model wire quirks (quirks.rs), and LiteLLM alias resolution (resolution.rs), plus their Go/TypeScript/Python/.NET ports. Every engine loads THIS file and asserts its own registry, quirk table and URL/parse helpers produce exactly these values. The expectations were GENERATED from the Rust reference, which is normative: if a port disagrees, the port is wrong. Routing is where a silent divergence is most expensive \u2014 a slot that resolves to the wrong model or the wrong base URL sends real traffic and real money somewhere nobody intended, and it looks like it is working. Presets are dumped with apiKey='test-key' and with SMOOAI_GATEWAY_URL unset, so the smooai-gateway rows pin the production default URL.",
+    "defaultRouting": {
+        "coding": {
+            "model": "openrouter/auto",
+            "provider": "openrouter"
+        },
+        "default": {
+            "model": "openrouter/auto",
+            "provider": "openrouter"
+        },
+        "fast": {
+            "model": "openrouter/auto",
+            "provider": "openrouter"
+        },
+        "judge": {
+            "model": "openrouter/auto",
+            "provider": "openrouter"
+        },
+        "reasoning": {
+            "model": "openrouter/auto",
+            "provider": "openrouter"
+        },
+        "reviewing": {
+            "model": "openrouter/auto",
+            "provider": "openrouter"
+        },
+        "summarize": {
+            "model": "openrouter/auto",
+            "provider": "openrouter"
+        }
+    },
+    "fallbackChain": {
+        "apiKey": "t-key",
+        "apiUrl": "https://tertiary.example.com/v1",
+        "model": "model-c"
+    },
+    "modelInfoParse": [
+        {
+            "body": "{\"data\":[{\"model_name\":\"smooth-coding\",\"litellm_params\":{\"model\":\"moonshot/kimi-k2-thinking\"},\"model_info\":{\"id\":\"abc-123\",\"max_tokens\":200000}}]}",
+            "entries": [
+                {
+                    "alias": "smooth-coding",
+                    "id": "abc-123",
+                    "upstream": "moonshot/kimi-k2-thinking"
+                }
+            ],
+            "id": "single_entry"
+        },
+        {
+            "body": "{\"data\":[{\"model_name\":\"smooth-thinking\",\"litellm_params\":{\"model\":\"openrouter/z-ai/glm-5.1\"}},{\"model_name\":\"smooth-coding\",\"litellm_params\":{\"model\":\"minimax/minimax-m2.7\"}},{\"model_name\":\"gpt-4o\",\"litellm_params\":{\"model\":\"openai/gpt-4o\"}}]}",
+            "entries": [
+                {
+                    "alias": "gpt-4o",
+                    "id": null,
+                    "upstream": "openai/gpt-4o"
+                },
+                {
+                    "alias": "smooth-coding",
+                    "id": null,
+                    "upstream": "minimax/minimax-m2.7"
+                },
+                {
+                    "alias": "smooth-thinking",
+                    "id": null,
+                    "upstream": "openrouter/z-ai/glm-5.1"
+                }
+            ],
+            "id": "sorted_by_alias"
+        },
+        {
+            "body": "{\"data\":[{\"model_name\":\"custom-alias\",\"litellm_params\":{},\"model_info\":{}}]}",
+            "entries": [
+                {
+                    "alias": "custom-alias",
+                    "id": null,
+                    "upstream": null
+                }
+            ],
+            "id": "missing_upstream"
+        },
+        {
+            "body": "{\"data\":[]}",
+            "entries": [],
+            "id": "empty_data"
+        }
+    ],
+    "modelInfoUrls": [
+        {
+            "apiUrl": "https://gateway.example.com/v1",
+            "modelInfoUrl": "https://gateway.example.com/model/info"
+        },
+        {
+            "apiUrl": "https://gateway.example.com/v1/",
+            "modelInfoUrl": "https://gateway.example.com/model/info"
+        },
+        {
+            "apiUrl": "https://example.com",
+            "modelInfoUrl": "https://example.com/model/info"
+        },
+        {
+            "apiUrl": "https://example.com/",
+            "modelInfoUrl": "https://example.com/model/info"
+        },
+        {
+            "apiUrl": "https://llm.smoo.ai/v1",
+            "modelInfoUrl": "https://llm.smoo.ai/model/info"
+        }
+    ],
+    "presetNames": [
+        {
+            "name": "smooai-gateway",
+            "preset": "smooai-gateway"
+        },
+        {
+            "name": "smooai",
+            "preset": "smooai-gateway"
+        },
+        {
+            "name": "gateway",
+            "preset": "smooai-gateway"
+        },
+        {
+            "name": "openrouter-low-cost",
+            "preset": "openrouter"
+        },
+        {
+            "name": "low-cost",
+            "preset": "openrouter"
+        },
+        {
+            "name": "llmgateway-low-cost",
+            "preset": "llmgateway"
+        },
+        {
+            "name": "gateway-low-cost",
+            "preset": "llmgateway"
+        },
+        {
+            "name": "openai",
+            "preset": "openai"
+        },
+        {
+            "name": "codex",
+            "preset": "openai"
+        },
+        {
+            "name": "anthropic",
+            "preset": "anthropic"
+        },
+        {
+            "name": "bogus",
+            "preset": null
+        },
+        {
+            "name": "",
+            "preset": null
+        }
+    ],
+    "presets": [
+        {
+            "name": "smooai-gateway",
+            "providerId": "smooai-gateway",
+            "registeredProviders": [
+                "smooai-gateway"
+            ],
+            "slots": {
+                "coding": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://llm.smoo.ai/v1",
+                    "maxTokens": 32768,
+                    "model": "smooth-coding",
+                    "temperature": 0.0
+                },
+                "default": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://llm.smoo.ai/v1",
+                    "maxTokens": 32768,
+                    "model": "smooth-default",
+                    "temperature": 0.0
+                },
+                "fast": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://llm.smoo.ai/v1",
+                    "maxTokens": 32768,
+                    "model": "smooth-fast",
+                    "temperature": 0.0
+                },
+                "judge": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://llm.smoo.ai/v1",
+                    "maxTokens": 32768,
+                    "model": "smooth-judge",
+                    "temperature": 0.0
+                },
+                "reasoning": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://llm.smoo.ai/v1",
+                    "maxTokens": 32768,
+                    "model": "smooth-reasoning",
+                    "temperature": 0.0
+                },
+                "reviewing": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://llm.smoo.ai/v1",
+                    "maxTokens": 32768,
+                    "model": "smooth-reviewing",
+                    "temperature": 0.0
+                },
+                "summarize": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://llm.smoo.ai/v1",
+                    "maxTokens": 32768,
+                    "model": "smooth-summarize",
+                    "temperature": 0.0
+                }
+            }
+        },
+        {
+            "name": "openrouter-low-cost",
+            "providerId": "openrouter",
+            "registeredProviders": [
+                "openrouter"
+            ],
+            "slots": {
+                "coding": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://openrouter.ai/api/v1",
+                    "maxTokens": 32768,
+                    "model": "minimax/minimax-m2.7",
+                    "temperature": 0.0
+                },
+                "default": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://openrouter.ai/api/v1",
+                    "maxTokens": 32768,
+                    "model": "deepseek/deepseek-v3.2",
+                    "temperature": 0.0
+                },
+                "fast": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://openrouter.ai/api/v1",
+                    "maxTokens": 32768,
+                    "model": "google/gemini-2.5-flash-lite",
+                    "temperature": 0.0
+                },
+                "judge": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://openrouter.ai/api/v1",
+                    "maxTokens": 32768,
+                    "model": "google/gemini-2.5-flash",
+                    "temperature": 0.0
+                },
+                "reasoning": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://openrouter.ai/api/v1",
+                    "maxTokens": 32768,
+                    "model": "z-ai/glm-5.1",
+                    "temperature": 0.0
+                },
+                "reviewing": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://openrouter.ai/api/v1",
+                    "maxTokens": 32768,
+                    "model": "deepseek/deepseek-v3.2",
+                    "temperature": 0.0
+                },
+                "summarize": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://openrouter.ai/api/v1",
+                    "maxTokens": 32768,
+                    "model": "deepseek/deepseek-v3.2",
+                    "temperature": 0.0
+                }
+            }
+        },
+        {
+            "name": "llmgateway-low-cost",
+            "providerId": "llmgateway",
+            "registeredProviders": [
+                "llmgateway"
+            ],
+            "slots": {
+                "coding": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.llmgateway.io/v1",
+                    "maxTokens": 32768,
+                    "model": "minimax-m2.7",
+                    "temperature": 0.0
+                },
+                "default": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.llmgateway.io/v1",
+                    "maxTokens": 32768,
+                    "model": "deepseek-v3.2",
+                    "temperature": 0.0
+                },
+                "fast": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.llmgateway.io/v1",
+                    "maxTokens": 32768,
+                    "model": "gemini-2.5-flash-lite",
+                    "temperature": 0.0
+                },
+                "judge": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.llmgateway.io/v1",
+                    "maxTokens": 32768,
+                    "model": "gemini-2.5-flash",
+                    "temperature": 0.0
+                },
+                "reasoning": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.llmgateway.io/v1",
+                    "maxTokens": 32768,
+                    "model": "glm-5",
+                    "temperature": 0.0
+                },
+                "reviewing": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.llmgateway.io/v1",
+                    "maxTokens": 32768,
+                    "model": "deepseek-v3.2",
+                    "temperature": 0.0
+                },
+                "summarize": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.llmgateway.io/v1",
+                    "maxTokens": 32768,
+                    "model": "deepseek-v3.2",
+                    "temperature": 0.0
+                }
+            }
+        },
+        {
+            "name": "openai",
+            "providerId": "openai",
+            "registeredProviders": [
+                "openai"
+            ],
+            "slots": {
+                "coding": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.openai.com/v1",
+                    "maxTokens": 32768,
+                    "model": "gpt-4o",
+                    "temperature": 0.0
+                },
+                "default": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.openai.com/v1",
+                    "maxTokens": 32768,
+                    "model": "gpt-4o",
+                    "temperature": 0.0
+                },
+                "fast": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.openai.com/v1",
+                    "maxTokens": 32768,
+                    "model": "gpt-4o-mini",
+                    "temperature": 0.0
+                },
+                "judge": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.openai.com/v1",
+                    "maxTokens": 32768,
+                    "model": "gpt-4o-mini",
+                    "temperature": 0.0
+                },
+                "reasoning": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.openai.com/v1",
+                    "maxTokens": 32768,
+                    "model": "o3-mini",
+                    "temperature": 0.0
+                },
+                "reviewing": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.openai.com/v1",
+                    "maxTokens": 32768,
+                    "model": "gpt-4o",
+                    "temperature": 0.0
+                },
+                "summarize": {
+                    "apiFormat": "OpenAiCompat",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.openai.com/v1",
+                    "maxTokens": 32768,
+                    "model": "gpt-4o-mini",
+                    "temperature": 0.0
+                }
+            }
+        },
+        {
+            "name": "anthropic",
+            "providerId": "anthropic",
+            "registeredProviders": [
+                "anthropic"
+            ],
+            "slots": {
+                "coding": {
+                    "apiFormat": "Anthropic",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.anthropic.com/v1",
+                    "maxTokens": 32768,
+                    "model": "claude-sonnet-4-20250514",
+                    "temperature": 0.0
+                },
+                "default": {
+                    "apiFormat": "Anthropic",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.anthropic.com/v1",
+                    "maxTokens": 32768,
+                    "model": "claude-sonnet-4-20250514",
+                    "temperature": 0.0
+                },
+                "fast": {
+                    "apiFormat": "Anthropic",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.anthropic.com/v1",
+                    "maxTokens": 32768,
+                    "model": "claude-haiku-4-5-20251001",
+                    "temperature": 0.0
+                },
+                "judge": {
+                    "apiFormat": "Anthropic",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.anthropic.com/v1",
+                    "maxTokens": 32768,
+                    "model": "claude-haiku-4-5-20251001",
+                    "temperature": 0.0
+                },
+                "reasoning": {
+                    "apiFormat": "Anthropic",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.anthropic.com/v1",
+                    "maxTokens": 32768,
+                    "model": "claude-opus-4-20250514",
+                    "temperature": 0.0
+                },
+                "reviewing": {
+                    "apiFormat": "Anthropic",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.anthropic.com/v1",
+                    "maxTokens": 32768,
+                    "model": "claude-sonnet-4-20250514",
+                    "temperature": 0.0
+                },
+                "summarize": {
+                    "apiFormat": "Anthropic",
+                    "apiKey": "test-key",
+                    "apiUrl": "https://api.anthropic.com/v1",
+                    "maxTokens": 32768,
+                    "model": "claude-haiku-4-5-20251001",
+                    "temperature": 0.0
+                }
+            }
+        }
+    ],
+    "providerFactories": [
+        {
+            "apiFormat": "OpenAiCompat",
+            "apiKey": "k",
+            "apiUrl": "https://openrouter.ai/api/v1",
+            "defaultModel": "openai/gpt-4o",
+            "factory": "openrouter",
+            "id": "openrouter"
+        },
+        {
+            "apiFormat": "OpenAiCompat",
+            "apiKey": "k",
+            "apiUrl": "https://api.openai.com/v1",
+            "defaultModel": "gpt-4o",
+            "factory": "openai",
+            "id": "openai"
+        },
+        {
+            "apiFormat": "Anthropic",
+            "apiKey": "k",
+            "apiUrl": "https://api.anthropic.com/v1",
+            "defaultModel": "claude-sonnet-4-20250514",
+            "factory": "anthropic",
+            "id": "anthropic"
+        },
+        {
+            "apiFormat": "OpenAiCompat",
+            "apiKey": "",
+            "apiUrl": "http://localhost:11434/v1",
+            "defaultModel": "llama3",
+            "factory": "ollama",
+            "id": "ollama"
+        },
+        {
+            "apiFormat": "OpenAiCompat",
+            "apiKey": "k",
+            "apiUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+            "defaultModel": "gemini-2.0-flash",
+            "factory": "google",
+            "id": "google"
+        },
+        {
+            "apiFormat": "OpenAiCompat",
+            "apiKey": "k",
+            "apiUrl": "https://api.moonshot.ai/v1",
+            "defaultModel": "kimi-k2.5",
+            "factory": "kimi",
+            "id": "kimi"
+        },
+        {
+            "apiFormat": "Anthropic",
+            "apiKey": "k",
+            "apiUrl": "https://api.kimi.com/coding/v1",
+            "defaultModel": "kimi-for-coding",
+            "factory": "kimiCode",
+            "id": "kimi-code"
+        },
+        {
+            "apiFormat": "OpenAiCompat",
+            "apiKey": "k",
+            "apiUrl": "https://api.llmgateway.io/v1",
+            "defaultModel": "openai/gpt-4o",
+            "factory": "llmgateway",
+            "id": "llmgateway"
+        },
+        {
+            "apiFormat": "OpenAiCompat",
+            "apiKey": "k",
+            "apiUrl": "https://llm.smoo.ai/v1",
+            "defaultModel": "smooth-default",
+            "factory": "smooaiGateway",
+            "id": "smooai-gateway"
+        }
+    ],
+    "quirks": [
+        {
+            "allowParallelTools": null,
+            "matchedKeys": [],
+            "strictToolCallJson": false,
+            "upstream": "gpt-4o"
+        },
+        {
+            "allowParallelTools": null,
+            "matchedKeys": [],
+            "strictToolCallJson": false,
+            "upstream": "anthropic/claude-sonnet-4-6"
+        },
+        {
+            "allowParallelTools": null,
+            "matchedKeys": [
+                "qwen3-coder"
+            ],
+            "strictToolCallJson": true,
+            "upstream": "qwen3-coder-plus"
+        },
+        {
+            "allowParallelTools": null,
+            "matchedKeys": [
+                "qwen3-coder"
+            ],
+            "strictToolCallJson": true,
+            "upstream": "dashscope/qwen3-coder-plus-2025"
+        },
+        {
+            "allowParallelTools": null,
+            "matchedKeys": [
+                "qwen3-coder"
+            ],
+            "strictToolCallJson": true,
+            "upstream": "QWEN3-CODER-PLUS"
+        },
+        {
+            "allowParallelTools": null,
+            "matchedKeys": [
+                "qwen-coder"
+            ],
+            "strictToolCallJson": true,
+            "upstream": "qwen-coder"
+        },
+        {
+            "allowParallelTools": null,
+            "matchedKeys": [],
+            "strictToolCallJson": false,
+            "upstream": "smooth-coding"
+        }
+    ],
+    "unregisteredWithoutFallbackErrors": true,
+    "wireCompat": [
+        {
+            "id": "legacy_thinking_and_planning",
+            "json": "{\"providers\":[],\"routing\":{\"thinking\":{\"provider\":\"p\",\"model\":\"m-thinking\"},\"coding\":{\"provider\":\"p\",\"model\":\"m-coding\"},\"planning\":{\"provider\":\"p\",\"model\":\"m-planning\"},\"reviewing\":{\"provider\":\"p\",\"model\":\"m-reviewing\"},\"judge\":{\"provider\":\"p\",\"model\":\"m-judge\"},\"summarize\":{\"provider\":\"p\",\"model\":\"m-summarize\"},\"default\":{\"provider\":\"p\",\"model\":\"m-default\"}}}",
+            "slotModels": {
+                "coding": "m-coding",
+                "default": "m-default",
+                "fast": "m-default",
+                "judge": "m-judge",
+                "reasoning": "m-thinking",
+                "reviewing": "m-reviewing",
+                "summarize": "m-summarize"
+            }
+        },
+        {
+            "id": "reasoning_absent",
+            "json": "{\"providers\":[],\"routing\":{\"coding\":{\"provider\":\"p\",\"model\":\"m-coding\"},\"reviewing\":{\"provider\":\"p\",\"model\":\"m-reviewing\"},\"judge\":{\"provider\":\"p\",\"model\":\"m-judge\"},\"summarize\":{\"provider\":\"p\",\"model\":\"m-summarize\"},\"default\":{\"provider\":\"p\",\"model\":\"m-default\"}}}",
+            "slotModels": {
+                "coding": "m-coding",
+                "default": "m-default",
+                "fast": "m-default",
+                "judge": "m-judge",
+                "reasoning": "m-default",
+                "reviewing": "m-reviewing",
+                "summarize": "m-summarize"
+            }
+        }
+    ]
+}
