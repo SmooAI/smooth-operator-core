@@ -45,6 +45,12 @@
          prompt-injection detectors are pinned to the same vectors as the other four
          engines and cannot drift weaker unnoticed. -->
     <None Include="..\..\..\spec\narc\corpus.json" Link="narc\corpus.json" CopyToOutputDirectory="PreserveNewest" />
+
+    <!-- THE shared provider-routing corpus. Same deal as the eval and Narc corpora:
+         a build-time copy of the single source of truth at spec/providers/routing.json,
+         so the .NET registry, quirk table and alias resolver are pinned to the same
+         values as the other four engines and cannot drift unnoticed. -->
+    <None Include="..\..\..\spec\providers\routing.json" Link="providers\routing.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
