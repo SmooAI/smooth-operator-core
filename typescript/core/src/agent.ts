@@ -297,6 +297,16 @@ export interface ChatChunk {
         };
     }>;
     usage?: { prompt_tokens?: number | null; completion_tokens?: number | null } | null;
+    /**
+     * The gateway's per-request cost, when the client surfaced one. It lives ONLY in
+     * a response HEADER, which is gone once the SSE body is being consumed — so a
+     * streaming client reads it up front and rides it on a chunk (the gateway client
+     * uses a leading chunk with no `choices`, matching the Go engine). Absent ⇒
+     * unmeasured, and the local pricing estimate is used instead of a bogus $0.
+     */
+    gatewayCostUsd?: number;
+    /** Raw response headers, when the client hangs them off a chunk instead of pre-parsing. */
+    headers?: unknown;
 }
 
 /**
@@ -776,7 +786,14 @@ export class SmoothAgent {
                     ...metadataField(this.options.metadata),
                     stream: true,
                 });
+                // Cost lives in a response HEADER, which is gone once the SSE body is
+                // being consumed — so a streaming client reads it up front and rides it
+                // on a chunk. Mirrors python/agent.py's run_stream and Go's first-chunk
+                // ChatChunk{CostUSD}.
+                let gatewayCost: number | undefined;
                 for await (const chunk of stream) {
+                    const chunkCost = responseGatewayCost(chunk);
+                    if (chunkCost !== undefined) gatewayCost = chunkCost;
                     if (chunk.usage) assembled.usage = chunk.usage;
                     const delta = chunk.choices[0]?.delta;
                     if (!delta) continue;
@@ -797,7 +814,7 @@ export class SmoothAgent {
                     .sort((a, b) => a[0] - b[0])
                     .map(([, p]) => ({ id: p.id, function: { name: p.name, arguments: p.arguments } }));
 
-                tracker.recordWithGatewayCost(model, extractUsage(assembled.usage), responseGatewayCost(assembled), this.options.pricing);
+                tracker.recordWithGatewayCost(model, extractUsage(assembled.usage), gatewayCost, this.options.pricing);
                 lastText = assembled.content;
 
                 const assistantMsg: Record<string, unknown> = { role: 'assistant', content: assembled.content };

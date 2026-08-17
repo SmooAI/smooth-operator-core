@@ -14,6 +14,8 @@ export { InMemoryCheckpointStore } from './checkpoint.js';
 export type { Checkpoint, CheckpointStore } from './checkpoint.js';
 export { CostTracker, DEFAULT_PRICING, GATEWAY_COST_HEADERS, parseGatewayCost } from './cost.js';
 export type { CostBudget, HeaderLike, ModelPricing, Usage } from './cost.js';
+export { createGatewayClient, gatewayClientFrom } from './gatewayClient.js';
+export type { GatewayClientOptions } from './gatewayClient.js';
 export { approve, approveAlways, deny, HumanDecision, isApproved } from './humanGate.js';
 export type { HumanApprovalRequest, HumanApprovalResponse, HumanGate } from './humanGate.js';
 export {

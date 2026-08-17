@@ -23,6 +23,7 @@ from .cast import Cast, Clearance, OperatorRole, RoleKind
 from .checkpoint import Checkpoint, CheckpointStore, InMemoryCheckpointStore
 from .cost import GATEWAY_COST_HEADERS, CostBudget, CostTracker, ModelPricing, Usage, parse_gateway_cost
 from .deny_policy import DenyPolicy, DenyPredicate, DenyReason, DenyRules
+from .gateway_client import GatewayLlmProvider
 from .hooks import ToolCall, ToolHook, ToolResult
 from .human_gate import (
     DelegateHumanGate,
@@ -95,6 +96,7 @@ __all__ = [
     "DenyRules",
     "Embedder",
     "FunctionTool",
+    "GatewayLlmProvider",
     "delegate_tool",
     "effective_max_tokens",
     "HashEmbedder",
