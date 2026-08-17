@@ -17,7 +17,7 @@ The Rust crate is the reference implementation. The other four engines mirror it
 
 ## Feature surface (the shared core, in all five engines)
 
-Every engine supports the same core capabilities below. Beyond this shared core, the Rust reference carries surfaces still being ported (multimodal images, structured output, prompt caching, provider routing, the NarcHook secret/injection scanner, and the extension sandbox/integrity hardening) — if a capability matters to you in a non-Rust engine, check that language's package docs before assuming it. A real gateway LLM client is no longer one of them: all five now ship one, though the Rust client's provider quirks/routing remain ahead.
+Every engine supports the same core capabilities below. Beyond this shared core, the Rust reference carries surfaces still being ported (multimodal images, structured output, prompt caching, provider routing, and the extension sandbox/integrity hardening) — if a capability matters to you in a non-Rust engine, check that language's package docs before assuming it. A real gateway LLM client is no longer one of them: all five now ship one, though the Rust client's provider quirks/routing remain ahead.
 
 - **Agentic tool-calling loop** — observe → think → act, looping until the model answers.
 - **In-memory + vector knowledge (RAG)** — ground the turn in retrieved documents.
@@ -30,6 +30,7 @@ Every engine supports the same core capabilities below. Beyond this shared core,
 - **Sub-agents / delegation** — spawn child agents for sub-tasks.
 - **Cast** — roles + clearance (tool-access policy per role).
 - **Human-in-the-loop gate** — require approval before designated tool calls run.
+- **NarcHook secret/injection scanner** — a `ToolHook` that scans tool-call arguments and results for 10 credential patterns and 8 prompt-injection patterns. Blocks a call whose arguments carry an active data/URL exfiltration payload; alerts on everything else; **redacts** a leaked secret out of a tool result before the model sees it. The detection set is pinned across all five engines by the shared corpus at [`spec/narc/corpus.json`](../spec/narc/corpus.json), generated from the Rust reference — a port that drops a pattern or downgrades a severity fails its own test suite.
 - **Conversation thread** — carry a conversation across multiple `run` calls.
 - **`LlmProvider` seam + `MockLlmProvider`** — inject any OpenAI-compatible client; a deterministic record/replay mock drives the offline tests, and a shipped real HTTP client talks to a live gateway (see [Talking to a real gateway](#talking-to-a-real-gateway)).
 - **Deferred tools + `tool_search`** — hide rarely-used tool schemas behind a built-in `tool_search` meta-tool the model calls to promote the ones it needs.
