@@ -36,7 +36,7 @@ export { DenyPolicy, DenyRules, globMatch } from './denyPolicy.js';
 export type { DenyPredicate } from './denyPolicy.js';
 export { InMemoryKnowledge } from './knowledge.js';
 export type { Knowledge, KnowledgeHit } from './knowledge.js';
-export { MockLlmProvider, textResponse, toolCallResponse } from './llmProvider.js';
+export { MockLlmProvider, SCRIPTED_USAGE, textResponse, toolCallResponse } from './llmProvider.js';
 export type { LlmProvider, RecordedCall, ScriptedMessage, ScriptedUsage } from './llmProvider.js';
 export { InMemoryMemory } from './memory.js';
 export type { Memory, MemoryEntry } from './memory.js';

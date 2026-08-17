@@ -25,14 +25,23 @@ public sealed class MockLlmProvider : IChatClient
     private readonly Queue<Outcome> _script = new();
     private readonly List<RecordedCall> _recorded = new();
 
-    private static UsageDetails Tokens() => new() { InputTokenCount = 10, OutputTokenCount = 5, TotalTokenCount = 15 };
+    /// <summary>
+    /// The token usage a <b>scripted</b> mock response reports. Fixed, and identical in all five
+    /// engines' mocks (Rust · Go · Python · TypeScript · C#), so the shared server scenario corpus
+    /// can assert <c>eventual_response.usage</c> as a real cross-language invariant instead of
+    /// documenting five different answers (pearl th-4f1263).
+    ///
+    /// Only the FIFO scripting helpers (<see cref="PushText"/> / <see cref="PushToolCall"/>) attach
+    /// it; <see cref="PushResponse"/> carries whatever the caller built.
+    /// </summary>
+    public static UsageDetails ScriptedUsage() => new() { InputTokenCount = 10, OutputTokenCount = 5, TotalTokenCount = 15 };
 
     // ── scripting (fluent: each returns this) ────────────────────────────────────────────────
 
     /// <summary>Script a plain assistant text response (ends the loop).</summary>
     public MockLlmProvider PushText(string text)
     {
-        var response = new ChatResponse(new ChatMessage(ChatRole.Assistant, text)) { Usage = Tokens(), ModelId = ModelId };
+        var response = new ChatResponse(new ChatMessage(ChatRole.Assistant, text)) { Usage = ScriptedUsage(), ModelId = ModelId };
         _script.Enqueue(Outcome.Message(response));
         return this;
     }
@@ -41,7 +50,7 @@ public sealed class MockLlmProvider : IChatClient
     public MockLlmProvider PushToolCall(string callId, string name, IDictionary<string, object?> arguments)
     {
         var message = new ChatMessage(ChatRole.Assistant, new List<AIContent> { new FunctionCallContent(callId, name, arguments) });
-        var response = new ChatResponse(message) { Usage = Tokens(), ModelId = ModelId };
+        var response = new ChatResponse(message) { Usage = ScriptedUsage(), ModelId = ModelId };
         _script.Enqueue(Outcome.Message(response));
         return this;
     }

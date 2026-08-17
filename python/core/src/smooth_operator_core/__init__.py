@@ -36,6 +36,7 @@ from .llm_provider import (
     LlmProvider,
     MockLlmProvider,
     RecordedCall,
+    scripted_usage,
     text_response,
     tool_call_response,
     usage,
@@ -152,6 +153,7 @@ __all__ = [
     "Workflow",
     "WorkflowError",
     "END",
+    "scripted_usage",
     "text_response",
     "tool_call_response",
 ]

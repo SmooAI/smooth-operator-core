@@ -63,6 +63,21 @@ export interface ScriptedUsage {
     completion_tokens?: number;
 }
 
+/**
+ * The token usage a **scripted** mock response reports. Fixed, and identical in
+ * all five engines' mocks (Rust · Go · Python · TypeScript · C#), so the shared
+ * server scenario corpus can assert `eventual_response.usage` as a real
+ * cross-language invariant instead of documenting five different answers
+ * (pearl th-4f1263).
+ *
+ * Only the FIFO scripting helpers ({@link MockLlmProvider.pushText} /
+ * {@link MockLlmProvider.pushToolCall}) attach it. An *unscripted* response — the
+ * benign empty reply a drained script falls back to — still reports nothing, so
+ * "the script ran out" stays distinguishable from "the model answered". Pass an
+ * explicit `usage` to override.
+ */
+export const SCRIPTED_USAGE: Readonly<Required<ScriptedUsage>> = Object.freeze({ prompt_tokens: 10, completion_tokens: 5 });
+
 /** A scripted outcome: either a response message (with optional usage) or an error to throw. */
 type Outcome = { kind: 'message'; message: ScriptedMessage; usage?: ScriptedUsage } | { kind: 'error'; message: string };
 
@@ -97,14 +112,14 @@ export class MockLlmProvider implements ChatClientLike {
         return this;
     }
 
-    /** Queue a plain-text response (with optional usage) for the next call. */
+    /** Queue a plain-text response for the next call, reporting {@link SCRIPTED_USAGE} unless `usage` overrides it. */
     pushText(content: string, usage?: ScriptedUsage): this {
-        return this.pushResponse(textResponse(content), usage);
+        return this.pushResponse(textResponse(content), usage ?? SCRIPTED_USAGE);
     }
 
-    /** Queue a single-tool-call response (with optional usage) for the next call. */
+    /** Queue a single-tool-call response for the next call, reporting {@link SCRIPTED_USAGE} unless `usage` overrides it. */
     pushToolCall(id: string, name: string, args: string, usage?: ScriptedUsage): this {
-        return this.pushResponse(toolCallResponse(id, name, args), usage);
+        return this.pushResponse(toolCallResponse(id, name, args), usage ?? SCRIPTED_USAGE);
     }
 
     /** Queue an error to be thrown on the next call. */

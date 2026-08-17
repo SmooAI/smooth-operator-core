@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { AgentOptions, SmoothAgent, Tool } from '../src/agent.js';
-import { MockLlmProvider } from '../src/llmProvider.js';
+import { MockLlmProvider, SCRIPTED_USAGE } from '../src/llmProvider.js';
 
 describe('MockLlmProvider', () => {
     it('replays text responses in FIFO order', async () => {
@@ -20,6 +20,25 @@ describe('MockLlmProvider', () => {
 
         expect(r1.choices[0].message.content).toBe('first');
         expect(r2.choices[0].message.content).toBe('second');
+    });
+
+    // The cross-language invariant (pearl th-4f1263): a scripted text or tool-call
+    // response reports 10 prompt / 5 completion tokens in EVERY engine's mock, and a
+    // drained script still reports nothing. Change these numbers here and the shared
+    // server scenario corpus goes red.
+    it('reports the shared scripted-usage convention', async () => {
+        const mock = new MockLlmProvider();
+        mock.pushText('hi').pushToolCall('call_1', 'search', '{}');
+
+        for (let i = 0; i < 2; i++) {
+            const response = await mock.chat.completions.create({ messages: [] });
+            expect(response.usage).toEqual(SCRIPTED_USAGE);
+        }
+
+        // Drained script: "the script ran out" must stay distinguishable from "the
+        // model answered", so the fallback reports nothing.
+        const drained = await mock.chat.completions.create({ messages: [] });
+        expect(drained.usage).toBeNull();
     });
 
     it('records messages and tools', async () => {
