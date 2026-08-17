@@ -112,6 +112,22 @@ type wireRequest struct {
 	// Top-level OpenAI-compat `metadata` object — LiteLLM records it on spend
 	// logs. omitempty keeps the wire byte-identical when unset (Rust parity).
 	Metadata map[string]any `json:"metadata,omitempty"`
+	// Structured output. Pointer + omitempty so an unset format leaves the
+	// request byte-identical to before (Rust parity).
+	ResponseFormat *wireResponseFormat `json:"response_format,omitempty"`
+}
+
+// wireResponseFormat is the OpenAI-compatible `response_format` object:
+// `{"type":"json_schema","json_schema":{name,schema,strict}}`.
+type wireResponseFormat struct {
+	Type       string         `json:"type"`
+	JSONSchema wireJSONSchema `json:"json_schema"`
+}
+
+type wireJSONSchema struct {
+	Name   string         `json:"name"`
+	Schema map[string]any `json:"schema"`
+	Strict bool           `json:"strict"`
 }
 
 // wireStreamChunk is one OpenAI streaming chunk (`data: {...}` SSE payload).
@@ -170,6 +186,12 @@ func buildWireRequest(req ChatRequest, stream bool) wireRequest {
 		w.Function.Description = t.Description
 		w.Function.Parameters = t.Parameters
 		wreq.Tools = append(wreq.Tools, w)
+	}
+	if f := req.ResponseFormat; f != nil {
+		wreq.ResponseFormat = &wireResponseFormat{
+			Type:       "json_schema",
+			JSONSchema: wireJSONSchema{Name: f.Name, Schema: f.Schema, Strict: f.Strict},
+		}
 	}
 	return wreq
 }

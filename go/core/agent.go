@@ -46,6 +46,11 @@ type ChatRequest struct {
 	// normalizes an empty map to nil so unset stays byte-identical. Mirrors
 	// the Rust engine's ChatRequest.metadata (with_metadata).
 	Metadata map[string]any
+	// ResponseFormat constrains the reply to a JSON Schema — structured output
+	// (see structured.go). nil omits the field from the wire entirely, so an
+	// unset format leaves the request byte-identical. Mirrors the Rust engine's
+	// chat_with_format(format).
+	ResponseFormat *ResponseFormat
 }
 
 // ChatResponse is the assistant's reply (content and/or tool calls).
