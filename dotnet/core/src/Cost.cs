@@ -10,6 +10,49 @@ public sealed record ModelPricing(decimal PromptPerMillionTokens, decimal Comple
     public decimal CostFor(long promptTokens, long completionTokens) =>
         (promptTokens * PromptPerMillionTokens / 1_000_000m) +
         (completionTokens * CompletionPerMillionTokens / 1_000_000m);
+
+    /// <summary>
+    /// Approximate default pricing (USD / 1M tokens), used when
+    /// <see cref="AgentOptions.Pricing"/> has no entry for the model. The C# analog of the sibling
+    /// engines' <c>DefaultPricing</c> / <c>DEFAULT_PRICING</c> (<c>go/core/cost.go</c>,
+    /// <c>python/.../cost.py</c>, <c>typescript/core/src/cost.ts</c>) and carrying the same two
+    /// entries at the same prices.
+    ///
+    /// <para>Without this, C# was the ONLY engine with no local fallback at all:
+    /// <c>AgentOptions.Pricing</c> starts empty, so an unpriced model recorded exactly $0 on every
+    /// call and a caller could not tell "this model is free" from "nobody told me the price"
+    /// (pearl th-9520d3).</para>
+    ///
+    /// <para>ponytail: two entries, matching the siblings, not a fifth opinion about the model set.
+    /// The five engines' local tables genuinely disagree about coverage — Rust's substring resolver
+    /// prices <c>gpt-4o</c>, <c>deepseek</c>, <c>gemini-flash</c> and the <c>smooth-*</c> aliases but
+    /// NOT Claude; these three price only Claude. Unifying them needs a cited price list, not an
+    /// inference, so it stays a separate change.</para>
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, ModelPricing> Default =
+        new Dictionary<string, ModelPricing>(StringComparer.Ordinal)
+        {
+            ["claude-haiku-4-5"] = new(1.0m, 5.0m),
+            ["claude-sonnet-4-5"] = new(3.0m, 15.0m),
+        };
+
+    /// <summary>
+    /// Pricing for <paramref name="modelId"/> from <paramref name="overrides"/> first, then
+    /// <see cref="Default"/>, then null (unpriced). Mirrors the siblings' "caller table ?? default
+    /// table" lookup.
+    /// </summary>
+    public static ModelPricing? ForModel(string? modelId, IDictionary<string, ModelPricing>? overrides = null)
+    {
+        if (modelId is null)
+        {
+            return null;
+        }
+        if (overrides is not null && overrides.TryGetValue(modelId, out var over))
+        {
+            return over;
+        }
+        return Default.TryGetValue(modelId, out var fallback) ? fallback : null;
+    }
 }
 
 /// <summary>

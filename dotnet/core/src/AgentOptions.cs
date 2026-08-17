@@ -223,9 +223,12 @@ public sealed class AgentOptions
     public CostBudget? Budget { get; set; }
 
     /// <summary>
-    /// Per-model USD pricing, keyed by model id (as reported on the response's <c>ModelId</c>),
-    /// used to compute the dollar cost in <see cref="AgentRunResponse.Cost"/>. Token accounting
-    /// works without it; only USD requires pricing.
+    /// Per-model USD pricing OVERRIDES, keyed by model id (as reported on the response's
+    /// <c>ModelId</c>), used to compute the dollar cost in <see cref="AgentRunResponse.Cost"/>.
+    /// Token accounting works without it; only USD requires pricing.
+    /// <para>An entry here wins; otherwise <see cref="ModelPricing.Default"/> applies, and a model
+    /// in neither is unpriced ($0). The gateway's authoritative per-request cost, when the client
+    /// surfaces one, beats both.</para>
     /// </summary>
     public IDictionary<string, ModelPricing> Pricing { get; } = new Dictionary<string, ModelPricing>(StringComparer.Ordinal);
 
