@@ -14,14 +14,22 @@
 </p>
 
 <p align="center">
-  <a href="#why-this"><b>Features</b></a> &nbsp;·&nbsp; <a href="#quickstart"><b>Install</b></a> &nbsp;·&nbsp; <a href="#quickstart"><b>Usage</b></a> &nbsp;·&nbsp; <a href="#architecture"><b>Architecture</b></a> &nbsp;·&nbsp; <a href="#part-of-smoo-ai"><b>Platform</b></a>
+  <img src="https://img.shields.io/badge/protocol--first-5_languages,_one_engine-00A6A6?style=flat-square&labelColor=020618" alt="protocol-first, five-language parity">
+  <img src="https://img.shields.io/badge/bring_your_own-model-F49F0A?style=flat-square&labelColor=020618" alt="bring your own model">
+  <img src="https://img.shields.io/badge/you_approve-every_write-FF6B6C?style=flat-square&labelColor=020618" alt="you approve every write">
+  <img src="https://img.shields.io/badge/durable-Temporal_backend-00A6A6?style=flat-square&labelColor=020618" alt="durable Temporal backend">
+  <img src="https://img.shields.io/badge/tests-offline_·_deterministic-F49F0A?style=flat-square&labelColor=020618" alt="offline deterministic tests">
+</p>
+
+<p align="center">
+  <a href="#feature-tour"><b>Features</b></a> &nbsp;·&nbsp; <a href="#quickstart"><b>Install</b></a> &nbsp;·&nbsp; <a href="#one-agent-five-languages--side-by-side"><b>Polyglot</b></a> &nbsp;·&nbsp; <a href="#architecture"><b>Architecture</b></a> &nbsp;·&nbsp; <a href="#part-of-smoo-ai"><b>Platform</b></a>
 </p>
 
 ---
 
 > ### The agent brain you can point at production — because you decide what it must never do.
 >
-> One observe→think→act engine — typed tools, streaming, checkpointing, memory, cost budgets, and a permission gate with hard lines the model can't cross — native in **Rust, TypeScript, Python, Go, and C#**.
+> One **protocol-first** observe→think→act engine — typed tools, streaming, checkpointing, memory, cost budgets, and a permission gate with hard lines the model can't cross — shipped native in **Rust, TypeScript, Python, Go, and C#**, every port held to the same shared corpora.
 >
 > The open-source heart of [Smoo AI](https://smoo.ai)'s Smooth Operator. **MIT-licensed. Bring your own model. You approve every write.**
 
@@ -30,6 +38,56 @@ Most agent frameworks hand the model a pile of tools and hope for the best. `smo
 It's the runtime that powers the [**smooth-operator**](https://github.com/SmooAI/smooth-operator) service behind the [Smoo AI](https://smoo.ai) platform in production — not a notebook demo. Inspired by LangGraph, CrewAI, and Agno, with one hard difference: every surface is covered by **hundreds of fast, offline unit tests** built on a deterministic `MockLlmClient`, so the loop is verified — not vibe-coded. And it's the **same engine in five languages** — write your agent where your stack already lives.
 
 > The Rust implementation is the source of truth. The TypeScript, Python, Go, and C#/.NET ports mirror its surface at parity (protocol-first; see [Repository layout](#repository-layout)). One engine surface is still Rust-first — the extension **sandbox / integrity hardening**. The durable-execution **backend** (Temporal) now ships in all five, each as an optional per-language package (with shared ADR-030 follow-ups — terminal-result-only, no token-delta streaming, `costUsd = 0` on the workflow result — still open in every engine). Everything else in [the feature list](./docs/Polyglot-Engines.md#feature-surface-the-shared-core-in-all-five-engines) is in all five today.
+
+---
+
+<p align="center">
+  <img src=".github/demo-agent.gif" alt="A smooth-operator-core agent running one turn in a terminal: the model streams its reasoning token by token, calls a tool, and folds the result back into a final answer." width="100%">
+</p>
+<p align="center"><sub><b>One turn, live.</b> The engine streams tokens, dispatches a tool call, and returns the grounded answer — the same loop in all five languages.</sub></p>
+
+---
+
+## Feature tour
+
+Everything below lives in the engine itself — one import, no service, and (except where noted) native in all five languages. The full, honest feature surface is in [**docs/Polyglot-Engines.md**](./docs/Polyglot-Engines.md#feature-surface-the-shared-core-in-all-five-engines).
+
+| | Capability | What it does |
+| :--: | --- | --- |
+| 🔁 | **Agent turn loop** | observe → think → act with iteration caps, parallel tool calls, retry/backoff, and a typed `AgentEvent` stream. |
+| 🌐 | **Real LLM client + provider routing** | ships a live OpenAI-compatible HTTP client; a per-`Activity` routing table (coding / reasoning / reviewing / judge / summarize / fast) picks a model per slot, with fallback chains and LiteLLM alias resolution. |
+| 🖼️ | **Multimodal input** | attach images to a user turn as `data:`/`https` URLs, emitted as OpenAI `image_url` content parts. |
+| 📐 | **Structured output** | constrain a reply to a JSON Schema via `response_format`, parsed back with a clear error when the model ignores the schema. |
+| 🧠 | **Prompt caching** | split the system prompt into a hashed static half and a swappable dynamic half, and emit Anthropic `cache_control` markers on the wire. |
+| 🛡️ | **NarcHook guard** | a tool-hook that scans every call for 10 credential + 8 injection patterns — blocks exfiltration, redacts leaked secrets before the model sees them. |
+| ⏱️ | **Durable execution** | an `AgentExecutor` seam that decides *where* a turn runs; an optional Temporal backend (all five) runs the turn as a crash-safe workflow with durable human-in-the-loop signals. |
+| 📚 | **Vector knowledge + reranker** | ground each turn in retrieved documents (`KnowledgeBase`), reranked (built-in lexical reranker) before injection. |
+| 🚫 | **Deny-policy hard-guard** | declarative TOML rules + semantic predicates that no prompt, jailbreak, or bypass mode can waive. |
+| 🧪 | **Parity oracle** | eval scenarios, the Narc corpus, and the routing table are shared JSON that all five engines — Rust included — replay, so the reference can't drift from its ports. |
+
+Two of these are one-liners you'll reach for on day one:
+
+**Guard every tool call.** Drop the secret/injection scanner onto the registry and every call is screened before and after it runs:
+
+```rust
+use smooth_operator_core::NarcHook;
+
+// Blocks a call carrying an active exfiltration payload, redacts a
+// leaked secret out of the result before the model sees it, alerts on the rest.
+registry.add_hook(NarcHook::new());
+```
+
+**Ground answers in your own knowledge.** Attach a knowledge base and a reranker; the engine retrieves, reranks, and injects the best hits each turn:
+
+```rust
+use std::sync::Arc;
+use smooth_operator_core::{AgentConfig, InMemoryKnowledge, LexicalReranker};
+
+let kb = Arc::new(InMemoryKnowledge::new()); // add your documents to it
+let config = AgentConfig::new("support", "Answer only from the knowledge base.", llm)
+    .with_knowledge(kb)
+    .with_reranker(Arc::new(LexicalReranker), 20); // rerank the top 20 hits before injection
+```
 
 ---
 
@@ -108,6 +166,107 @@ async fn main() -> anyhow::Result<()> {
 ```
 
 > Note: the LLM client is **OpenAI-compatible**. Point `api_url` at OpenAI, an Anthropic-compatible endpoint, or your own gateway (e.g. `https://llm.smoo.ai/v1`). `run()` returns the full `Conversation`; for live token deltas / tool-call / tool-result events, use `run_with_channel(msg, tx)` and consume the `AgentEvent` stream off the receiver.
+
+---
+
+## One agent, five languages — side by side
+
+The engine's surface is mirrored across every port: construct a provider, build an agent, `run` a turn, read the answer off the result. Here's the same minimal agent — driven by the deterministic mock, so it runs with **zero credentials** — in three of the five. Go and C#/.NET are identical in shape; see [**docs/Polyglot-Engines.md**](./docs/Polyglot-Engines.md#per-language-install--hello-agent) for all five.
+
+<table>
+<tr>
+<th>🦀 Rust</th>
+<th>🟦 TypeScript</th>
+<th>🐍 Python</th>
+</tr>
+<tr>
+<td valign="top">
+
+```rust
+use smooth_operator_core::{
+  Agent, AgentConfig,
+  LlmConfig, ToolRegistry};
+use smooth_operator_core
+  ::llm_provider::MockLlmClient;
+use std::sync::Arc;
+
+let mock = MockLlmClient::new();
+mock.push_text("42");
+
+let cfg = AgentConfig::new(
+  "agent", "Be helpful",
+  LlmConfig::openrouter("k"));
+let agent = Agent::new(
+    cfg, ToolRegistry::new())
+  .with_llm_provider(
+    Arc::new(mock));
+
+let c = agent.run("answer?")
+  .await?;
+println!("{}",
+  c.last_assistant_content()
+   .unwrap_or(""));
+```
+
+</td>
+<td valign="top">
+
+```ts
+import {
+  SmoothAgent,
+  MockLlmProvider,
+} from '@smooai/smooth-operator-core';
+
+
+
+
+const provider =
+  new MockLlmProvider()
+    .pushText('42');
+
+const agent = new SmoothAgent(
+  provider,
+  { instructions: 'Be helpful' },
+);
+
+
+
+const res = await agent.run(
+  'answer?');
+console.log(res.text);
+```
+
+</td>
+<td valign="top">
+
+```python
+from smooth_operator_core import (
+  SmoothAgent,
+  AgentOptions,
+  MockLlmProvider,
+)
+
+
+provider = MockLlmProvider()
+provider.push_text("42")
+
+
+agent = SmoothAgent(
+  provider,
+  AgentOptions(
+    instructions="Be helpful"),
+)
+
+result = await agent.run(
+  "answer?")
+print(result.text)
+```
+
+</td>
+</tr>
+</table>
+
+Same shape, five idioms — `snake_case` in Python, `*Async` in C#, `(result, error)` in Go — one behavior, pinned by the shared corpora.
 
 ---
 
