@@ -637,9 +637,9 @@ class SmoothAgent:
                 partials: dict[int, dict[str, str]] = {}
                 usage: Usage = Usage()
                 stream = await self._call_model_stream(messages, tool_specs)
-                # Cost lives in a response HEADER, which is gone once the SSE body is
-                # being consumed — so read it off the stream object up front, and let
-                # a chunk carry it too for clients that surface it that way.
+                # Cost lives in a response HEADER. A client that returns a bare stream
+                # has no response object to read one off at all, so read it from the
+                # stream object when one surfaces it, and let a chunk carry it too.
                 gateway_cost = _response_gateway_cost(stream)
                 async for chunk in stream:
                     chunk_cost = _response_gateway_cost(chunk)
