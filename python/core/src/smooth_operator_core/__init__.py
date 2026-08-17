@@ -53,6 +53,7 @@ from .llm_provider import (
     usage,
 )
 from .memory import InMemoryMemory, Memory, MemoryEntry
+from .multimodal import ImageContent, user_content
 from .narc import (
     NarcAlert,
     NarcFinding,
@@ -192,6 +193,8 @@ __all__ = [
     "PROMPT_CACHE_BOUNDARY",
     "PromptCache",
     "apply_cache_control",
+    "ImageContent",
+    "user_content",
     "supports_anthropic_cache_control",
     "NoopReranker",
     "json_schema_format",

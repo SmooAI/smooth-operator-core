@@ -15,6 +15,8 @@ export type { Checkpoint, CheckpointStore } from './checkpoint.js';
 export { extractSection, findProjectContextFile, headingToAnchor, loadProjectContext, parseFileReferences, parseLinkLine } from './context.js';
 export type { FileRef } from './context.js';
 export { applyCacheControl, supportsAnthropicCacheControl } from './cacheControl.js';
+export { userContent } from './multimodal.js';
+export type { ContentPart, ImageContent } from './multimodal.js';
 export { CostTracker, DEFAULT_PRICING, GATEWAY_COST_HEADERS, parseGatewayCost } from './cost.js';
 export type { CostBudget, HeaderLike, ModelPricing, Usage } from './cost.js';
 export { driveTurn, InProcessActivities, InProcessExecutor } from './executor.js';

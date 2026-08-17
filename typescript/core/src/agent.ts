@@ -28,6 +28,8 @@ import type { DenyPolicy } from './denyPolicy.js';
 import { AutoMode, PermissionHook } from './permission.js';
 import type { PermissionGrants } from './permissionGrants.js';
 import { ToolSearch } from './toolSearch.js';
+import { userContent } from './multimodal.js';
+import type { ImageContent } from './multimodal.js';
 
 /** A callable tool the agent may invoke. Mirrors the reference engines' tool seam. */
 export interface Tool {
@@ -184,6 +186,14 @@ export interface AgentOptions {
      * deferred tool is NOT dispatchable.
      */
     deferredTools?: Tool[];
+
+    /**
+     * Image attachments for the CURRENT turn's user message (a multimodal turn).
+     * Set by a host that received a chat turn carrying images; emitted as OpenAI
+     * `image_url` content parts on that one turn. Unset (the default) leaves every
+     * text-only turn byte-identical. Mirrors Rust's `AgentConfig::with_user_images`.
+     */
+    nextUserImages?: ImageContent[];
     /**
      * SEP extension host participating in the agent loop — the TypeScript sibling
      * of Rust's `Agent::with_extension_host` (and Go's `AgentOptions.Extensions`).
@@ -619,7 +629,7 @@ export class SmoothAgent {
         }
         if (thread) prior = [...thread.messages];
         if (prior) messages.push(...prior);
-        const userMsg: Record<string, unknown> = { role: 'user', content: message };
+        const userMsg: Record<string, unknown> = { role: 'user', content: userContent(message, this.options.nextUserImages) };
         messages.push(userMsg);
 
         // Track this turn's new messages by identity so they can be appended back to
@@ -764,7 +774,7 @@ export class SmoothAgent {
         }
         if (thread) prior = [...thread.messages];
         if (prior) messages.push(...prior);
-        const userMsg: Record<string, unknown> = { role: 'user', content: message };
+        const userMsg: Record<string, unknown> = { role: 'user', content: userContent(message, this.options.nextUserImages) };
         messages.push(userMsg);
 
         const turnMessages: Array<Record<string, unknown>> = [userMsg];

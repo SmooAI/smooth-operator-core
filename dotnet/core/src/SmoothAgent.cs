@@ -354,7 +354,7 @@ public sealed class SmoothAgent
             messages.Add(context);
         }
 
-        messages.Add(new ChatMessage(ChatRole.User, userMessage));
+        messages.Add(Multimodal.UserMessage(userMessage, (IReadOnlyList<ImageContent>)_options.NextUserImages));
         return messages;
     }
 

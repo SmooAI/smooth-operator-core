@@ -351,12 +351,15 @@ public sealed class GatewayChatClient : IChatClient
 
             var calls = message.Contents.OfType<FunctionCallContent>().ToList();
             var text = string.Concat(message.Contents.OfType<TextContent>().Select(c => c.Text));
-            if (calls.Count == 0 && string.IsNullOrEmpty(text))
+            // Images count as content: a turn may carry images ALONE, and dropping it here
+            // would silently discard the whole message.
+            var images = message.Contents.OfType<ImageUrlContent>().ToList();
+            if (calls.Count == 0 && images.Count == 0 && string.IsNullOrEmpty(text))
             {
                 continue;
             }
 
-            var entry = new JsonObject { ["role"] = RoleName(message.Role), ["content"] = text };
+            var entry = new JsonObject { ["role"] = RoleName(message.Role), ["content"] = Multimodal.Content(text, images) };
             if (calls.Count > 0)
             {
                 var toolCalls = new JsonArray();

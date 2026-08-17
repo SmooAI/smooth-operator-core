@@ -100,6 +100,14 @@ public sealed class AgentOptions
     public IList<AITool> DeferredTools { get; } = new List<AITool>();
 
     /// <summary>
+    /// Image attachments for the CURRENT turn's user message (a multimodal turn). Set by a host
+    /// that received a chat turn carrying images; emitted as OpenAI <c>image_url</c> content parts
+    /// on that one turn. Empty (the default) leaves every text-only turn byte-identical. Mirrors
+    /// Rust's <c>AgentConfig::with_user_images</c>.
+    /// </summary>
+    public IList<ImageContent> NextUserImages { get; } = new List<ImageContent>();
+
+    /// <summary>
     /// Wires a SEP extension host into this agent — the C# sibling of Rust's
     /// <c>Agent::with_extension_host</c> and Go's <c>AgentOptions.Extensions</c>.
     /// <para>

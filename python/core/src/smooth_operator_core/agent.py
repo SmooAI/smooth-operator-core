@@ -28,6 +28,7 @@ from .hooks import ToolCall, ToolHook, ToolResult
 from .human_gate import HumanApprovalRequest, HumanGate
 from .knowledge import Knowledge
 from .memory import Memory
+from .multimodal import ImageContent, user_content
 from .permission import AutoMode, PermissionHook
 from .rerank import NoopReranker, Reranker
 from .thread import SmoothAgentThread
@@ -159,6 +160,11 @@ class AgentOptions:
     #: schema payload small when there are many rarely-used tools. An unpromoted
     #: deferred tool is NOT dispatchable.
     deferred_tools: list[Tool] = field(default_factory=list)
+    #: Image attachments for the CURRENT turn's user message (a multimodal turn).
+    #: Set by a host that received a chat turn carrying images; emitted as OpenAI
+    #: ``image_url`` content parts on that one turn. Empty (the default) leaves every
+    #: text-only turn byte-identical. Mirrors Rust's ``AgentConfig::with_user_images``.
+    next_user_images: list[ImageContent] = field(default_factory=list)
     #: A loaded SEP :class:`~smooth_operator_core.extension.host.ExtensionHost` to
     #: wire into this agent — the Python sibling of Rust's
     #: ``Agent::with_extension_host``. Its tools are merged into the agent's tool
@@ -464,7 +470,7 @@ class SmoothAgent:
             prior = list(thread.messages)
         if prior:
             messages.extend(prior)
-        user_msg = {"role": "user", "content": message}
+        user_msg = {"role": "user", "content": user_content(message, self._options.next_user_images)}
         messages.append(user_msg)
 
         # Track this turn's new messages by identity so they can be appended back to
@@ -618,7 +624,7 @@ class SmoothAgent:
             prior = list(thread.messages)
         if prior:
             messages.extend(prior)
-        user_msg = {"role": "user", "content": message}
+        user_msg = {"role": "user", "content": user_content(message, self._options.next_user_images)}
         messages.append(user_msg)
 
         turn_messages: list[dict[str, Any]] = [user_msg]
