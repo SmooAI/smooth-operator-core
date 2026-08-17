@@ -271,11 +271,58 @@ public sealed class GatewayChatClient : IChatClient
         {
             body["metadata"] = JsonSerializer.SerializeToNode(metadata, JsonOptions);
         }
+        // Structured output (SMOODEV-1472). MEAI already models this as
+        // ChatOptions.ResponseFormat, so there is no parallel ResponseFormat type here —
+        // this maps the platform's own ChatResponseFormatJson onto the OpenAI-compatible
+        // wire object. Omitted entirely when unset, so the wire stays byte-identical
+        // (Rust parity: the field is an Option, skipped when None).
+        if (BuildResponseFormat(options?.ResponseFormat) is { } responseFormat)
+        {
+            body["response_format"] = responseFormat;
+        }
 
         return new HttpRequestMessage(HttpMethod.Post, _endpoint)
         {
             Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json"),
             Headers = { Accept = { new MediaTypeWithQualityHeaderValue(stream ? "text/event-stream" : "application/json") } },
+        };
+    }
+
+    /// <summary>
+    /// Render a <see cref="ChatResponseFormat"/> into the OpenAI-compatible
+    /// <c>response_format</c> object, or <c>null</c> when there is nothing to send.
+    ///
+    /// <para>A schema yields
+    /// <c>{"type":"json_schema","json_schema":{name,schema,strict}}</c> — the shape the Rust
+    /// reference sends. <c>strict</c> is always <c>true</c>: MEAI models no strict flag, and
+    /// Rust's <c>ResponseFormat::json_schema</c> constructor is strict, so that is the
+    /// behavior being matched. An unnamed schema falls back to <c>structured_output</c>, the
+    /// same default Rust uses when a name sanitizes to empty.</para>
+    ///
+    /// <para>A schemaless <see cref="ChatResponseFormat.Json"/> yields plain
+    /// <c>{"type":"json_object"}</c>. Rust has no such variant, but the platform type makes
+    /// it reachable and silently dropping a caller's explicit request for JSON mode would be
+    /// worse than sending the field OpenAI defines for it.</para>
+    /// </summary>
+    private static JsonObject? BuildResponseFormat(ChatResponseFormat? format)
+    {
+        if (format is not ChatResponseFormatJson json)
+        {
+            return null;
+        }
+        if (json.Schema is not { } schema)
+        {
+            return new JsonObject { ["type"] = "json_object" };
+        }
+        return new JsonObject
+        {
+            ["type"] = "json_schema",
+            ["json_schema"] = new JsonObject
+            {
+                ["name"] = string.IsNullOrEmpty(json.SchemaName) ? "structured_output" : json.SchemaName,
+                ["schema"] = JsonSerializer.SerializeToNode(schema, JsonOptions),
+                ["strict"] = true,
+            },
         };
     }
 

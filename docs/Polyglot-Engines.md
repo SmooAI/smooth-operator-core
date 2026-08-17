@@ -17,7 +17,7 @@ The Rust crate is the reference implementation. The other four engines mirror it
 
 ## Feature surface (the shared core, in all five engines)
 
-Every engine supports the same core capabilities below. Beyond this shared core, the Rust reference carries surfaces still being ported (multimodal images, structured output, provider routing, and the extension sandbox/integrity hardening) — if a capability matters to you in a non-Rust engine, check that language's package docs before assuming it. A real gateway LLM client is no longer one of them: all five now ship one, though the Rust client's provider quirks/routing remain ahead. **Anthropic `cache_control` request markers** are Rust + Go today; the other three engines only just gained a request builder of their own, so they are next in line rather than blocked.
+Every engine supports the same core capabilities below. Beyond this shared core, the Rust reference carries surfaces still being ported (multimodal images, provider routing, and the extension sandbox/integrity hardening) — if a capability matters to you in a non-Rust engine, check that language's package docs before assuming it. A real gateway LLM client is no longer one of them: all five now ship one, though the Rust client's provider quirks/routing remain ahead. **Anthropic `cache_control` request markers** are Rust + Go today; the other three engines only just gained a request builder of their own, so they are next in line rather than blocked.
 
 - **Agentic tool-calling loop** — observe → think → act, looping until the model answers.
 - **In-memory + vector knowledge (RAG)** — ground the turn in retrieved documents.
@@ -28,6 +28,7 @@ Every engine supports the same core capabilities below. Beyond this shared core,
 - **Cost / budget** — per-model pricing, token + USD accounting, early stop on budget.
 - **Checkpointing** — persist/resume a conversation via a checkpoint store.
 - **Rerank** — rerank retrieved hits before injection; a lexical reranker (query-term coverage normalized by document length) is built into all five.
+- **Structured output** — constrain a reply to a JSON Schema via `response_format`, and parse it back with a clear error when the model ignores the schema. In all five; each engine uses its own idiom (Go a `ChatRequest` field, TypeScript/Python a spreadable request fragment, .NET the `ChatOptions.ResponseFormat` the platform already defines). Only Rust also has the Anthropic-native forced-tool path — the other four talk to OpenAI-compatible endpoints, which take the field directly.
 - **Sub-agents / delegation** — spawn child agents for sub-tasks.
 - **Cast** — roles + clearance (tool-access policy per role).
 - **Human-in-the-loop gate** — require approval before designated tool calls run.

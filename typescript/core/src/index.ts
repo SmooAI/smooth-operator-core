@@ -49,6 +49,8 @@ export { hasInjection, hasSecrets, NarcHook, redactMatch, scanInjection, scanSec
 export type { NarcAlert, NarcFinding } from './narc.js';
 export { LexicalReranker, NoopReranker } from './rerank.js';
 export type { Reranker } from './rerank.js';
+export { jsonSchemaFormat, responseFormatField, structuredJson } from './structured.js';
+export type { ResponseFormat } from './structured.js';
 export { SmoothAgentThread } from './thread.js';
 export { MAX_MATCHES, TOOL_SEARCH_NAME, ToolSearch } from './toolSearch.js';
 export { HashEmbedder, hashToken, VectorKnowledge } from './vector.js';

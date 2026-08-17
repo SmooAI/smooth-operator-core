@@ -378,6 +378,72 @@ public class GatewayChatClientTests : IDisposable
         Assert.False(FirstRequest.ContainsKey("metadata"));
     }
 
+    // ---- structured output (SMOODEV-1472) ----
+
+    private static JsonElement WeatherSchema => JsonSerializer.Deserialize<JsonElement>(
+        """{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}""");
+
+    [Fact]
+    public async Task SendsResponseFormatJsonSchemaOnTheWire()
+    {
+        Serve(text: """{"city":"Indianapolis"}""");
+        using var client = Client();
+
+        await client.GetResponseAsync(
+            [new ChatMessage(ChatRole.User, "weather?")],
+            new ChatOptions { ResponseFormat = ChatResponseFormat.ForJsonSchema(WeatherSchema, "weather_report") });
+        await _serving!;
+
+        var format = FirstRequest["response_format"]!;
+        Assert.Equal("json_schema", format["type"]!.GetValue<string>());
+        Assert.Equal("weather_report", format["json_schema"]!["name"]!.GetValue<string>());
+        Assert.True(format["json_schema"]!["strict"]!.GetValue<bool>());
+        Assert.Equal("object", format["json_schema"]!["schema"]!["type"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task OmitsResponseFormatEntirelyWhenUnset()
+    {
+        Serve(text: "hi");
+        using var client = Client();
+
+        await client.GetResponseAsync([new ChatMessage(ChatRole.User, "hi")], new ChatOptions());
+        await _serving!;
+
+        // The parity bar: byte-identical to a client that never knew about the field.
+        Assert.False(FirstRequest.ContainsKey("response_format"));
+    }
+
+    [Fact]
+    public async Task UnnamedSchemaFallsBackToTheReferenceDefaultName()
+    {
+        Serve(text: """{"city":"Indianapolis"}""");
+        using var client = Client();
+
+        await client.GetResponseAsync(
+            [new ChatMessage(ChatRole.User, "weather?")],
+            new ChatOptions { ResponseFormat = ChatResponseFormat.ForJsonSchema(WeatherSchema) });
+        await _serving!;
+
+        Assert.Equal("structured_output", FirstRequest["response_format"]!["json_schema"]!["name"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task SchemalessJsonModeSendsJsonObject()
+    {
+        Serve(text: """{"anything":true}""");
+        using var client = Client();
+
+        await client.GetResponseAsync(
+            [new ChatMessage(ChatRole.User, "json please")],
+            new ChatOptions { ResponseFormat = ChatResponseFormat.Json });
+        await _serving!;
+
+        // No schema to send, but a caller asking for JSON mode must not be silently dropped.
+        Assert.Equal("json_object", FirstRequest["response_format"]!["type"]!.GetValue<string>());
+        Assert.Null(FirstRequest["response_format"]!["json_schema"]);
+    }
+
     // ---- failure ----
 
     [Fact]
