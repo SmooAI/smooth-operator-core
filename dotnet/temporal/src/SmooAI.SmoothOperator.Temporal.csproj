@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>SmooAI.SmoothOperator.Temporal</RootNamespace>
+    <AssemblyName>SmooAI.SmoothOperator.Temporal</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Phase-0 docstrings are intentionally partial; don't fail the build on CS1591. -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <!-- NuGet package metadata. This is a SEPARATE, OPTIONAL package — the C# sibling of the Rust
+       reference's separate `smooth-operator-temporal` crate (behind an off-by-default `temporal`
+       cargo feature). Keeping the `Temporalio` dependency out of SmooAI.SmoothOperator.Core is what
+       keeps the published core zero-infra: a consumer that never needs durable execution never pulls
+       in the Temporal SDK. ADR-030 / SMOODEV-1972. -->
+  <PropertyGroup>
+    <PackageId>SmooAI.SmoothOperator.Temporal</PackageId>
+    <Version>1.8.10</Version>
+    <Authors>SmooAI</Authors>
+    <Company>SmooAI</Company>
+    <Description>Optional Temporal-backed durable execution backend for the SmooAI.SmoothOperator.Core agent engine (ADR-030). An agent turn runs as a Temporal workflow whose model call and each tool invocation are activities, giving crash-safe resume, durable human-in-the-loop via signals, and durable timers. The in-process executor runs the same drive_turn loop inline — one loop, two backends. The C# sibling of the Rust smooai-smooth-operator-temporal crate.</Description>
+    <PackageTags>ai;agent;temporal;durable;workflow;smooth-operator;smooai</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/SmooAI/smooth-operator-core/tree/main/dotnet/temporal</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/SmooAI/smooth-operator-core.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The official Temporal .NET SDK: workflows, activities, worker, client, and the
+         Temporalio.Testing WorkflowEnvironment used by the e2e suite. -->
+    <PackageReference Include="Temporalio" Version="1.14.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\core\src\SmooAI.SmoothOperator.Core.csproj" />
+  </ItemGroup>
+
+</Project>

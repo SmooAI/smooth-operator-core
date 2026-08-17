@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>SmooAI.SmoothOperator.Temporal.Tests</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+    <!-- Microsoft.Extensions.AI (not just Abstractions) for AIFunctionFactory.Create — authoring
+         tools from ordinary C# methods in the e2e turns. -->
+    <PackageReference Include="Microsoft.Extensions.AI" Version="9.7.1" />
+    <!-- SkippableFact so the Temporal-dev-server e2e suite skips cleanly without a reachable server
+         (SMOOTH_AGENT_TEMPORAL_E2E unset, or the ephemeral server can't be downloaded/started). -->
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.61" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\src\SmooAI.SmoothOperator.Temporal.csproj" />
+    <ProjectReference Include="..\..\core\src\SmooAI.SmoothOperator.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+</Project>

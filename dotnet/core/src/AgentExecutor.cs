@@ -175,7 +175,12 @@ public static class AgentTurn
             // activity boundary without aliasing the live conversation.
             var context = messages.ToList();
 
-            var response = await activities.ModelCallAsync(context, tools, cancellationToken).ConfigureAwait(false);
+            // NOTE: no ConfigureAwait(false) here (nor on the tool await below). This method is
+            // documented as valid Temporal workflow code, and a durable backend runs it inside the
+            // workflow scheduler — ConfigureAwait(false) would post the continuation off that
+            // single-threaded scheduler and break determinism (the workflow would hang mid-turn). The
+            // in-process path has no captured context to marshal back to, so dropping it costs nothing.
+            var response = await activities.ModelCallAsync(context, tools, cancellationToken);
 
             // Append the assistant turn under exactly the Rust push condition: non-empty content,
             // OR tool calls, OR reasoning content. An empty message carrying none of the three is
@@ -201,7 +206,7 @@ public static class AgentTurn
             // workflow — can match results back to calls.
             foreach (var call in calls)
             {
-                var result = await activities.ToolInvokeAsync(call, cancellationToken).ConfigureAwait(false);
+                var result = await activities.ToolInvokeAsync(call, cancellationToken); // no ConfigureAwait — see the model await above (workflow determinism)
                 messages.Add(new ChatMessage(ChatRole.Tool, new List<AIContent> { result }) { AuthorName = call.Name });
             }
         }

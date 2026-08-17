@@ -82,6 +82,20 @@ public sealed class SmoothAgent
             : null;
     }
 
+    /// <summary>The system prompt (MAF "instructions") this agent runs with, if any. Read-only view
+    /// of <see cref="AgentOptions.Instructions"/>, exposed so an out-of-process executor
+    /// (<c>SmooAI.SmoothOperator.Temporal</c>) can seed a durable turn with the same instructions the
+    /// in-process turn would use.</summary>
+    public string? Instructions => _options.Instructions;
+
+    /// <summary>The eager tools this agent advertises to the model (natives plus any SEP extension
+    /// eager tools) — the same set the in-process loop offers. Read-only, exposed for the durable
+    /// executor to project as serializable tool schemas.</summary>
+    public IReadOnlyList<AITool> Tools => _eagerTools;
+
+    /// <summary>The agentic loop-iteration cap. Read-only view of <see cref="AgentOptions.MaxIterations"/>.</summary>
+    public int MaxIterations => _options.MaxIterations;
+
     /// <summary>Start a fresh conversation thread for multi-turn use. (MAF: <c>GetNewThread</c>.)</summary>
     public SmoothAgentThread GetNewThread() => new();
 
