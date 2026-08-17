@@ -25,10 +25,14 @@ public static class Workflow
     /// driver that advances the top-level graph one node per user turn: a sub-workflow node
     /// executes its whole sub-graph within that one turn, and the top level stays turn-gated.
     ///
+    /// The result is an ordinary node delegate: <c>AddEdge</c> and <c>AddConditionalEdge</c>
+    /// treat it exactly like a plain node, as an edge source and as an edge target alike. Plain
+    /// nodes and sub-workflows are therefore interchangeable vertices of one composite graph,
+    /// and they nest arbitrarily — a sub-workflow may itself contain sub-workflows.
+    ///
     /// <paramref name="mapIn"/> projects parent state into the child's state type;
     /// <paramref name="mapOut"/> folds the child's final state back into the parent's. An
-    /// exception from any child node propagates out of the parent's run. Sub-workflows nest —
-    /// a child may itself hold a sub-workflow node.
+    /// exception from any child node propagates out of the parent's run.
     /// </summary>
     public static Func<TParent, CancellationToken, Task<TParent>> SubWorkflowNode<TParent, TChild>(
         Workflow<TChild> child,

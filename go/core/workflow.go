@@ -108,10 +108,15 @@ func (w *Workflow[S]) SetEnd(from string) *Workflow[S] {
 // turn: a sub-workflow node executes its whole sub-graph within that one turn,
 // and the top level stays turn-gated.
 //
+// The result is an ordinary NodeFn: AddEdge and AddConditionalEdge treat it
+// exactly like a plain node, as an edge source and as an edge target alike.
+// Plain nodes and sub-workflows are therefore interchangeable vertices of one
+// composite graph, and they nest arbitrarily — a sub-workflow may itself contain
+// sub-workflows.
+//
 // mapIn projects parent state into the child's state type; mapOut folds the
 // child's final state back into the parent's. An error from any child node
-// propagates out of the parent's Run. Sub-workflows nest — a child may itself
-// hold a sub-workflow node.
+// propagates out of the parent's Run.
 func SubWorkflowNode[P, C any](child *Workflow[C], mapIn func(P) C, mapOut func(P, C) P) NodeFn[P] {
 	return func(ctx context.Context, state P) (P, error) {
 		out, err := child.Run(ctx, mapIn(state))

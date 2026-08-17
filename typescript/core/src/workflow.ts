@@ -135,10 +135,15 @@ export class Workflow<S> {
  * turn: a sub-workflow node executes its whole sub-graph within that one turn,
  * and the top level stays turn-gated.
  *
+ * The result is an ordinary {@link NodeFn}: `addEdge` and `addConditionalEdge`
+ * treat it exactly like a plain node, as an edge source and as an edge target
+ * alike. Plain nodes and sub-workflows are therefore interchangeable vertices of
+ * one composite graph, and they nest arbitrarily — a sub-workflow may itself
+ * contain sub-workflows.
+ *
  * `mapIn` projects parent state into the child's state type; `mapOut` folds the
  * child's final state back into the parent's. An error from any child node
- * propagates out of the parent's `run`. Sub-workflows nest — a child may itself
- * hold a sub-workflow node.
+ * propagates out of the parent's `run`.
  */
 export function subWorkflowNode<P, C>(child: Workflow<C>, mapIn: (state: P) => C, mapOut: (parent: P, child: C) => P): NodeFn<P> {
     return async (state) => mapOut(state, await child.run(mapIn(state)));

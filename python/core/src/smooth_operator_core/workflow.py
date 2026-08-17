@@ -137,10 +137,15 @@ def sub_workflow_node(
     turn: a sub-workflow node executes its whole sub-graph within that one turn,
     and the top level stays turn-gated.
 
+    The result is an ordinary node function: :meth:`Workflow.add_edge` and
+    :meth:`Workflow.add_conditional_edge` treat it exactly like a plain node, as
+    an edge source and as an edge target alike. Plain nodes and sub-workflows are
+    therefore interchangeable vertices of one composite graph, and they nest
+    arbitrarily — a sub-workflow may itself contain sub-workflows.
+
     ``map_in`` projects parent state into the child's state type; ``map_out``
     folds the child's final state back into the parent's. An error from any child
-    node propagates out of the parent's :meth:`Workflow.run`. Sub-workflows nest
-    — a child may itself hold a sub-workflow node.
+    node propagates out of the parent's :meth:`Workflow.run`.
     """
 
     async def node(state: P) -> P:

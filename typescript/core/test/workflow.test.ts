@@ -175,4 +175,37 @@ describe('subWorkflowNode', () => {
 
         expect(await wf.run([])).toEqual(['parent_a', 'child_a', 'grand_a', 'grand_b']);
     });
+
+    it('mixes plain and sub-workflow vertices in one composite graph wired by conditional edges', async () => {
+        const deep = new Workflow<string[]>()
+            .addNode('deep_a', append('deep_a'))
+            .addNode('deep_b', append('deep_b'))
+            .addNode('deep_never', append('deep_never'))
+            .addConditionalEdge('deep_a', (s) => (s.includes('deep_a') ? 'deep_b' : 'deep_never'))
+            .setEntry('deep_a')
+            .setEnd('deep_b');
+
+        // A sub-workflow whose own vertices are a plain node AND a sub-workflow.
+        const enrich = new Workflow<string[]>()
+            .addNode('enrich_a', append('enrich_a'))
+            .addNode('deep', subWorkflowNode(deep, identity, takeChild))
+            .addEdge('enrich_a', 'deep')
+            .setEntry('enrich_a')
+            .setEnd('deep');
+
+        // Parent: plain --conditional--> sub-workflow --conditional--> plain.
+        const wf = new Workflow<string[]>()
+            .addNode('classify', append('classify'))
+            .addNode('enrich', subWorkflowNode(enrich, identity, takeChild))
+            .addNode('finish', append('finish'))
+            .addNode('never', append('never'))
+            .addConditionalEdge('classify', (s) => (s.includes('classify') ? 'enrich' : 'never'))
+            // A conditional edge LEAVING a sub-workflow vertex, routing on state the
+            // sub-workflow produced — including the terminate sentinel.
+            .addConditionalEdge('enrich', (s) => (s.includes('deep_b') ? 'finish' : END))
+            .setEntry('classify')
+            .setEnd('finish');
+
+        expect(await wf.run([])).toEqual(['classify', 'enrich_a', 'deep_a', 'deep_b', 'finish']);
+    });
 });

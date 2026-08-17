@@ -250,3 +250,48 @@ async def test_sub_workflow_nesting_depth_two() -> None:
     )
 
     assert await wf.run([]) == ["parent_a", "child_a", "grand_a", "grand_b"]
+
+
+async def test_composite_graph_mixes_plain_and_sub_workflow_vertices() -> None:
+    """Plain nodes and sub-workflows are interchangeable vertices of one graph.
+
+    The composite wires both with the same conditional edges — routing INTO a
+    sub-workflow and OUT of one — and the sub-workflow itself mixes a plain node
+    with a nested sub-workflow (depth 2). All of it in one parent run.
+    """
+    deep = (
+        Workflow[list[str]]()
+        .add_node("deep_a", _append("deep_a"))
+        .add_node("deep_b", _append("deep_b"))
+        .add_node("deep_never", _append("deep_never"))
+        .add_conditional_edge("deep_a", lambda s: "deep_b" if "deep_a" in s else "deep_never")
+        .set_entry("deep_a")
+        .set_end("deep_b")
+    )
+
+    # A sub-workflow whose own vertices are a plain node AND a sub-workflow.
+    enrich = (
+        Workflow[list[str]]()
+        .add_node("enrich_a", _append("enrich_a"))
+        .add_node("deep", sub_workflow_node(deep, _identity, _take_child))
+        .add_edge("enrich_a", "deep")
+        .set_entry("enrich_a")
+        .set_end("deep")
+    )
+
+    # Parent: plain --conditional--> sub-workflow --conditional--> plain.
+    wf = (
+        Workflow[list[str]]()
+        .add_node("classify", _append("classify"))
+        .add_node("enrich", sub_workflow_node(enrich, _identity, _take_child))
+        .add_node("finish", _append("finish"))
+        .add_node("never", _append("never"))
+        .add_conditional_edge("classify", lambda s: "enrich" if "classify" in s else "never")
+        # A conditional edge LEAVING a sub-workflow vertex, routing on state the
+        # sub-workflow produced — including the terminate sentinel.
+        .add_conditional_edge("enrich", lambda s: "finish" if "deep_b" in s else END)
+        .set_entry("classify")
+        .set_end("finish")
+    )
+
+    assert await wf.run([]) == ["classify", "enrich_a", "deep_a", "deep_b", "finish"]
