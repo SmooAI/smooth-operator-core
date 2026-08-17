@@ -178,8 +178,7 @@ public sealed class SmoothAgent
         };
     }
 
-    private ModelPricing? LookupPricing(string? modelId) =>
-        modelId is not null && _options.Pricing.TryGetValue(modelId, out var pricing) ? pricing : null;
+    private ModelPricing? LookupPricing(string? modelId) => ModelPricing.ForModel(modelId, _options.Pricing);
 
     /// <summary>
     /// Invoke the model with bounded retry-with-exponential-backoff. On a transient error

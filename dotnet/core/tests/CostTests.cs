@@ -122,6 +122,45 @@ public class CostTests
         Assert.Null(agent.LastRunResponse);
     }
 
+    /// <summary>
+    /// Pearl th-9520d3: C# was the only engine with no local pricing fallback — an unpriced model
+    /// recorded exactly $0 on every call, so a caller could not tell "this model is free" from
+    /// "nobody told me the price". Same two entries, same prices, as the Go/Python/TypeScript
+    /// engines' <c>DEFAULT_PRICING</c>.
+    /// </summary>
+    [Fact]
+    public void ForModel_FallsBackToTheDefaultTable_AndOverridesWin()
+    {
+        // A model in the default table is priced with no caller table at all.
+        Assert.Equal(new ModelPricing(1.0m, 5.0m), ModelPricing.ForModel("claude-haiku-4-5"));
+        Assert.Equal(new ModelPricing(3.0m, 15.0m), ModelPricing.ForModel("claude-sonnet-4-5"));
+
+        // A caller entry wins over the default for the same model.
+        var overrides = new Dictionary<string, ModelPricing> { ["claude-haiku-4-5"] = new(99m, 99m) };
+        Assert.Equal(new ModelPricing(99m, 99m), ModelPricing.ForModel("claude-haiku-4-5", overrides));
+
+        // Unknown stays unpriced, and so does a null model id.
+        Assert.Null(ModelPricing.ForModel("totally-fake-model-name-xyz"));
+        Assert.Null(ModelPricing.ForModel(null));
+    }
+
+    [Fact]
+    public async Task Agent_PricesADefaultTableModel_WithoutAnyCallerPricing()
+    {
+        // ModelId "claude-haiku-4-5", usage 10 in / 5 out, and AgentOptions.Pricing left EMPTY.
+        var response = new ChatResponse(new ChatMessage(ChatRole.Assistant, "hi"))
+        {
+            Usage = MockLlmProvider.ScriptedUsage(),
+            ModelId = "claude-haiku-4-5",
+        };
+        var agent = new SmoothAgent(new MockLlmProvider().PushResponse(response), new AgentOptions());
+
+        var result = await agent.RunAsync("hello");
+
+        // 10 * 1/1e6 + 5 * 5/1e6 = 0.000035 — before this, exactly 0.
+        Assert.Equal(0.000035m, result.Cost.TotalCostUsd);
+    }
+
     [Fact]
     public async Task TokenBudget_HaltsTheRun()
     {
