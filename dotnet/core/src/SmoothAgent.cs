@@ -33,6 +33,26 @@ public sealed class SmoothAgent
     private readonly PermissionHook? _permissionHook;
     private readonly IReadOnlyList<AITool> _eagerTools;
 
+    /// <summary>
+    /// The completed turn from the most recent <see cref="RunStreamingAsync(string, SmoothAgentThread?, CancellationToken)"/>,
+    /// carrying the usage, cost and budget outcome that the <c>IAsyncEnumerable&lt;ChatResponseUpdate&gt;</c>
+    /// return type has nowhere to hang. This is C#'s stand-in for the terminal <c>done</c> event the
+    /// sibling engines emit (Rust <c>AgentEvent::Completed</c>, Go/Python/TypeScript <c>done</c>),
+    /// which carry <c>cost_usd</c> and the token totals on the stream itself.
+    ///
+    /// <para><b>Null until the stream is fully enumerated.</b> It is set at the end of the iterator
+    /// body, so a consumer that breaks out early never sees it — and it is reset to null when a new
+    /// streaming turn begins, so a stale total can't be mistaken for a fresh one.
+    /// <see cref="RunAsync(string, SmoothAgentThread?, CancellationToken)"/> returns its
+    /// <see cref="AgentRunResponse"/> directly and does not touch this.</para>
+    ///
+    /// <para>ponytail: one slot, not a per-run handle, because a <see cref="SmoothAgent"/> already
+    /// cannot serve two turns at once (tool_search promotions mutate the visible tool set across
+    /// iterations). If concurrent turns on one agent ever become supported, this becomes a
+    /// completion callback or a per-run handle at the same time — not before.</para>
+    /// </summary>
+    public AgentRunResponse? LastRunResponse { get; private set; }
+
     public SmoothAgent(IChatClient chatClient, AgentOptions options)
     {
         _chatClient = chatClient ?? throw new ArgumentNullException(nameof(chatClient));
@@ -208,9 +228,13 @@ public sealed class SmoothAgent
     {
         var working = await SeedConversationAsync(message, thread, cancellationToken).ConfigureAwait(false);
         var newThisTurn = new List<ChatMessage> { working[^1] };
+        var usage = new UsageDetails();
+        var cost = new CostTracker();
+        BudgetExceeded? budgetHit = null;
         var iterations = 0;
         var lastText = string.Empty;
 
+        LastRunResponse = null;
         SepDispatch(SepTurnStart, new JsonObject { ["agent_id"] = SepAgentId });
 
         while (true)
@@ -232,10 +256,22 @@ public sealed class SmoothAgent
             }
 
             var response = updates.ToChatResponse();
+            // The folded response carries this iteration's Usage and ModelId — the same two inputs
+            // RunAsync records. Dropping them here is what left streaming turns with no usage, no
+            // cost, and (worse) a silently inert AgentOptions.Budget. Pearl th-df859c.
+            Accumulate(usage, response.Usage);
+            cost.RecordWithGatewayCost(response.ModelId, response.Usage, ResponseGatewayCost(response), LookupPricing(response.ModelId));
             lastText = response.Text ?? string.Empty;
             working.AddRange(response.Messages);
             newThisTurn.AddRange(response.Messages);
             await MaybeCheckpointAsync(thread, newThisTurn, iterations, CheckpointStrategy.AfterEachIteration, cancellationToken).ConfigureAwait(false);
+
+            // Stop before another expensive call if the run has blown its spend ceiling — the
+            // streaming counterpart of the same guard in RunAsync.
+            if (_options.Budget is not null && cost.ExceedsBudget(_options.Budget, out budgetHit))
+            {
+                break;
+            }
 
             var calls = ExtractToolCalls(response.Messages);
             if (calls.Count == 0 || iterations >= _options.MaxIterations)
@@ -258,6 +294,7 @@ public sealed class SmoothAgent
         SepTurnComplete(iterations, lastText);
 
         thread?.AddRange(newThisTurn);
+        LastRunResponse = new AgentRunResponse(newThisTurn, usage, iterations, cost, budgetHit);
     }
 
     /// <summary>
