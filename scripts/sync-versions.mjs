@@ -16,8 +16,14 @@
  * NOT touched, on purpose:
  *   • Cargo.lock — gitignored in this repo (see .gitignore), so there is nothing
  *     tracked to rewrite. `cargo publish` regenerates it.
- *   • rust/smooth-operator-temporal — `publish = false`, path-deps core with no
- *     version requirement; it never reaches a registry so its version is inert.
+ *   • rust/smooth-operator-temporal's dependency on core — pinned at `^1.8`, not
+ *     the exact lockstep version, so it stays satisfiable across patch releases
+ *     without an anchor of its own.
+ *
+ * The temporal crate's own [package] version IS synced (anchor below): it used to
+ * be `publish = false` and therefore inert, but it now publishes to crates.io, so
+ * a drifting version would make ci-publish's `cratesHasVersion` check never
+ * match — it would try to publish the stale version forever.
  *
  * FAILS LOUDLY: if any expected version anchor is missing we throw rather than
  * silently ship a mismatched set — a partial sync must abort the release, never
@@ -53,6 +59,11 @@ const anchors = [
         label: "Rust crate (Cargo.toml [package] version)",
         path: "rust/smooth-operator-core/Cargo.toml",
         pattern: /(name = "smooai-smooth-operator-core"\nversion = ")[^"]+(")/,
+    },
+    {
+        label: "Rust temporal crate (Cargo.toml [package] version)",
+        path: "rust/smooth-operator-temporal/Cargo.toml",
+        pattern: /(name = "smooai-smooth-operator-temporal"\nversion = ")[^"]+(")/,
     },
     {
         label: ".NET package (csproj <Version>)",

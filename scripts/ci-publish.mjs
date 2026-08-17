@@ -7,6 +7,7 @@
  *
  *   • npm      — @smooai/smooth-operator-core          (typescript/core)
  *   • crates.io— smooai-smooth-operator-core           (rust/smooth-operator-core)
+ *   • crates.io— smooai-smooth-operator-temporal       (rust/smooth-operator-temporal)
  *   • NuGet    — SmooAI.SmoothOperator.Core            (dotnet/core)
  *   • PyPI     — smooai-smooth-operator-core           (python/core)
  *   • Go       — git tag go/vX.Y.Z                     (go/  — "publish" == tag)
@@ -167,6 +168,24 @@ const registries = [
             }
             requireEnv("CARGO_REGISTRY_TOKEN");
             run("cargo", ["publish", "-p", "smooai-smooth-operator-core", "--locked"], { cwd: resolve(root, "rust") });
+        },
+    },
+    {
+        // MUST come after the core crate: cargo refuses to publish a crate whose
+        // dependency is not yet on the index, and this one depends on core `^1.8`.
+        // Its own default build compiles NO temporalio-* (the SDK is behind the
+        // off-by-default `temporal` feature), so the verify build stays cheap.
+        name: "crates.io (temporal)",
+        artifact: `smooai-smooth-operator-temporal@${version}`,
+        exists: () => cratesHasVersion("smooai-smooth-operator-temporal", version),
+        tool: "cargo",
+        publish(dry) {
+            if (dry) {
+                run("cargo", ["package", "-p", "smooai-smooth-operator-temporal", "--no-verify", "--allow-dirty"], { cwd: resolve(root, "rust") });
+                return;
+            }
+            requireEnv("CARGO_REGISTRY_TOKEN");
+            run("cargo", ["publish", "-p", "smooai-smooth-operator-temporal", "--locked"], { cwd: resolve(root, "rust") });
         },
     },
     {

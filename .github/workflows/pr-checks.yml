@@ -70,3 +70,13 @@ jobs:
             - name: Publish dry-run (crates.io packaging)
               working-directory: rust
               run: cargo publish --dry-run -p smooai-smooth-operator-core --locked
+
+            # The temporal crate publishes too (it stopped being `publish = false`
+            # when the server needed a real durable backend). It needs its OWN
+            # dry-run: packaging rules are per-manifest, so a stray path/git dep or
+            # missing metadata here is invisible to the core crate's check above and
+            # would otherwise surface only at release, failing the whole lockstep
+            # publish. Its default features compile no temporalio-*, so this is cheap.
+            - name: Publish dry-run (crates.io packaging, temporal)
+              working-directory: rust
+              run: cargo publish --dry-run -p smooai-smooth-operator-temporal --locked
