@@ -21,6 +21,10 @@
 		"./extension": {
 			"types": "./dist/extension/index.d.ts",
 			"import": "./dist/extension/index.js"
+		},
+		"./executor": {
+			"types": "./dist/executor.d.ts",
+			"import": "./dist/executor.js"
 		}
 	},
 	"files": [

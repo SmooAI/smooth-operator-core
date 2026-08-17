@@ -38,8 +38,16 @@ jobs:
             - name: Install dependencies
               run: pnpm install --frozen-lockfile
 
-            - name: Typecheck
-              run: pnpm --filter @smooai/smooth-operator-core typecheck
+            # Build core first so the optional Temporal package resolves the core
+            # `./executor` subpath (dist) it imports.
+            - name: Build core
+              run: pnpm --filter @smooai/smooth-operator-core build
 
+            - name: Typecheck
+              run: pnpm --filter @smooai/smooth-operator-core --filter @smooai/smooth-operator-temporal typecheck
+
+            # The Temporal package's e2e suite is gated behind SMOOTH_TEMPORAL_E2E
+            # (unset here) and self-skips, so this needs no Temporal server; only the
+            # zero-infra DTO boundary test runs for that package.
             - name: Test
-              run: pnpm --filter @smooai/smooth-operator-core test
+              run: pnpm --filter @smooai/smooth-operator-core --filter @smooai/smooth-operator-temporal test
