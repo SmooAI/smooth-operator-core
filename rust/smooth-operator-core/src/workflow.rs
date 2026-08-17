@@ -79,10 +79,15 @@ impl<S: State> Node<S> for FnNode<S> {
 /// user turn: a sub-workflow node executes its whole sub-graph within that one
 /// turn, and the top level stays turn-gated.
 ///
+/// The result is an ordinary [`Node`]: [`WorkflowBuilder::add_edge`] and
+/// [`WorkflowBuilder::add_conditional_edge`] treat it exactly like a plain one,
+/// as an edge source and as an edge target alike. Plain nodes and sub-workflows
+/// are therefore interchangeable vertices of one composite graph, and they nest
+/// arbitrarily — a sub-workflow may itself contain sub-workflows.
+///
 /// `map_in` projects parent state into the child's state type; `map_out` folds
 /// the child's final state back into the parent's. An error from any child node
-/// propagates out of the parent's [`Workflow::run`]. Sub-workflows nest — a
-/// child may itself hold a sub-workflow node.
+/// propagates out of the parent's [`Workflow::run`].
 pub fn sub_workflow_node<P: State, C: State>(
     name: &str,
     child: Workflow<C>,
@@ -550,5 +555,68 @@ mod tests {
 
         let result = wf.run(vec![]).await.unwrap();
         assert_eq!(result, vec!["parent_a", "child_a", "grand_a", "grand_b"]);
+    }
+
+    // 13. Plain nodes and sub-workflows are interchangeable vertices: one composite
+    //     graph wires both with the same conditional edges — routing INTO a
+    //     sub-workflow and OUT of one — and the sub-workflow itself mixes a plain
+    //     node with a nested sub-workflow (depth 2). All of it in one parent run.
+    #[tokio::test]
+    async fn test_composite_graph_mixes_plain_and_sub_workflow_vertices() {
+        let deep = WorkflowBuilder::new()
+            .add_node(tracking_node("deep_a"))
+            .add_node(tracking_node("deep_b"))
+            .add_node(tracking_node("deep_never"))
+            .add_conditional_edge("deep_a", |state: &Vec<String>| {
+                if state.contains(&"deep_a".to_string()) {
+                    "deep_b".to_string()
+                } else {
+                    "deep_never".to_string()
+                }
+            })
+            .set_entry("deep_a")
+            .set_end("deep_b")
+            .build()
+            .unwrap();
+
+        // A sub-workflow whose own vertices are a plain node AND a sub-workflow.
+        let enrich = WorkflowBuilder::new()
+            .add_node(tracking_node("enrich_a"))
+            .add_node(sub_workflow_node("deep", deep, Vec::clone, |_parent, child| child))
+            .add_edge("enrich_a", "deep")
+            .set_entry("enrich_a")
+            .set_end("deep")
+            .build()
+            .unwrap();
+
+        // Parent: plain --conditional--> sub-workflow --conditional--> plain.
+        let wf = WorkflowBuilder::new()
+            .add_node(tracking_node("classify"))
+            .add_node(sub_workflow_node("enrich", enrich, Vec::clone, |_parent, child| child))
+            .add_node(tracking_node("finish"))
+            .add_node(tracking_node("never"))
+            .add_conditional_edge("classify", |state: &Vec<String>| {
+                if state.contains(&"classify".to_string()) {
+                    "enrich".to_string()
+                } else {
+                    "never".to_string()
+                }
+            })
+            // A conditional edge LEAVING a sub-workflow vertex, routing on state the
+            // sub-workflow produced — including the terminate sentinel.
+            .add_conditional_edge("enrich", |state: &Vec<String>| {
+                if state.contains(&"deep_b".to_string()) {
+                    "finish".to_string()
+                } else {
+                    END_SENTINEL.to_string()
+                }
+            })
+            .set_entry("classify")
+            .set_end("finish")
+            .build()
+            .unwrap();
+
+        let result = wf.run(vec![]).await.unwrap();
+        assert_eq!(result, vec!["classify", "enrich_a", "deep_a", "deep_b", "finish"]);
     }
 }

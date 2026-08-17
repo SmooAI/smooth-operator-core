@@ -265,3 +265,70 @@ func TestSubWorkflowNestingDepthTwo(t *testing.T) {
 		t.Fatalf("expected two levels of nesting to run fully, got %q", got)
 	}
 }
+
+// Plain nodes and sub-workflows are interchangeable vertices: one composite graph
+// wires both with the same conditional edges — routing INTO a sub-workflow and OUT
+// of one — and the sub-workflow itself mixes a plain node with a nested
+// sub-workflow (depth 2). All of it in one parent run.
+func TestCompositeGraphMixesPlainAndSubWorkflowVertices(t *testing.T) {
+	contains := func(state []string, want string) bool {
+		for _, s := range state {
+			if s == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	deep := NewWorkflow[[]string](0).
+		AddNode("deep_a", appendNode("deep_a")).
+		AddNode("deep_b", appendNode("deep_b")).
+		AddNode("deep_never", appendNode("deep_never")).
+		AddConditionalEdge("deep_a", func(state []string) string {
+			if contains(state, "deep_a") {
+				return "deep_b"
+			}
+			return "deep_never"
+		}).
+		SetEntry("deep_a").
+		SetEnd("deep_b")
+
+	// A sub-workflow whose own vertices are a plain node AND a sub-workflow.
+	enrich := NewWorkflow[[]string](0).
+		AddNode("enrich_a", appendNode("enrich_a")).
+		AddNode("deep", SubWorkflowNode(deep, identity, takeChild)).
+		AddEdge("enrich_a", "deep").
+		SetEntry("enrich_a").
+		SetEnd("deep")
+
+	// Parent: plain --conditional--> sub-workflow --conditional--> plain.
+	wf := NewWorkflow[[]string](0).
+		AddNode("classify", appendNode("classify")).
+		AddNode("enrich", SubWorkflowNode(enrich, identity, takeChild)).
+		AddNode("finish", appendNode("finish")).
+		AddNode("never", appendNode("never")).
+		AddConditionalEdge("classify", func(state []string) string {
+			if contains(state, "classify") {
+				return "enrich"
+			}
+			return "never"
+		}).
+		// A conditional edge LEAVING a sub-workflow vertex, routing on state the
+		// sub-workflow produced — including the terminate sentinel.
+		AddConditionalEdge("enrich", func(state []string) string {
+			if contains(state, "deep_b") {
+				return "finish"
+			}
+			return END
+		}).
+		SetEntry("classify").
+		SetEnd("finish")
+
+	out, err := wf.Run(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := strings.Join(out, ","); got != "classify,enrich_a,deep_a,deep_b,finish" {
+		t.Fatalf("expected plain and sub-workflow vertices to compose in one run, got %q", got)
+	}
+}

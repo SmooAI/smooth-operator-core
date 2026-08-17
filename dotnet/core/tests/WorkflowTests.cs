@@ -216,4 +216,46 @@ public class WorkflowTests
 
         Assert.Equal(new[] { "parent_a", "child_a", "grand_a", "grand_b" }, result);
     }
+
+    /// <summary>
+    /// Plain nodes and sub-workflows are interchangeable vertices: one composite graph wires
+    /// both with the same conditional edges — routing INTO a sub-workflow and OUT of one — and
+    /// the sub-workflow itself mixes a plain node with a nested sub-workflow (depth 2).
+    /// </summary>
+    [Fact]
+    public async Task CompositeGraph_MixesPlainAndSubWorkflowVertices()
+    {
+        var deep = new Workflow<List<string>>()
+            .AddNode("deep_a", Append("deep_a"))
+            .AddNode("deep_b", Append("deep_b"))
+            .AddNode("deep_never", Append("deep_never"))
+            .AddConditionalEdge("deep_a", s => s.Contains("deep_a") ? "deep_b" : "deep_never")
+            .SetEntry("deep_a")
+            .SetEnd("deep_b");
+
+        // A sub-workflow whose own vertices are a plain node AND a sub-workflow.
+        var enrich = new Workflow<List<string>>()
+            .AddNode("enrich_a", Append("enrich_a"))
+            .AddNode("deep", Workflow.SubWorkflowNode(deep, Identity, TakeChild))
+            .AddEdge("enrich_a", "deep")
+            .SetEntry("enrich_a")
+            .SetEnd("deep");
+
+        // Parent: plain --conditional--> sub-workflow --conditional--> plain.
+        var wf = new Workflow<List<string>>()
+            .AddNode("classify", Append("classify"))
+            .AddNode("enrich", Workflow.SubWorkflowNode(enrich, Identity, TakeChild))
+            .AddNode("finish", Append("finish"))
+            .AddNode("never", Append("never"))
+            .AddConditionalEdge("classify", s => s.Contains("classify") ? "enrich" : "never")
+            // A conditional edge LEAVING a sub-workflow vertex, routing on state the
+            // sub-workflow produced — including the terminate sentinel.
+            .AddConditionalEdge("enrich", s => s.Contains("deep_b") ? "finish" : Workflow<List<string>>.End)
+            .SetEntry("classify")
+            .SetEnd("finish");
+
+        var result = await wf.RunAsync([]);
+
+        Assert.Equal(new[] { "classify", "enrich_a", "deep_a", "deep_b", "finish" }, result);
+    }
 }
