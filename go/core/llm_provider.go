@@ -21,6 +21,20 @@ func WithUsage(resp ChatResponse, promptTokens, completionTokens int) ChatRespon
 	return resp
 }
 
+// ScriptedUsage is the token usage a SCRIPTED mock response reports. Fixed, and
+// identical in all five engines' mocks (Rust · Go · Python · TypeScript · C#), so
+// the shared server scenario corpus can assert eventual_response.usage as a real
+// cross-language invariant instead of documenting five different answers (pearl
+// th-4f1263).
+//
+// Only the FIFO scripting helpers (PushText / PushToolCall) attach it. An
+// unscripted response — the benign empty reply a drained script falls back to —
+// still reports nothing, so "the script ran out" stays distinguishable from "the
+// model answered". Pass an explicit WithUsage to PushResponse to override.
+func ScriptedUsage() Usage {
+	return Usage{PromptTokens: 10, CompletionTokens: 5}
+}
+
 // TextResponse builds a plain-text ChatResponse (no tool calls). Handy for
 // scripting the mock and for assertions.
 func TextResponse(content string) ChatResponse {
@@ -62,14 +76,20 @@ func (m *MockLlmProvider) PushResponse(resp ChatResponse) *MockLlmProvider {
 	return m
 }
 
-// PushText queues a plain-text response for the next Chat call.
+// PushText queues a plain-text response for the next Chat call, reporting
+// ScriptedUsage.
 func (m *MockLlmProvider) PushText(content string) *MockLlmProvider {
-	return m.PushResponse(TextResponse(content))
+	resp := TextResponse(content)
+	resp.Usage = ScriptedUsage()
+	return m.PushResponse(resp)
 }
 
-// PushToolCall queues a single-tool-call response for the next Chat call.
+// PushToolCall queues a single-tool-call response for the next Chat call,
+// reporting ScriptedUsage.
 func (m *MockLlmProvider) PushToolCall(id, name, arguments string) *MockLlmProvider {
-	return m.PushResponse(ToolCallResponse(id, name, arguments))
+	resp := ToolCallResponse(id, name, arguments)
+	resp.Usage = ScriptedUsage()
+	return m.PushResponse(resp)
 }
 
 // PushError queues an error to be returned from the next Chat call.

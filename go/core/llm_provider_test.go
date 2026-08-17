@@ -63,6 +63,32 @@ func TestMockDefaultWhenScriptEmptyIsBenignTerminal(t *testing.T) {
 	}
 }
 
+// The cross-language invariant (pearl th-4f1263): a scripted text or tool-call
+// response reports 10 prompt / 5 completion tokens in EVERY engine's mock, and a
+// drained script still reports nothing. Change these numbers here and the shared
+// server scenario corpus goes red.
+func TestMockScriptedResponsesReportTheSharedUsageConvention(t *testing.T) {
+	mock := NewMockLlmProvider().PushText("hi").PushToolCall("call_1", "search", `{}`)
+	for i := 0; i < 2; i++ {
+		resp, err := mock.Chat(context.Background(), ChatRequest{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Usage.PromptTokens != 10 || resp.Usage.CompletionTokens != 5 {
+			t.Fatalf("call %d: usage = %+v, want {10 5}", i, resp.Usage)
+		}
+	}
+	// Drained script: "the script ran out" must stay distinguishable from "the
+	// model answered", so the fallback reports nothing.
+	drained, err := mock.Chat(context.Background(), ChatRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drained.Usage != (Usage{}) {
+		t.Fatalf("drained script usage = %+v, want zero", drained.Usage)
+	}
+}
+
 func TestMockScriptsErrors(t *testing.T) {
 	mock := NewMockLlmProvider()
 	mock.PushError("rate limited")

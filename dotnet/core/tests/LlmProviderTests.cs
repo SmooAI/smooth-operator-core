@@ -25,6 +25,28 @@ public class LlmProviderTests
         Assert.Contains(mock.LastCall!.Messages, m => m.Text.Contains("hi"));
     }
 
+    /// <summary>
+    /// The cross-language invariant (pearl th-4f1263): a scripted text or tool-call response
+    /// reports 10 prompt / 5 completion tokens in EVERY engine's mock. Change these numbers here
+    /// and the shared server scenario corpus goes red. (C# has no drained-script fallback — an
+    /// empty script throws, covered by <see cref="EmptyScript_ThrowsRatherThanHang"/>.)
+    /// </summary>
+    [Fact]
+    public async Task ScriptedResponses_ReportTheSharedUsageConvention()
+    {
+        var mock = new MockLlmProvider()
+            .PushText("hi")
+            .PushToolCall("c1", "search", new Dictionary<string, object?>());
+
+        for (var i = 0; i < 2; i++)
+        {
+            var response = await mock.GetResponseAsync(new List<ChatMessage>());
+            Assert.Equal(10, response.Usage?.InputTokenCount);
+            Assert.Equal(5, response.Usage?.OutputTokenCount);
+            Assert.Equal(15, response.Usage?.TotalTokenCount);
+        }
+    }
+
     [Fact]
     public async Task PushError_ThrowsOnThatCall()
     {

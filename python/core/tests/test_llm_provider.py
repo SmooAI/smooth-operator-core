@@ -31,6 +31,28 @@ async def test_replays_text_responses_in_fifo_order():
 
 
 @pytest.mark.asyncio
+async def test_scripted_responses_report_the_shared_usage_convention():
+    """The cross-language invariant (pearl th-4f1263).
+
+    A scripted text or tool-call response reports 10 prompt / 5 completion tokens in
+    EVERY engine's mock, and a drained script still reports nothing. Change these
+    numbers here and the shared server scenario corpus goes red.
+    """
+    mock = MockLlmProvider()
+    mock.push_text("hi").push_tool_call("call_1", "search", "{}")
+
+    for _ in range(2):
+        response = await mock.chat.completions.create(model="m", messages=[])
+        assert response.usage.prompt_tokens == 10
+        assert response.usage.completion_tokens == 5
+
+    # Drained script: "the script ran out" must stay distinguishable from "the model
+    # answered", so the fallback reports nothing.
+    drained = await mock.chat.completions.create(model="m", messages=[])
+    assert drained.usage is None
+
+
+@pytest.mark.asyncio
 async def test_records_messages_and_tools():
     mock = MockLlmProvider()
     mock.push_text("ok")

@@ -55,6 +55,23 @@ def usage(prompt_tokens: int = 0, completion_tokens: int = 0) -> SimpleNamespace
     return SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
 
 
+def scripted_usage() -> SimpleNamespace:
+    """The token usage a **scripted** mock response reports.
+
+    Fixed, and identical in all five engines' mocks (Rust · Go · Python ·
+    TypeScript · C#), so the shared server scenario corpus can assert
+    ``eventual_response.usage`` as a real cross-language invariant instead of
+    documenting five different answers (pearl th-4f1263).
+
+    Only the FIFO scripting helpers (:meth:`MockLlmProvider.push_text` /
+    :meth:`MockLlmProvider.push_tool_call`) attach it. An *unscripted* response —
+    the benign empty reply a drained script falls back to — still reports nothing,
+    so "the script ran out" stays distinguishable from "the model answered". Pass
+    an explicit ``usage=`` to override.
+    """
+    return usage(prompt_tokens=10, completion_tokens=5)
+
+
 def text_response(content: str, usage: SimpleNamespace | None = None) -> SimpleNamespace:
     """An OpenAI-shaped assistant message that is plain text (no tool calls).
 
@@ -200,14 +217,20 @@ class MockLlmProvider:
         return self
 
     def push_text(self, content: str, usage: SimpleNamespace | None = None) -> MockLlmProvider:
-        """Queue a plain-text response (with optional usage) for the next call."""
-        return self.push_response(text_response(content, usage))
+        """Queue a plain-text response for the next call, reporting :func:`scripted_usage`.
+
+        Pass ``usage=`` to report something else.
+        """
+        return self.push_response(text_response(content, usage or scripted_usage()))
 
     def push_tool_call(
         self, call_id: str, name: str, arguments: str, usage: SimpleNamespace | None = None
     ) -> MockLlmProvider:
-        """Queue a single-tool-call response (with optional usage) for the next call."""
-        return self.push_response(tool_call_response(call_id, name, arguments, usage))
+        """Queue a single-tool-call response for the next call, reporting :func:`scripted_usage`.
+
+        Pass ``usage=`` to report something else.
+        """
+        return self.push_response(tool_call_response(call_id, name, arguments, usage or scripted_usage()))
 
     def push_error(self, message: str) -> MockLlmProvider:
         """Queue an error to be raised on the next call."""

@@ -66,6 +66,26 @@ impl LlmProvider for LlmClient {
     }
 }
 
+/// The token usage a **scripted** mock response reports. Fixed, and identical in
+/// all five engines' mocks (Rust · Go · Python · TypeScript · C#), so the shared
+/// server scenario corpus can assert `eventual_response.usage` as a real
+/// cross-language invariant instead of documenting five different answers
+/// (pearl th-4f1263).
+///
+/// Only the FIFO scripting helpers ([`MockLlmClient::push_text`],
+/// [`MockLlmClient::push_tool_call`]) attach it. An *unscripted* response — the
+/// benign empty reply a drained script falls back to — still reports nothing, so
+/// "the script ran out" stays distinguishable from "the model answered".
+#[must_use]
+pub fn scripted_usage() -> Usage {
+    Usage {
+        prompt_tokens: 10,
+        completion_tokens: 5,
+        total_tokens: 15,
+        cached_tokens: 0,
+    }
+}
+
 /// Build a plain text [`LlmResponse`] with `stop` finish reason and otherwise
 /// empty/default fields. Handy for scripting the mock and for assertions.
 #[must_use]
@@ -178,14 +198,20 @@ impl MockLlmClient {
         self
     }
 
-    /// Queue a plain-text response for the next `chat` call.
+    /// Queue a plain-text response for the next `chat` call, reporting
+    /// [`scripted_usage`].
     pub fn push_text(&self, content: impl Into<String>) -> &Self {
-        self.push_response(text_response(content))
+        let mut response = text_response(content);
+        response.usage = scripted_usage();
+        self.push_response(response)
     }
 
-    /// Queue a single-tool-call response for the next `chat` call.
+    /// Queue a single-tool-call response for the next `chat` call, reporting
+    /// [`scripted_usage`].
     pub fn push_tool_call(&self, id: impl Into<String>, name: impl Into<String>, arguments: serde_json::Value) -> &Self {
-        self.push_response(tool_call_response(id, name, arguments))
+        let mut response = tool_call_response(id, name, arguments);
+        response.usage = scripted_usage();
+        self.push_response(response)
     }
 
     /// Queue an error for the next `chat` call.
@@ -292,6 +318,30 @@ mod tests {
 
         assert_eq!(r1.content, "first");
         assert_eq!(r2.content, "second");
+    }
+
+    /// The cross-language invariant (pearl th-4f1263): a scripted text or
+    /// tool-call response reports 10 prompt / 5 completion tokens in EVERY
+    /// engine's mock, and a drained script still reports nothing. Change these
+    /// numbers here and the shared server scenario corpus goes red.
+    #[tokio::test]
+    async fn scripted_responses_report_the_shared_usage_convention() {
+        let mock = MockLlmClient::new();
+        mock.push_text("hi").push_tool_call("call_1", "search", serde_json::json!({}));
+        let u = Message::user("hi");
+
+        for _ in 0..2 {
+            let r = mock.chat(&msgs(&u), &[]).await.expect("chat");
+            assert_eq!(r.usage.prompt_tokens, 10);
+            assert_eq!(r.usage.completion_tokens, 5);
+            assert_eq!(r.usage.total_tokens, 15);
+        }
+
+        // Drained script: "the script ran out" must stay distinguishable from
+        // "the model answered", so the fallback reports nothing.
+        let drained = mock.chat(&msgs(&u), &[]).await.expect("chat");
+        assert_eq!(drained.usage.prompt_tokens, 0);
+        assert_eq!(drained.usage.completion_tokens, 0);
     }
 
     #[tokio::test]
