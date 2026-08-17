@@ -22,12 +22,14 @@ namespace SmooAI.SmoothOperator.Core;
 ///
 /// <para>Two details are load-bearing:</para>
 /// <list type="bullet">
-/// <item><description><b>Streaming reads the headers BEFORE the body.</b>
-/// <see cref="HttpCompletionOption.ResponseHeadersRead"/> returns as soon as the response HEAD is
-/// in, so <see cref="GatewayCost"/> parses the cost while the SSE body is still untouched. Reading
-/// it after scanning the stream finds nothing — the exact regression core#102 fixed in Rust. The
-/// cost rides a LEADING update (matching Go's first-chunk <c>ChatChunk{CostUSD}</c>) so it survives
-/// a stream that errors before any usage arrives.</description></item>
+/// <item><description><b>Streaming keeps hold of the response.</b>
+/// <see cref="HttpResponseMessage.Headers"/> stays readable after the body is consumed, so the
+/// cost is never racing the stream — the hazard core#102 fixed in Rust is dropping the response
+/// and keeping only a stream, which leaves nothing to read a header off at all.
+/// <see cref="HttpCompletionOption.ResponseHeadersRead"/> is required here for a different reason:
+/// the default buffers the WHOLE body before returning, which never completes on an open SSE
+/// stream. The cost rides a LEADING update (matching Go's first-chunk <c>ChatChunk{CostUSD}</c>)
+/// so it survives a stream that errors before any usage arrives.</description></item>
 /// <item><description><b><c>metadata</c> is omitted when unset</b> (core#100), keeping the request
 /// byte-identical to a client that never knew about the field.</description></item>
 /// </list>
@@ -128,9 +130,9 @@ public sealed class GatewayChatClient : IChatClient
             .ConfigureAwait(false);
         await ThrowIfNotSuccessAsync(response, cancellationToken).ConfigureAwait(false);
 
-        // MUST happen before the body is read. ResponseHeadersRead means we are here with the
-        // headers in hand and not a byte of SSE consumed; once the reader below is scanning the
-        // stream they are gone. This is the regression core#102 fixed in Rust.
+        // `response` is held for the whole method, which is what actually matters: its Headers
+        // survive the body being read, so this is safe anywhere below too. The regression
+        // core#102 fixed in Rust was keeping only the stream and losing the response entirely.
         var cost = GatewayCost.Parse(response.Headers);
         if (cost is { } measured)
         {

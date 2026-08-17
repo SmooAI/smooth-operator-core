@@ -9,11 +9,11 @@ It is a thin adapter over the ``openai`` SDK, which this package already depends
 — the SDK owns the wire format, the SSE framing, timeouts and connection retries, so
 the only thing this module adds is the bit the SDK's parsed response throws away:
 
-**The gateway cost header.** Cost is reported ONLY in a response header, and on the
-streaming path those headers are gone once the SSE body is being consumed — the
-regression core#102 fixed in Rust. ``with_raw_response`` hands back the headers
-alongside the (not yet consumed) payload, so both paths read them BEFORE touching
-the body and expose them on the documented seam
+**The gateway cost header.** Cost is reported ONLY in a response header, and a plain
+``create(stream=True)`` hands back ONLY the stream — there is no response object left
+to ask for headers, so the cost is not late, it is absent. That is the regression
+core#102 fixed in Rust. ``with_raw_response`` keeps the headers alongside the payload,
+and they are exposed on the documented seam
 (:func:`smooth_operator_core.agent._response_gateway_cost` reads ``.headers``).
 
 The request body is otherwise passed through verbatim, so the agent's ``metadata``
