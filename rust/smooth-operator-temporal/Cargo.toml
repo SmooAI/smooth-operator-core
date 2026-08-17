@@ -1,6 +1,6 @@
 [package]
 name = "smooai-smooth-operator-temporal"
-version = "1.8.10"
+version = "1.8.11"
 edition = "2021"
 description = "Optional Temporal-backed durable execution backend for the smooth-operator agent engine (ADR-030)."
 license = "MIT"
