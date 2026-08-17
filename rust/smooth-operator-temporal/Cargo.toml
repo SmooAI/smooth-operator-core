@@ -1,10 +1,13 @@
 [package]
 name = "smooai-smooth-operator-temporal"
-version = "0.14.0"
+version = "1.8.9"
 edition = "2021"
 description = "Optional Temporal-backed durable execution backend for the smooth-operator agent engine (ADR-030)."
 license = "MIT"
-publish = false
+repository = "https://github.com/SmooAI/smooth-operator-core"
+readme = "README.md"
+keywords = ["ai", "agent", "temporal", "durable", "workflow"]
+categories = ["asynchronous", "api-bindings"]
 
 # The Temporal SDK + workflow/executor wiring is behind the `temporal` feature so
 # the default build (and the OSS core's CI) compiles NONE of the preview SDK and
@@ -26,7 +29,11 @@ temporal = [
 ]
 
 [dependencies]
-smooai-smooth-operator-core = { path = "../smooth-operator-core" }
+# `path` for local dev, `version` because a published crate may not depend on a
+# bare path. `1.8` (i.e. `^1.8`) rather than the exact lockstep version so this
+# line never needs re-syncing on a patch release — any 1.x core from 1.8 up
+# satisfies it, and the two ship in lockstep anyway.
+smooai-smooth-operator-core = { path = "../smooth-operator-core", version = "1.8" }
 anyhow = "1"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
