@@ -3,4 +3,8 @@
     <Project Path="core/src/SmooAI.SmoothOperator.Core.csproj" />
     <Project Path="core/tests/SmooAI.SmoothOperator.Core.Tests.csproj" />
   </Folder>
+  <Folder Name="/temporal/">
+    <Project Path="temporal/src/SmooAI.SmoothOperator.Temporal.csproj" />
+    <Project Path="temporal/tests/SmooAI.SmoothOperator.Temporal.Tests.csproj" />
+  </Folder>
 </Solution>
