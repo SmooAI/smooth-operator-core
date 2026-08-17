@@ -23,6 +23,7 @@ Every engine supports the same core capabilities below. Beyond this shared core,
 - **In-memory + vector knowledge (RAG)** — ground the turn in retrieved documents.
 - **Memory** — long-term entries recalled into context each turn.
 - **Compaction** — sliding-window context-token budget keeps the prompt under a ceiling.
+- **Project context loader** — stack the user's `~/.smooth/CONTEXT.md` above the nearest project `.smooth/CONTEXT.md` / `SMOOTH.md` / `AGENTS.md` / `CLAUDE.md` (walking up from the working directory), resolving any `## File References` inline. A standalone loader in every engine: the host decides whether to inject the result into the system prompt.
 - **Cost / budget** — per-model pricing, token + USD accounting, early stop on budget.
 - **Checkpointing** — persist/resume a conversation via a checkpoint store.
 - **Rerank** — rerank retrieved hits before injection; a lexical reranker (query-term coverage normalized by document length) is built into all five.
