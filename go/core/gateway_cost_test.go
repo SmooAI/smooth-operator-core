@@ -10,8 +10,9 @@ import (
 
 // The gateway reports per-request cost ONLY in a response header. These drive the
 // real GatewayClient against a local server so the header genuinely has to survive
-// the HTTP round-trip — including on the streaming path, where the headers are gone
-// once the SSE body is being scanned (the bug core#102 fixed in Rust).
+// the HTTP round-trip — including on the streaming path. Note resp.Header survives
+// the body being read just fine; the bug core#102 fixed in Rust was keeping only
+// the stream and losing the response, leaving nothing to read a header off at all.
 
 func TestParseGatewayCostPrecedence(t *testing.T) {
 	cases := []struct {
