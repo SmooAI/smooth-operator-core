@@ -47,6 +47,81 @@ public class CostTests
         Assert.Null(result.BudgetExceeded);
     }
 
+    /// <summary>
+    /// Pearl th-df859c: the streaming path used to discard usage and cost entirely — no tracker was
+    /// even declared. A streamed turn must now report the SAME totals as the non-streaming one for
+    /// the same script, which is what lets the C# server stop hardcoding <c>costUsd: 0</c>.
+    /// </summary>
+    [Fact]
+    public async Task StreamingRun_TracksTheSameUsageAndCostAsRunAsync()
+    {
+        var options = new AgentOptions();
+        options.Pricing[MockLlmProvider.ModelId] = new ModelPricing(PromptPerMillionTokens: 1m, CompletionPerMillionTokens: 2m);
+
+        var streamed = new SmoothAgent(new MockLlmProvider().PushText("hi"), options);
+        await foreach (var _ in streamed.RunStreamingAsync("hello"))
+        {
+        }
+
+        var blocking = await new SmoothAgent(new MockLlmProvider().PushText("hi"), options).RunAsync("hello");
+
+        Assert.NotNull(streamed.LastRunResponse);
+        Assert.Equal(blocking.Usage.InputTokenCount, streamed.LastRunResponse!.Usage.InputTokenCount);
+        Assert.Equal(blocking.Usage.OutputTokenCount, streamed.LastRunResponse.Usage.OutputTokenCount);
+        Assert.Equal(blocking.Cost.TotalTokens, streamed.LastRunResponse.Cost.TotalTokens);
+        Assert.Equal(blocking.Cost.TotalCostUsd, streamed.LastRunResponse.Cost.TotalCostUsd);
+        Assert.Equal(0.00002m, streamed.LastRunResponse.Cost.TotalCostUsd);
+        Assert.Null(streamed.LastRunResponse.BudgetExceeded);
+    }
+
+    /// <summary>
+    /// The consequence that bit hardest: with no tracker on the streaming path,
+    /// <see cref="AgentOptions.Budget"/> was silently inert — a runaway streamed turn could not be
+    /// stopped by its own spend ceiling. Same script and budget as
+    /// <see cref="TokenBudget_HaltsTheRun"/>, same answer.
+    /// </summary>
+    [Fact]
+    public async Task StreamingRun_TokenBudget_HaltsTheRun()
+    {
+        var mock = new MockLlmProvider();
+        for (var i = 0; i < 10; i++)
+        {
+            mock.PushToolCall($"c{i}", "noop", new Dictionary<string, object?>());
+        }
+        var options = new AgentOptions
+        {
+            MaxIterations = 10,                      // not the limiter here
+            Budget = new CostBudget { MaxTokens = 20 },
+        };
+        options.Tools.Add(AIFunctionFactory.Create(() => "ok", "noop", "does nothing"));
+        var agent = new SmoothAgent(mock, options);
+
+        await foreach (var _ in agent.RunStreamingAsync("loop"))
+        {
+        }
+
+        // Call 1 = 15 tokens (≤ 20, continues); call 2 = 30 tokens (> 20, halts).
+        Assert.NotNull(agent.LastRunResponse);
+        Assert.Equal(2, agent.LastRunResponse!.Iterations);
+        Assert.Equal(30, agent.LastRunResponse.Cost.TotalTokens);
+        Assert.NotNull(agent.LastRunResponse.BudgetExceeded);
+        Assert.Equal(20, agent.LastRunResponse.BudgetExceeded!.LimitTokens);
+    }
+
+    /// <summary>A turn abandoned mid-stream reports nothing, rather than a partial or stale total.</summary>
+    [Fact]
+    public async Task StreamingRun_AbandonedMidStream_ReportsNoTotals()
+    {
+        var agent = new SmoothAgent(new MockLlmProvider().PushText("hello there friend"), new AgentOptions());
+
+        await foreach (var _ in agent.RunStreamingAsync("hi"))
+        {
+            break;
+        }
+
+        Assert.Null(agent.LastRunResponse);
+    }
+
     [Fact]
     public async Task TokenBudget_HaltsTheRun()
     {
