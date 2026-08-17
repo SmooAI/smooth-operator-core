@@ -1236,7 +1236,11 @@ impl LlmClient {
             }
         };
 
-        // Must be read BEFORE the body is consumed. Pearl th-11f9bb.
+        // Read the headers while we still own `resp`: `bytes_stream()` below takes
+        // `self` BY VALUE, so afterwards there is no response left to ask. The
+        // mechanism is the move, not the body — consuming a body does not destroy
+        // headers, and porting this as "read them early" has produced the wrong
+        // comment in four languages. Pearl th-11f9bb.
         let gateway_cost_usd = parse_gateway_cost(resp.headers());
         let byte_stream = resp.bytes_stream();
 
@@ -1611,7 +1615,11 @@ impl LlmClient {
             anyhow::bail!("Anthropic API error {status} after {attempt} attempt(s): {body}");
         }
 
-        // Must be read BEFORE the body is consumed. Pearl th-11f9bb.
+        // Read the headers while we still own `resp`: `bytes_stream()` below takes
+        // `self` BY VALUE, so afterwards there is no response left to ask. The
+        // mechanism is the move, not the body — consuming a body does not destroy
+        // headers, and porting this as "read them early" has produced the wrong
+        // comment in four languages. Pearl th-11f9bb.
         let gateway_cost_usd = parse_gateway_cost(resp.headers());
         let byte_stream = resp.bytes_stream();
         let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<StreamEvent>>(256);
