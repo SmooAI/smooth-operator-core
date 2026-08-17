@@ -87,10 +87,32 @@ type wireToolCall struct {
 }
 
 type wireMessage struct {
-	Role       string         `json:"role"`
-	Content    string         `json:"content"`
+	Role string `json:"role"`
+	// Either a plain string (the default every OpenAI-compat upstream accepts)
+	// or a []wireTextBlock when Anthropic prompt caching marks this message.
+	// Rust models this as an untagged enum; in Go `any` marshals both shapes,
+	// and a string in an `any` field is byte-identical to a string field, so
+	// the wire is unchanged whenever caching is off.
+	Content    any            `json:"content"`
 	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string         `json:"tool_call_id,omitempty"`
+}
+
+// wireCacheControl is the Anthropic-shaped marker. `{"type":"ephemeral"}` is
+// the default 5-minute TTL — what the agent loop wants, since system + tools +
+// recent history get reused turn after turn within one dispatch.
+type wireCacheControl struct {
+	Type string `json:"type"`
+}
+
+func ephemeralCacheControl() *wireCacheControl { return &wireCacheControl{Type: "ephemeral"} }
+
+// wireTextBlock is one block of an Anthropic-style content array. A
+// cache_control on a block caches THAT block plus everything before it.
+type wireTextBlock struct {
+	Type         string            `json:"type"`
+	Text         string            `json:"text"`
+	CacheControl *wireCacheControl `json:"cache_control,omitempty"`
 }
 
 type wireTool struct {
@@ -100,6 +122,10 @@ type wireTool struct {
 		Description string         `json:"description"`
 		Parameters  map[string]any `json:"parameters"`
 	} `json:"function"`
+	// Set on the LAST tool only: Anthropic then caches the whole tool-definitions
+	// block plus the system prefix ahead of it. Highest-ROI breakpoint, since the
+	// tool registry is large and near-constant within a run.
+	CacheControl *wireCacheControl `json:"cache_control,omitempty"`
 }
 
 type wireRequest struct {
@@ -164,8 +190,99 @@ type wireResponse struct {
 	} `json:"usage"`
 }
 
+// supportsAnthropicCacheControl decides whether the configured upstream
+// understands Anthropic-shaped `cache_control` markers. We send them when the
+// model id looks Claude-ish, or is one of the known semantic gateway aliases
+// that route to Claude, AND the api base looks like a LiteLLM-style gateway or
+// anthropic.* directly.
+//
+// We deliberately do NOT send cache_control to bare OpenAI / Gemini / Groq
+// endpoints — they 400 on unknown extension fields. A LiteLLM gateway's
+// `cache_control_injection_points` config is what actually passes the markers
+// through to Anthropic; without that gateway-side change this is a no-op.
+func supportsAnthropicCacheControl(model, apiURL string) bool {
+	m := strings.ToLower(model)
+	u := strings.ToLower(apiURL)
+	looksClaude := strings.Contains(m, "claude") || strings.Contains(m, "sonnet") || strings.Contains(m, "opus") || strings.Contains(m, "haiku")
+	// The generic `smooth-` prefix alone isn't enough — `smooth-fast` routes to
+	// a Groq/Llama model, which would 400 on cache_control.
+	isClaudeAlias := strings.HasPrefix(m, "smooth-coding") ||
+		strings.HasPrefix(m, "smooth-thinking") ||
+		strings.HasPrefix(m, "smooth-planning") ||
+		strings.HasPrefix(m, "smooth-reviewing")
+	urlIsGateway := strings.Contains(u, "litellm") || strings.Contains(u, "gateway")
+	urlIsAnthropic := strings.Contains(u, "anthropic.")
+	return (looksClaude || isClaudeAlias) && (urlIsGateway || urlIsAnthropic)
+}
+
+// applyCacheControl attaches `cache_control: ephemeral` to the strategic prefix
+// boundaries so Anthropic's prompt cache covers what changes least:
+//
+//  1. The (last) system message — caches the system prompt.
+//  2. The last tool definition — caches the tool block + system prefix ahead of it.
+//  3. The last message in history — caches the running conversation, so each turn
+//     within the 5-minute window pays only for the new delta.
+//
+// Marking a block caches THAT block plus everything before it, so only the last
+// block of each prefix we want to reuse needs a marker.
+func applyCacheControl(messages []wireMessage, tools []wireTool) {
+	// 1. Last system message.
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "system" {
+			messages[i].Content = wrapWithCacheControl(messages[i].Content)
+			break
+		}
+	}
+
+	// 2. Last tool — covers the whole tools array plus the system prefix.
+	if len(tools) > 0 {
+		tools[len(tools)-1].CacheControl = ephemeralCacheControl()
+	}
+
+	// 3. Last message, so turn-by-turn history caching extends. Skipped when the
+	//    only message is the system we just marked (avoid double-marking it).
+	if len(messages) > 1 {
+		last := len(messages) - 1
+		messages[last].Content = wrapWithCacheControl(messages[last].Content)
+	}
+}
+
+// wrapWithCacheControl rewrites string content into the single-text-block form
+// carrying `cache_control: ephemeral`. Empty content (a tool-call-only assistant
+// message) is left alone: there's nothing to cache on it, and the marker on the
+// last block before the assistant turn already covers the prefix. Content that
+// is already in block form is re-marked on its last block.
+//
+// ponytail: Rust also passes multimodal image parts through untouched here; Go
+// has no multimodal content shape yet, so there's nothing to guard. Add the
+// passthrough when images land, or the wrap would silently drop them.
+func wrapWithCacheControl(existing any) any {
+	switch c := existing.(type) {
+	case string:
+		if c == "" {
+			return c
+		}
+		return []wireTextBlock{{Type: "text", Text: c, CacheControl: ephemeralCacheControl()}}
+	case []wireTextBlock:
+		blocks := make([]wireTextBlock, len(c))
+		for i, b := range c {
+			blocks[i] = wireTextBlock{Type: b.Type, Text: b.Text}
+		}
+		if len(blocks) > 0 {
+			blocks[len(blocks)-1].CacheControl = ephemeralCacheControl()
+		}
+		return blocks
+	default:
+		return existing
+	}
+}
+
 // buildWireRequest translates a ChatRequest into the OpenAI wire shape.
-func buildWireRequest(req ChatRequest, stream bool) wireRequest {
+//
+// apiURL is optional and only used to gate Anthropic prompt-cache markers: with
+// no URL (or an upstream that doesn't support them) the request is byte-identical
+// to what it was before caching existed.
+func buildWireRequest(req ChatRequest, stream bool, apiURL ...string) wireRequest {
 	wreq := wireRequest{Model: req.Model, Temperature: req.Temperature, MaxTokens: req.MaxTokens, Stream: stream, Metadata: normalizeMetadata(req.Metadata)}
 	for _, m := range req.Messages {
 		wm := wireMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
@@ -193,12 +310,15 @@ func buildWireRequest(req ChatRequest, stream bool) wireRequest {
 			JSONSchema: wireJSONSchema{Name: f.Name, Schema: f.Schema, Strict: f.Strict},
 		}
 	}
+	if len(apiURL) > 0 && supportsAnthropicCacheControl(req.Model, apiURL[0]) {
+		applyCacheControl(wreq.Messages, wreq.Tools)
+	}
 	return wreq
 }
 
 // Chat implements ChatClient.
 func (g *GatewayClient) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
-	wreq := buildWireRequest(req, false)
+	wreq := buildWireRequest(req, false, g.BaseURL)
 
 	body, err := json.Marshal(wreq)
 	if err != nil {
@@ -246,7 +366,7 @@ func (g *GatewayClient) Chat(ctx context.Context, req ChatRequest) (ChatResponse
 // Connect-time failures (request build / HTTP / non-2xx) come back as the error;
 // the channel is closed when the SSE stream ends (`data: [DONE]` or EOF).
 func (g *GatewayClient) ChatStream(ctx context.Context, req ChatRequest) (<-chan ChatChunk, error) {
-	wreq := buildWireRequest(req, true)
+	wreq := buildWireRequest(req, true, g.BaseURL)
 	body, err := json.Marshal(wreq)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)

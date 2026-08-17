@@ -38,7 +38,7 @@ pub use activities::{drive_turn, AgentActivities, InProcessActivities, TurnPolic
 pub use agent::{Agent, AgentConfig, AgentEvent, DelegationHandle, DelegationTool, SubAgentConfig, KNOWLEDGE_TOP_K};
 pub use cast::{Cast, Clearance, DispatchResult, DispatchSubagentTool, LlmConfigFactory, OperatorRole, PermissionHook, RoleKind};
 pub use checkpoint::{Checkpoint, CheckpointStore, MemoryCheckpointStore};
-pub use conversation::{CompactionResult, CompactionStrategy, Conversation, Message, Role};
+pub use conversation::{CompactionResult, CompactionStrategy, Conversation, Message, PromptCache, Role};
 pub use cost::{BudgetExceeded, CostBudget, CostEntry, CostTracker, ModelPricing};
 pub use deny_policy::{DenyPolicy, DenyPredicate, DenyReason, DenyRules};
 pub use executor::{AgentExecutor, InProcessExecutor};

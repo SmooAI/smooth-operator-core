@@ -80,6 +80,7 @@ from .permission_grants import (
     project_grants_path,
     user_grants_path,
 )
+from .prompt_cache import PROMPT_CACHE_BOUNDARY, PromptCache
 from .rerank import LexicalReranker, NoopReranker, Reranker
 from .thread import SmoothAgentThread
 from .tool_search import ToolSearch
@@ -141,6 +142,8 @@ __all__ = [
     "MockLlmProvider",
     "ModelPricing",
     "parse_gateway_cost",
+    "PROMPT_CACHE_BOUNDARY",
+    "PromptCache",
     "NoopReranker",
     "OperatorRole",
     "RecordedCall",
