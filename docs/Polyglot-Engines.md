@@ -38,6 +38,7 @@ Every engine supports the same core capabilities below. Beyond this shared core,
 - **Parallel tool calls** — dispatch ≥2 tool calls concurrently (transcript order preserved).
 - **Retry / backoff** — retry transient model-call failures with exponential backoff.
 - **Streaming** — stream incremental text, tool calls, and tool results as the turn runs.
+- **Durable-execution seam (ADR-030)** — an `AgentExecutor` that decides *where* a turn runs, over an `AgentActivities` + `driveTurn` split that separates the side-effecting model/tool calls from the deterministic loop sequencing them. The default in-process executor is a verbatim delegation to that engine's own `run`, so the seam changes nothing until something plugs into it. Only the **Rust** engine ships an actual durable backend today (the separate, feature-gated `smooth-operator-temporal` crate, which runs the turn as a Temporal workflow with the model and tool calls as activities, giving crash-safe resume, durable human-in-the-loop via signals, and durable timers). The other four ship the seam and a `TODO(ADR-030)` naming the separate opt-in package their backend belongs in — no engine pulls a Temporal SDK into your dependency tree.
 
 ## Per-language install + hello agent
 
