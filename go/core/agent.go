@@ -17,12 +17,26 @@ type ToolCall struct {
 	Arguments string // raw JSON
 }
 
+// ImageContent is an image attachment on a user message (multimodal turns).
+// URL is a `data:` URL (`data:image/png;base64,...`) or a remote `https` URL;
+// the client emits it as an OpenAI `image_url` content part. Detail
+// ("low"/"high"/"auto") is an optional OpenAI vision hint, omitted when empty.
+// The Go sibling of Rust's `conversation::ImageContent`. Pearl th-25ce5c.
+type ImageContent struct {
+	URL    string
+	Detail string
+}
+
 // ChatMessage is one message in the OpenAI-shaped conversation.
 type ChatMessage struct {
 	Role       string
 	Content    string
 	ToolCalls  []ToolCall
 	ToolCallID string // set on role=="tool" messages
+	// Images are attachments on a USER message (multimodal turns), emitted as
+	// OpenAI `image_url` content parts. Empty for the text-only common case,
+	// which keeps the wire byte-identical to before this field existed.
+	Images []ImageContent
 }
 
 // ToolSpec is a tool advertised to the model.
@@ -208,6 +222,13 @@ type AgentOptions struct {
 	// tool set, and its hook lanes run at the same points Rust runs them.
 	// nil (the default) leaves the loop exactly as it was before extensions.
 	Extensions ExtensionHooks
+
+	// NextUserImages attaches image(s) to the CURRENT turn's user message. A
+	// host sets it when a chat turn carried image attachments; the agent emits
+	// them as OpenAI `image_url` content parts on that one turn. Empty (the
+	// default) leaves every text-only turn byte-identical. Mirrors Rust's
+	// `AgentConfig::with_user_images`. Pearl th-25ce5c.
+	NextUserImages []ImageContent
 
 	Instructions  string
 	Model         string
@@ -420,6 +441,14 @@ func buildPermissionGate(o AgentOptions) *PermissionGate {
 	}
 }
 
+// userTurnMessage builds this turn's user message, attaching any images the
+// host set for it. A helper because BOTH run and RunStream push this message
+// twice (the live `messages` slice and `turnMessages`) — all four sites have to
+// agree, or a multimodal turn reaches the model without its images.
+func (a *SmoothAgent) userTurnMessage(message string) ChatMessage {
+	return ChatMessage{Role: "user", Content: message, Images: a.options.NextUserImages}
+}
+
 func (a *SmoothAgent) buildSystem(message string) string {
 	system := a.options.Instructions
 
@@ -522,12 +551,12 @@ func (a *SmoothAgent) run(ctx context.Context, message string, history []ChatMes
 		prior = thread.Messages()
 	}
 	messages = append(messages, prior...)
-	messages = append(messages, ChatMessage{Role: "user", Content: message})
+	messages = append(messages, a.userTurnMessage(message))
 
 	// Track this turn's new messages (user + assistant + tool, never system) so they
 	// can be appended back to the thread on exit. Slicing the live messages by index
 	// would be unsafe — compaction may drop/reorder it mid-turn.
-	turnMessages := []ChatMessage{{Role: "user", Content: message}}
+	turnMessages := []ChatMessage{a.userTurnMessage(message)}
 
 	// Persist the conversation (sans system prompt, rebuilt each turn) on any exit,
 	// and append this turn's messages to the thread.
@@ -740,9 +769,9 @@ func (a *SmoothAgent) runStream(ctx context.Context, sc StreamingChatClient, mes
 		prior = thread.Messages()
 	}
 	messages = append(messages, prior...)
-	messages = append(messages, ChatMessage{Role: "user", Content: message})
+	messages = append(messages, a.userTurnMessage(message))
 
-	turnMessages := []ChatMessage{{Role: "user", Content: message}}
+	turnMessages := []ChatMessage{a.userTurnMessage(message)}
 	defer func() {
 		if cpStore != nil && cpID != "" {
 			nonSystem := make([]ChatMessage, 0, len(messages))

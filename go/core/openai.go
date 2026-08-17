@@ -98,6 +98,46 @@ type wireMessage struct {
 	ToolCallID string         `json:"tool_call_id,omitempty"`
 }
 
+// wireContentPart is one part of an OpenAI multimodal `content` array. It
+// marshals as `{"type":"text","text":...}` or
+// `{"type":"image_url","image_url":{...}}` — the standard shape every model we
+// route vision to (gemini-flash, gpt-4o, mimo-vl) speaks. Mirrors Rust's
+// `ContentPart`. Pearl th-25ce5c.
+type wireContentPart struct {
+	Type     string        `json:"type"`
+	Text     string        `json:"text,omitempty"`
+	ImageURL *wireImageURL `json:"image_url,omitempty"`
+}
+
+// wireImageURL is the `image_url` object inside an image content part. URL is a
+// `data:`/`https` URL; Detail is the optional OpenAI vision hint.
+type wireImageURL struct {
+	URL    string `json:"url"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// messageContent returns a message's wire `content`: an OpenAI content-parts
+// array when a USER message carries images (text part first — omitted when the
+// text is empty, since images may be sent alone — then one image_url part per
+// image), otherwise the plain string every turn has always sent. Text-only
+// turns are byte-identical to before images existed.
+func messageContent(m ChatMessage) any {
+	if m.Role != "user" || len(m.Images) == 0 {
+		return m.Content
+	}
+	parts := make([]wireContentPart, 0, len(m.Images)+1)
+	if m.Content != "" {
+		parts = append(parts, wireContentPart{Type: "text", Text: m.Content})
+	}
+	for _, img := range m.Images {
+		parts = append(parts, wireContentPart{
+			Type:     "image_url",
+			ImageURL: &wireImageURL{URL: img.URL, Detail: img.Detail},
+		})
+	}
+	return parts
+}
+
 // wireCacheControl is the Anthropic-shaped marker. `{"type":"ephemeral"}` is
 // the default 5-minute TTL — what the agent loop wants, since system + tools +
 // recent history get reused turn after turn within one dispatch.
@@ -253,11 +293,13 @@ func applyCacheControl(messages []wireMessage, tools []wireTool) {
 // last block before the assistant turn already covers the prefix. Content that
 // is already in block form is re-marked on its last block.
 //
-// ponytail: Rust also passes multimodal image parts through untouched here; Go
-// has no multimodal content shape yet, so there's nothing to guard. Add the
-// passthrough when images land, or the wrap would silently drop them.
+// Multimodal content-parts arrays pass through UNTOUCHED: flattening them into
+// a text block would silently drop the images, and prompt caching only applies
+// to text prefixes anyway. Mirrors Rust's `wrap_with_cache_control`.
 func wrapWithCacheControl(existing any) any {
 	switch c := existing.(type) {
+	case []wireContentPart:
+		return c
 	case string:
 		if c == "" {
 			return c
@@ -285,7 +327,7 @@ func wrapWithCacheControl(existing any) any {
 func buildWireRequest(req ChatRequest, stream bool, apiURL ...string) wireRequest {
 	wreq := wireRequest{Model: req.Model, Temperature: req.Temperature, MaxTokens: req.MaxTokens, Stream: stream, Metadata: normalizeMetadata(req.Metadata)}
 	for _, m := range req.Messages {
-		wm := wireMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
+		wm := wireMessage{Role: m.Role, Content: messageContent(m), ToolCallID: m.ToolCallID}
 		for _, tc := range m.ToolCalls {
 			var w wireToolCall
 			w.ID = tc.ID
