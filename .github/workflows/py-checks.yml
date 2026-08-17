@@ -1,16 +1,20 @@
-# PR checks for the Python engine (`smooai-smooth-operator-core`).
+# PR checks for the Python packages published from THIS repo.
 #
-# The Python engine lives in `python/core/` and is published from THIS repo
-# (see publish-pypi.yml). This workflow gates PRs that touch it: it syncs the
-# uv environment, runs ruff (format check + lint), and runs the test suite.
+# `python/core/` is the engine (`smooai-smooth-operator-core`); `python/temporal/`
+# is its optional Temporal-backed durable-execution backend
+# (`smooai-smooth-operator-temporal`). This workflow gates PRs that touch either:
+# it syncs the uv environment, runs ruff (format check + lint), and runs the test
+# suite. The temporal package's e2e tests self-skip when no Temporal dev server
+# can be reached.
 #
-# Scoped to `python/core/**` so Rust/C#/other-language PRs don't pay for it.
+# Scoped to the two Python packages so Rust/C#/other-language PRs don't pay for it.
 name: Python Checks
 
 on:
     pull_request:
         paths:
             - 'python/core/**'
+            - 'python/temporal/**'
             - '.github/workflows/py-checks.yml'
 
 concurrency:
@@ -19,12 +23,16 @@ concurrency:
 
 jobs:
     checks:
-        name: ruff + pytest
+        name: ruff + pytest (${{ matrix.package }})
         runs-on: ubuntu-latest
         timeout-minutes: 15
+        strategy:
+            fail-fast: false
+            matrix:
+                package: [core, temporal]
         defaults:
             run:
-                working-directory: python/core
+                working-directory: python/${{ matrix.package }}
         steps:
             - uses: actions/checkout@v4
 
