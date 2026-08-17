@@ -12,6 +12,8 @@ export { Cast, Clearance, makeRole, RoleKind } from './cast.js';
 export type { OperatorRole } from './cast.js';
 export { InMemoryCheckpointStore } from './checkpoint.js';
 export type { Checkpoint, CheckpointStore } from './checkpoint.js';
+export { extractSection, findProjectContextFile, headingToAnchor, loadProjectContext, parseFileReferences, parseLinkLine } from './context.js';
+export type { FileRef } from './context.js';
 export { CostTracker, DEFAULT_PRICING, GATEWAY_COST_HEADERS, parseGatewayCost } from './cost.js';
 export type { CostBudget, HeaderLike, ModelPricing, Usage } from './cost.js';
 export { approve, approveAlways, deny, HumanDecision, isApproved } from './humanGate.js';

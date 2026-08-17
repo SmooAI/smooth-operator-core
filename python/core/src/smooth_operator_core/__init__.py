@@ -21,6 +21,7 @@ from .agent import (
 )
 from .cast import Cast, Clearance, OperatorRole, RoleKind
 from .checkpoint import Checkpoint, CheckpointStore, InMemoryCheckpointStore
+from .context import FileRef, load_project_context, parse_file_references
 from .cost import GATEWAY_COST_HEADERS, CostBudget, CostTracker, ModelPricing, Usage, parse_gateway_cost
 from .deny_policy import DenyPolicy, DenyPredicate, DenyReason, DenyRules
 from .hooks import ToolCall, ToolHook, ToolResult
@@ -94,6 +95,9 @@ __all__ = [
     "DenyReason",
     "DenyRules",
     "Embedder",
+    "FileRef",
+    "load_project_context",
+    "parse_file_references",
     "FunctionTool",
     "delegate_tool",
     "effective_max_tokens",
