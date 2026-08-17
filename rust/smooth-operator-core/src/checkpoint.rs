@@ -156,7 +156,7 @@ impl CheckpointStore for MemoryCheckpointStore {
     fn list(&self, agent_id: &str) -> anyhow::Result<Vec<Checkpoint>> {
         let store = self.checkpoints.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let mut result: Vec<Checkpoint> = store.iter().filter(|c| c.agent_id == agent_id).cloned().collect();
-        result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        result.sort_by_key(|c| std::cmp::Reverse(c.created_at));
         Ok(result)
     }
 
@@ -263,7 +263,7 @@ impl CheckpointStore for FileCheckpointStore {
             }
         }
         // Newest first
-        checkpoints.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        checkpoints.sort_by_key(|c| std::cmp::Reverse(c.created_at));
         Ok(checkpoints)
     }
 
