@@ -269,9 +269,13 @@ func (g *GatewayClient) ChatStream(ctx context.Context, req ChatRequest) (<-chan
 		return nil, fmt.Errorf("gateway %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 
-	// Must be read BEFORE the body is consumed — once the SSE stream is being
-	// scanned the headers are gone. This is the bug the Rust fix (core#102) was
-	// about: the streaming path went straight to the body and dropped them.
+	// Capture the cost off the response BEFORE handing the body to the scanner.
+	// Not because consuming the body destroys the headers — Go's resp.Header is a
+	// plain map and stays readable afterward. The real hazard core#102 fixed is
+	// narrower: a streaming API hands you only a stream unless you deliberately
+	// keep hold of the response, so the mistake is never capturing it at all
+	// (Rust's bytes_stream() literally consumes the Response, which is why the
+	// reference orders it this way). Capturing up front makes that impossible.
 	streamCost := parseGatewayCost(resp.Header)
 
 	ch := make(chan ChatChunk)
