@@ -109,6 +109,10 @@ class GatewayLlmProvider:
             client = AsyncOpenAI(base_url=base_url, api_key=api_key, **extra)
         self._client = client
         self.chat = _Chat(client)
+        # Surfaced so the agent can gate Anthropic prompt-cache markers on the route it
+        # is actually talking to (see cache_control.py). Read off the SDK so a
+        # caller-supplied client reports its real base URL, not a re-declared one.
+        self.api_base_url = str(client.base_url)
 
 
 class _Chat:

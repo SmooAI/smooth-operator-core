@@ -18,6 +18,7 @@ import type { SmoothAgentThread } from './thread.js';
 import type { Memory } from './memory.js';
 import type { Reranker } from './rerank.js';
 import { compact } from './compaction.js';
+import { applyCacheControl, supportsAnthropicCacheControl } from './cacheControl.js';
 import { CostTracker, parseGatewayCost } from './cost.js';
 import type { CostBudget, HeaderLike, ModelPricing, Usage } from './cost.js';
 import type { HumanGate } from './humanGate.js';
@@ -342,6 +343,13 @@ export interface ChatClientLike {
             createStream?(body: Record<string, unknown>): AsyncIterable<ChatChunk>;
         };
     };
+    /**
+     * The OpenAI-compatible base URL this client talks to, when it knows it.
+     * Only used to gate Anthropic prompt-cache markers (see `cacheControl.ts`) —
+     * a client that doesn't set it, such as {@link MockLlmProvider}, simply never
+     * gets them, leaving its request bodies byte-identical.
+     */
+    apiBaseUrl?: string;
 }
 
 /**
@@ -778,7 +786,7 @@ export class SmoothAgent {
                 // accumulating the full assistant message (content + tool calls + usage).
                 const assembled: AssembledMessage = { content: '', toolCalls: [], usage: null };
                 const partials = new Map<number, { id: string; name: string; arguments: string }>();
-                const stream = createStream({
+                const streamBody: Record<string, unknown> = {
                     model,
                     messages,
                     ...(tools ? { tools } : {}),
@@ -786,7 +794,9 @@ export class SmoothAgent {
                     max_tokens: effectiveMaxTokens(this.options.maxTokens ?? DEFAULTS.maxTokens, this.options.modelMaxOutput),
                     ...metadataField(this.options.metadata),
                     stream: true,
-                });
+                };
+                this.markPromptCache(streamBody);
+                const stream = createStream(streamBody);
                 // Cost lives in a response HEADER. A client that returns a bare stream
                 // has no response object to read one off at all, so it captures the
                 // response and rides the cost on a chunk. Mirrors python/agent.py's
@@ -905,6 +915,7 @@ export class SmoothAgent {
         const maxRetries = this.options.maxRetries ?? DEFAULTS.maxRetries;
         const backoffMs = this.options.retryBackoffMs ?? DEFAULTS.retryBackoffMs;
         let attempt = 0;
+        this.markPromptCache(body);
         for (;;) {
             try {
                 return await this.client.chat.completions.create(body);
@@ -913,6 +924,17 @@ export class SmoothAgent {
                 attempt++;
                 await sleep(backoffMs * 2 ** (attempt - 1));
             }
+        }
+    }
+
+    /**
+     * Stamp Anthropic prompt-cache markers on an outbound body, when the upstream
+     * understands them. A no-op for every other route, so the request stays
+     * byte-identical on the OpenAI/Gemini/Groq paths and under the mock client.
+     */
+    private markPromptCache(body: Record<string, unknown>): void {
+        if (supportsAnthropicCacheControl(body.model as string | undefined, this.client.apiBaseUrl)) {
+            applyCacheControl(body);
         }
     }
 

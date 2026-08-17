@@ -19,6 +19,7 @@ from .agent import (
     delegate_tool,
     effective_max_tokens,
 )
+from .cache_control import apply_cache_control, supports_anthropic_cache_control
 from .cast import Cast, Clearance, OperatorRole, RoleKind
 from .checkpoint import Checkpoint, CheckpointStore, InMemoryCheckpointStore
 from .context import FileRef, load_project_context, parse_file_references
@@ -159,6 +160,8 @@ __all__ = [
     "parse_gateway_cost",
     "PROMPT_CACHE_BOUNDARY",
     "PromptCache",
+    "apply_cache_control",
+    "supports_anthropic_cache_control",
     "NoopReranker",
     "json_schema_format",
     "response_format_field",

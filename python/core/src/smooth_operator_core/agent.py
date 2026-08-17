@@ -18,6 +18,7 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Protocol, Union
 
+from .cache_control import apply_cache_control, supports_anthropic_cache_control
 from .cast import Clearance
 from .checkpoint import Checkpoint, CheckpointStore
 from .compaction import compact
@@ -754,6 +755,17 @@ class SmoothAgent:
             if thread is not None:
                 thread.extend(turn_messages)
 
+    def _mark_prompt_cache(self, messages: list[dict[str, Any]], tool_specs: list[dict[str, Any]] | None) -> None:
+        """Stamp Anthropic prompt-cache markers, when the upstream understands them.
+
+        A no-op for every other route, so the request stays wire-identical on the
+        OpenAI/Gemini/Groq paths and under the mock provider (which reports no base
+        url). ``api_base_url`` is the seam :class:`~.gateway_client.GatewayLlmProvider`
+        populates from the SDK.
+        """
+        if supports_anthropic_cache_control(self._options.model, getattr(self._client, "api_base_url", None)):
+            apply_cache_control(messages, tool_specs)
+
     async def _call_model_stream(
         self, messages: list[dict[str, Any]], tool_specs: list[dict[str, Any]] | None
     ) -> AsyncIterator[Any]:
@@ -765,6 +777,7 @@ class SmoothAgent:
         without a live model. Retry is deliberately not applied here — see
         :meth:`run_stream`.
         """
+        self._mark_prompt_cache(messages, tool_specs)
         return await self._client.chat.completions.create(
             model=self._options.model,
             messages=messages,
@@ -786,6 +799,7 @@ class SmoothAgent:
         before retries existed. Only this model call is retried — tool execution is not.
         """
         attempt = 0
+        self._mark_prompt_cache(messages, tool_specs)
         while True:
             try:
                 return await self._client.chat.completions.create(
