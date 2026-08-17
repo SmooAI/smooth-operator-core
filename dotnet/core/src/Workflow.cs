@@ -12,6 +12,33 @@ public sealed class WorkflowException : Exception
 }
 
 /// <summary>
+/// Composition helpers for <see cref="Workflow{TState}"/>. Mirrors the sibling engines'
+/// <c>sub_workflow_node</c> / <c>SubWorkflowNode</c> / <c>subWorkflowNode</c>.
+/// </summary>
+public static class Workflow
+{
+    /// <summary>
+    /// Wrap a child <see cref="Workflow{TState}"/> as a single node of a parent workflow.
+    ///
+    /// The child runs <b>to completion</b> — every node, its conditional edges and the end
+    /// sentinel included — inside one parent step. That is the contrast with a conversational
+    /// driver that advances the top-level graph one node per user turn: a sub-workflow node
+    /// executes its whole sub-graph within that one turn, and the top level stays turn-gated.
+    ///
+    /// <paramref name="mapIn"/> projects parent state into the child's state type;
+    /// <paramref name="mapOut"/> folds the child's final state back into the parent's. An
+    /// exception from any child node propagates out of the parent's run. Sub-workflows nest —
+    /// a child may itself hold a sub-workflow node.
+    /// </summary>
+    public static Func<TParent, CancellationToken, Task<TParent>> SubWorkflowNode<TParent, TChild>(
+        Workflow<TChild> child,
+        Func<TParent, TChild> mapIn,
+        Func<TParent, TChild, TParent> mapOut) =>
+        async (state, cancellationToken) =>
+            mapOut(state, await child.RunAsync(mapIn(state), cancellationToken).ConfigureAwait(false));
+}
+
+/// <summary>
 /// A LangGraph-inspired typed workflow graph with conditional edges. A <see cref="Workflow{TState}"/>
 /// is a state machine: <b>nodes</b> transform a typed state value and <b>edges</b> — static or
 /// conditional — determine the next node. The runner starts at the entry node, applies each node

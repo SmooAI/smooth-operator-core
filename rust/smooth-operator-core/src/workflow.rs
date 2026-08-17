@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tracing::warn;
@@ -64,6 +65,41 @@ impl<S: State> Node<S> for FnNode<S> {
     async fn execute(&self, state: S) -> anyhow::Result<S> {
         (self.func)(state).await
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sub-workflow node
+// ---------------------------------------------------------------------------
+
+/// Wrap a child [`Workflow`] as a single node of a parent workflow.
+///
+/// The child runs **to completion** — every node, its conditional edges and the
+/// `__end__` sentinel included — inside one parent step. That is the contrast
+/// with a conversational driver that advances the top-level graph one node per
+/// user turn: a sub-workflow node executes its whole sub-graph within that one
+/// turn, and the top level stays turn-gated.
+///
+/// `map_in` projects parent state into the child's state type; `map_out` folds
+/// the child's final state back into the parent's. An error from any child node
+/// propagates out of the parent's [`Workflow::run`]. Sub-workflows nest — a
+/// child may itself hold a sub-workflow node.
+pub fn sub_workflow_node<P: State, C: State>(
+    name: &str,
+    child: Workflow<C>,
+    map_in: impl Fn(&P) -> C + Send + Sync + 'static,
+    map_out: impl Fn(P, C) -> P + Send + Sync + 'static,
+) -> FnNode<P> {
+    let child = Arc::new(child);
+    let map_out = Arc::new(map_out);
+    FnNode::new(name, move |state: P| {
+        let child = Arc::clone(&child);
+        let map_out = Arc::clone(&map_out);
+        let child_state = map_in(&state);
+        Box::pin(async move {
+            let final_child = child.run(child_state).await?;
+            Ok(map_out(state, final_child))
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -387,5 +423,132 @@ mod tests {
 
         let result = wf.run("world".to_string()).await.unwrap();
         assert_eq!(result, "hello_world");
+    }
+
+    /// Helper: child graph of two tracking nodes joined by a conditional edge
+    /// that skips a third node. Proves the whole sub-graph — routing included —
+    /// runs inside the parent's single step.
+    fn two_node_child() -> Workflow<Vec<String>> {
+        WorkflowBuilder::new()
+            .add_node(tracking_node("child_a"))
+            .add_node(tracking_node("child_b"))
+            .add_node(tracking_node("child_never"))
+            .add_conditional_edge("child_a", |state: &Vec<String>| {
+                if state.contains(&"child_a".to_string()) {
+                    "child_b".to_string()
+                } else {
+                    "child_never".to_string()
+                }
+            })
+            .set_entry("child_a")
+            .set_end("child_b")
+            .build()
+            .unwrap()
+    }
+
+    // 9. A sub-workflow runs fully — 2 nodes + a conditional edge — in ONE parent step
+    #[tokio::test]
+    async fn test_sub_workflow_runs_to_completion_in_one_step() {
+        let wf = WorkflowBuilder::new()
+            .add_node(tracking_node("parent_a"))
+            .add_node(sub_workflow_node("sub", two_node_child(), Vec::clone, |_parent, child| child))
+            .add_node(tracking_node("parent_b"))
+            .add_edge("parent_a", "sub")
+            .add_edge("sub", "parent_b")
+            .set_entry("parent_a")
+            .set_end("parent_b")
+            .build()
+            .unwrap();
+
+        let result = wf.run(vec![]).await.unwrap();
+        assert_eq!(result, vec!["parent_a", "child_a", "child_b", "parent_b"]);
+    }
+
+    // 10. Parent and child states are different types — map in, map out
+    #[tokio::test]
+    async fn test_sub_workflow_state_maps_in_and_out() {
+        let child = WorkflowBuilder::new()
+            .add_node(FnNode::new("add_ten", |n: i64| Box::pin(async move { Ok(n + 10) })))
+            .add_node(FnNode::new("double", |n: i64| Box::pin(async move { Ok(n * 2) })))
+            .add_edge("add_ten", "double")
+            .set_entry("add_ten")
+            .set_end("double")
+            .build()
+            .unwrap();
+
+        // Parent state is (label, total); the child only ever sees the i64.
+        let wf = WorkflowBuilder::new()
+            .add_node(sub_workflow_node(
+                "math",
+                child,
+                |(_, total): &(String, i64)| *total,
+                |(label, _): (String, i64), total: i64| (format!("{label}:done"), total),
+            ))
+            .set_entry("math")
+            .set_end("math")
+            .build()
+            .unwrap();
+
+        let result = wf.run(("start".to_string(), 5)).await.unwrap();
+        assert_eq!(result, ("start:done".to_string(), 30));
+    }
+
+    // 11. A failing child node aborts the parent run
+    #[tokio::test]
+    async fn test_sub_workflow_error_propagates_to_parent() {
+        let child = WorkflowBuilder::new()
+            .add_node(FnNode::new("boom", |_state: Vec<String>| Box::pin(async { anyhow::bail!("child exploded") })))
+            .set_entry("boom")
+            .set_end("boom")
+            .build()
+            .unwrap();
+
+        let wf = WorkflowBuilder::new()
+            .add_node(tracking_node("parent_a"))
+            .add_node(sub_workflow_node("sub", child, Vec::clone, |_parent, child| child))
+            .add_node(tracking_node("parent_b"))
+            .add_edge("parent_a", "sub")
+            .add_edge("sub", "parent_b")
+            .set_entry("parent_a")
+            .set_end("parent_b")
+            .build()
+            .unwrap();
+
+        let err = wf.run(vec![]).await.unwrap_err();
+        assert!(err.to_string().contains("child exploded"));
+    }
+
+    // 12. Nesting deeper than one level — parent → child → grandchild
+    #[tokio::test]
+    async fn test_sub_workflow_nesting_depth_two() {
+        let grandchild = WorkflowBuilder::new()
+            .add_node(tracking_node("grand_a"))
+            .add_node(tracking_node("grand_b"))
+            .add_edge("grand_a", "grand_b")
+            .set_entry("grand_a")
+            .set_end("grand_b")
+            .build()
+            .unwrap();
+
+        let child = WorkflowBuilder::new()
+            .add_node(tracking_node("child_a"))
+            .add_node(sub_workflow_node("grand", grandchild, Vec::clone, |_parent, child| child))
+            .add_edge("child_a", "grand")
+            .set_entry("child_a")
+            .set_end("grand")
+            .build()
+            .unwrap();
+
+        let wf = WorkflowBuilder::new()
+            .add_node(tracking_node("parent_a"))
+            .add_node(sub_workflow_node("sub", child, Vec::clone, |_parent, child| child))
+            .add_edge("parent_a", "sub")
+            .set_entry("parent_a")
+            .set_end("sub")
+            .build()
+            .unwrap();
+
+        let result = wf.run(vec![]).await.unwrap();
+        assert_eq!(result, vec!["parent_a", "child_a", "grand_a", "grand_b"]);
     }
 }

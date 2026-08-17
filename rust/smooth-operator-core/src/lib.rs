@@ -58,5 +58,5 @@ pub use providers::{Activity, ModelRouting, ModelSlot, ProviderConfig, ProviderR
 pub use rerank::{LexicalReranker, NoopReranker, Reranker};
 pub use tool::{Tool, ToolCall, ToolRegistry, ToolResult, ToolSchema};
 pub use vector::{hash_token, Embedder, HashEmbedder, VectorKnowledge};
-pub use workflow::{EdgeTarget, FnNode, Node, State, Workflow, WorkflowBuilder};
+pub use workflow::{sub_workflow_node, EdgeTarget, FnNode, Node, State, Workflow, WorkflowBuilder};
 pub use ws_resilience::{ConnectionManager, ConnectionState, MessageBuffer, ResiliencyConfig};

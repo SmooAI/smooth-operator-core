@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from smooth_operator_core.workflow import END, Workflow, WorkflowError
+from smooth_operator_core.workflow import END, Workflow, WorkflowError, sub_workflow_node
 
 
 async def test_linear_workflow_runs_in_order() -> None:
@@ -124,3 +124,129 @@ async def test_edge_to_missing_node_raises() -> None:
     wf = Workflow[int]().add_node("a", lambda s: s).add_edge("a", "ghost").set_entry("a")
     with pytest.raises(WorkflowError, match="not found"):
         await wf.run(0)
+
+
+def _append(name: str):
+    def node(state: list[str]) -> list[str]:
+        return [*state, name]
+
+    return node
+
+
+def _two_node_child() -> Workflow[list[str]]:
+    """Two tracking nodes joined by a conditional edge that skips a third."""
+    return (
+        Workflow[list[str]]()
+        .add_node("child_a", _append("child_a"))
+        .add_node("child_b", _append("child_b"))
+        .add_node("child_never", _append("child_never"))
+        .add_conditional_edge("child_a", lambda s: "child_b" if "child_a" in s else "child_never")
+        .set_entry("child_a")
+        .set_end("child_b")
+    )
+
+
+def _identity(state: list[str]) -> list[str]:
+    return state
+
+
+def _take_child(_parent: list[str], child: list[str]) -> list[str]:
+    return child
+
+
+async def test_sub_workflow_runs_to_completion_in_one_step() -> None:
+    """A sub-workflow's 2 nodes + conditional edge all run inside one parent step."""
+    wf = (
+        Workflow[list[str]]()
+        .add_node("parent_a", _append("parent_a"))
+        .add_node("sub", sub_workflow_node(_two_node_child(), _identity, _take_child))
+        .add_node("parent_b", _append("parent_b"))
+        .add_edge("parent_a", "sub")
+        .add_edge("sub", "parent_b")
+        .set_entry("parent_a")
+        .set_end("parent_b")
+    )
+
+    assert await wf.run([]) == ["parent_a", "child_a", "child_b", "parent_b"]
+
+
+async def test_sub_workflow_state_maps_in_and_out() -> None:
+    """Parent and child hold different state types — map in, map out."""
+    child = (
+        Workflow[int]()
+        .add_node("add_ten", lambda n: n + 10)
+        .add_node("double", lambda n: n * 2)
+        .add_edge("add_ten", "double")
+        .set_entry("add_ten")
+        .set_end("double")
+    )
+
+    # Parent state is a labelled total; the child only ever sees the int.
+    wf = (
+        Workflow[tuple[str, int]]()
+        .add_node(
+            "math",
+            sub_workflow_node(
+                child,
+                lambda p: p[1],
+                lambda p, total: (f"{p[0]}:done", total),
+            ),
+        )
+        .set_entry("math")
+        .set_end("math")
+    )
+
+    assert await wf.run(("start", 5)) == ("start:done", 30)
+
+
+async def test_sub_workflow_error_propagates_to_parent() -> None:
+    """A failing child node aborts the parent run."""
+
+    def boom(_state: list[str]) -> list[str]:
+        raise RuntimeError("child exploded")
+
+    child = Workflow[list[str]]().add_node("boom", boom).set_entry("boom").set_end("boom")
+
+    wf = (
+        Workflow[list[str]]()
+        .add_node("parent_a", _append("parent_a"))
+        .add_node("sub", sub_workflow_node(child, _identity, _take_child))
+        .add_edge("parent_a", "sub")
+        .set_entry("parent_a")
+        .set_end("sub")
+    )
+
+    with pytest.raises(RuntimeError, match="child exploded"):
+        await wf.run([])
+
+
+async def test_sub_workflow_nesting_depth_two() -> None:
+    """Nesting deeper than one level — parent → child → grandchild."""
+    grandchild = (
+        Workflow[list[str]]()
+        .add_node("grand_a", _append("grand_a"))
+        .add_node("grand_b", _append("grand_b"))
+        .add_edge("grand_a", "grand_b")
+        .set_entry("grand_a")
+        .set_end("grand_b")
+    )
+
+    child = (
+        Workflow[list[str]]()
+        .add_node("child_a", _append("child_a"))
+        .add_node("grand", sub_workflow_node(grandchild, _identity, _take_child))
+        .add_edge("child_a", "grand")
+        .set_entry("child_a")
+        .set_end("grand")
+    )
+
+    wf = (
+        Workflow[list[str]]()
+        .add_node("parent_a", _append("parent_a"))
+        .add_node("sub", sub_workflow_node(child, _identity, _take_child))
+        .add_edge("parent_a", "sub")
+        .set_entry("parent_a")
+        .set_end("sub")
+    )
+
+    assert await wf.run([]) == ["parent_a", "child_a", "grand_a", "grand_b"]

@@ -52,5 +52,5 @@ export { SmoothAgentThread } from './thread.js';
 export { MAX_MATCHES, TOOL_SEARCH_NAME, ToolSearch } from './toolSearch.js';
 export { HashEmbedder, hashToken, VectorKnowledge } from './vector.js';
 export type { Embedder } from './vector.js';
-export { END, Workflow, WorkflowError } from './workflow.js';
+export { END, subWorkflowNode, Workflow, WorkflowError } from './workflow.js';
 export type { NodeFn, Router } from './workflow.js';
