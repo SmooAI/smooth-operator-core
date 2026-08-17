@@ -43,6 +43,7 @@ export type { Knowledge, KnowledgeHit } from './knowledge.js';
 export { MockLlmProvider, SCRIPTED_USAGE, textResponse, toolCallResponse } from './llmProvider.js';
 export type { LlmProvider, RecordedCall, ScriptedMessage, ScriptedUsage } from './llmProvider.js';
 export { InMemoryMemory } from './memory.js';
+export { PROMPT_CACHE_BOUNDARY, PromptCache } from './promptCache.js';
 export type { Memory, MemoryEntry } from './memory.js';
 export { hasInjection, hasSecrets, NarcHook, redactMatch, scanInjection, scanSecrets, Severity, severityLabel } from './narc.js';
 export type { NarcAlert, NarcFinding } from './narc.js';

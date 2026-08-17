@@ -17,12 +17,13 @@ The Rust crate is the reference implementation. The other four engines mirror it
 
 ## Feature surface (the shared core, in all five engines)
 
-Every engine supports the same core capabilities below. Beyond this shared core, the Rust reference carries surfaces still being ported (multimodal images, structured output, prompt caching, provider routing, and the extension sandbox/integrity hardening) — if a capability matters to you in a non-Rust engine, check that language's package docs before assuming it. A real gateway LLM client is no longer one of them: all five now ship one, though the Rust client's provider quirks/routing remain ahead.
+Every engine supports the same core capabilities below. Beyond this shared core, the Rust reference carries surfaces still being ported (multimodal images, structured output, provider routing, and the extension sandbox/integrity hardening) — if a capability matters to you in a non-Rust engine, check that language's package docs before assuming it. A real gateway LLM client is no longer one of them: all five now ship one, though the Rust client's provider quirks/routing remain ahead. **Anthropic `cache_control` request markers** are Rust + Go today; the other three engines only just gained a request builder of their own, so they are next in line rather than blocked.
 
 - **Agentic tool-calling loop** — observe → think → act, looping until the model answers.
 - **In-memory + vector knowledge (RAG)** — ground the turn in retrieved documents.
 - **Memory** — long-term entries recalled into context each turn.
 - **Compaction** — sliding-window context-token budget keeps the prompt under a ceiling.
+- **Prompt cache split** — `PromptCache` splits a system prompt at `__PROMPT_CACHE_BOUNDARY__` into a static half (role instructions, tool schemas) that is hashed once for cache-key dedup and a dynamic half (project context) you can swap without busting the static prefix. Feed `fullPrompt()` in as the agent's instructions. The matching wire half — Anthropic `cache_control` markers on the request — is Rust + Go today (see below).
 - **Project context loader** — stack the user's `~/.smooth/CONTEXT.md` above the nearest project `.smooth/CONTEXT.md` / `SMOOTH.md` / `AGENTS.md` / `CLAUDE.md` (walking up from the working directory), resolving any `## File References` inline. A standalone loader in every engine: the host decides whether to inject the result into the system prompt.
 - **Cost / budget** — per-model pricing, token + USD accounting, early stop on budget.
 - **Checkpointing** — persist/resume a conversation via a checkpoint store.
