@@ -21,6 +21,8 @@ from collections.abc import Awaitable
 from typing import Callable, Generic, TypeVar, Union
 
 S = TypeVar("S")
+P = TypeVar("P")  # parent state, for sub-workflow composition
+C = TypeVar("C")  # child (sub-workflow) state
 
 # Sentinel a conditional router can return to signal termination.
 END: str = "__end__"
@@ -120,3 +122,28 @@ class Workflow(Generic[S]):
                 current = edge
 
         raise WorkflowError(f"workflow exceeded max_steps ({self._max_steps}) — possible infinite loop")
+
+
+def sub_workflow_node(
+    child: Workflow[C],
+    map_in: Callable[[P], C],
+    map_out: Callable[[P, C], P],
+) -> Callable[[P], Awaitable[P]]:
+    """Wrap a child :class:`Workflow` as a single node of a parent workflow.
+
+    The child runs **to completion** — every node, its conditional edges and the
+    ``END`` sentinel included — inside one parent step. That is the contrast with
+    a conversational driver that advances the top-level graph one node per user
+    turn: a sub-workflow node executes its whole sub-graph within that one turn,
+    and the top level stays turn-gated.
+
+    ``map_in`` projects parent state into the child's state type; ``map_out``
+    folds the child's final state back into the parent's. An error from any child
+    node propagates out of the parent's :meth:`Workflow.run`. Sub-workflows nest
+    — a child may itself hold a sub-workflow node.
+    """
+
+    async def node(state: P) -> P:
+        return map_out(state, await child.run(map_in(state)))
+
+    return node

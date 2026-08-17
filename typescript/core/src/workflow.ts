@@ -125,3 +125,21 @@ export class Workflow<S> {
         throw new WorkflowError(`workflow exceeded maxSteps (${this.maxSteps}) — possible infinite loop`);
     }
 }
+
+/**
+ * Wrap a child {@link Workflow} as a single node of a parent workflow.
+ *
+ * The child runs **to completion** — every node, its conditional edges and the
+ * `END` sentinel included — inside one parent step. That is the contrast with a
+ * conversational driver that advances the top-level graph one node per user
+ * turn: a sub-workflow node executes its whole sub-graph within that one turn,
+ * and the top level stays turn-gated.
+ *
+ * `mapIn` projects parent state into the child's state type; `mapOut` folds the
+ * child's final state back into the parent's. An error from any child node
+ * propagates out of the parent's `run`. Sub-workflows nest — a child may itself
+ * hold a sub-workflow node.
+ */
+export function subWorkflowNode<P, C>(child: Workflow<C>, mapIn: (state: P) => C, mapOut: (parent: P, child: C) => P): NodeFn<P> {
+    return async (state) => mapOut(state, await child.run(mapIn(state)));
+}

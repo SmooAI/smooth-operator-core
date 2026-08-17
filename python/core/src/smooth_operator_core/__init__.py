@@ -73,7 +73,7 @@ from .rerank import LexicalReranker, NoopReranker, Reranker
 from .thread import SmoothAgentThread
 from .tool_search import ToolSearch
 from .vector import Embedder, HashEmbedder, VectorKnowledge
-from .workflow import END, Workflow, WorkflowError
+from .workflow import END, Workflow, WorkflowError, sub_workflow_node
 
 __all__ = [
     "AgentOptions",
@@ -158,6 +158,7 @@ __all__ = [
     "VectorKnowledge",
     "Workflow",
     "WorkflowError",
+    "sub_workflow_node",
     "END",
     "scripted_usage",
     "text_response",

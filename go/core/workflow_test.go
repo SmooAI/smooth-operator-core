@@ -138,3 +138,130 @@ func TestWorkflowNodeErrorPropagates(t *testing.T) {
 		t.Fatalf("expected wrapped sentinel error, got %v", err)
 	}
 }
+
+// twoNodeChild is a child graph of two tracking nodes joined by a conditional
+// edge that skips a third — proving the whole sub-graph, routing included, runs
+// inside the parent's single step.
+func twoNodeChild() *Workflow[[]string] {
+	return NewWorkflow[[]string](0).
+		AddNode("child_a", appendNode("child_a")).
+		AddNode("child_b", appendNode("child_b")).
+		AddNode("child_never", appendNode("child_never")).
+		AddConditionalEdge("child_a", func(state []string) string {
+			for _, s := range state {
+				if s == "child_a" {
+					return "child_b"
+				}
+			}
+			return "child_never"
+		}).
+		SetEntry("child_a").
+		SetEnd("child_b")
+}
+
+func identity(state []string) []string { return state }
+
+func takeChild(_ []string, child []string) []string { return child }
+
+func TestSubWorkflowRunsToCompletionInOneStep(t *testing.T) {
+	wf := NewWorkflow[[]string](0).
+		AddNode("parent_a", appendNode("parent_a")).
+		AddNode("sub", SubWorkflowNode(twoNodeChild(), identity, takeChild)).
+		AddNode("parent_b", appendNode("parent_b")).
+		AddEdge("parent_a", "sub").
+		AddEdge("sub", "parent_b").
+		SetEntry("parent_a").
+		SetEnd("parent_b")
+
+	out, err := wf.Run(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := strings.Join(out, ","); got != "parent_a,child_a,child_b,parent_b" {
+		t.Fatalf("expected the sub-workflow to run fully in one step, got %q", got)
+	}
+}
+
+func TestSubWorkflowStateMapsInAndOut(t *testing.T) {
+	// Parent state is a labelled total; the child only ever sees the int.
+	type parent struct {
+		Label string
+		Total int
+	}
+
+	child := NewWorkflow[int](0).
+		AddNode("add_ten", func(_ context.Context, n int) (int, error) { return n + 10, nil }).
+		AddNode("double", func(_ context.Context, n int) (int, error) { return n * 2, nil }).
+		AddEdge("add_ten", "double").
+		SetEntry("add_ten").
+		SetEnd("double")
+
+	wf := NewWorkflow[parent](0).
+		AddNode("math", SubWorkflowNode(child,
+			func(p parent) int { return p.Total },
+			func(p parent, total int) parent { return parent{Label: p.Label + ":done", Total: total} },
+		)).
+		SetEntry("math").
+		SetEnd("math")
+
+	out, err := wf.Run(context.Background(), parent{Label: "start", Total: 5})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Label != "start:done" || out.Total != 30 {
+		t.Fatalf("expected {start:done 30}, got %+v", out)
+	}
+}
+
+func TestSubWorkflowErrorPropagatesToParent(t *testing.T) {
+	sentinel := errors.New("child exploded")
+	child := NewWorkflow[[]string](0).
+		AddNode("boom", func(_ context.Context, _ []string) ([]string, error) { return nil, sentinel }).
+		SetEntry("boom").
+		SetEnd("boom")
+
+	wf := NewWorkflow[[]string](0).
+		AddNode("parent_a", appendNode("parent_a")).
+		AddNode("sub", SubWorkflowNode(child, identity, takeChild)).
+		AddNode("parent_b", appendNode("parent_b")).
+		AddEdge("parent_a", "sub").
+		AddEdge("sub", "parent_b").
+		SetEntry("parent_a").
+		SetEnd("parent_b")
+
+	_, err := wf.Run(context.Background(), nil)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected the child error to propagate, got %v", err)
+	}
+}
+
+func TestSubWorkflowNestingDepthTwo(t *testing.T) {
+	grandchild := NewWorkflow[[]string](0).
+		AddNode("grand_a", appendNode("grand_a")).
+		AddNode("grand_b", appendNode("grand_b")).
+		AddEdge("grand_a", "grand_b").
+		SetEntry("grand_a").
+		SetEnd("grand_b")
+
+	child := NewWorkflow[[]string](0).
+		AddNode("child_a", appendNode("child_a")).
+		AddNode("grand", SubWorkflowNode(grandchild, identity, takeChild)).
+		AddEdge("child_a", "grand").
+		SetEntry("child_a").
+		SetEnd("grand")
+
+	wf := NewWorkflow[[]string](0).
+		AddNode("parent_a", appendNode("parent_a")).
+		AddNode("sub", SubWorkflowNode(child, identity, takeChild)).
+		AddEdge("parent_a", "sub").
+		SetEntry("parent_a").
+		SetEnd("sub")
+
+	out, err := wf.Run(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := strings.Join(out, ","); got != "parent_a,child_a,grand_a,grand_b" {
+		t.Fatalf("expected two levels of nesting to run fully, got %q", got)
+	}
+}
