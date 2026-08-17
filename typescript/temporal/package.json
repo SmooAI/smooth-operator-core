@@ -1,0 +1,51 @@
+{
+	"name": "@smooai/smooth-operator-temporal",
+	"version": "1.8.10",
+	"description": "Optional Temporal-backed durable execution backend for the smooth-operator agent engine (ADR-030). The TypeScript sibling of the Rust `smooth-operator-temporal` crate — an agent turn runs as a Temporal workflow whose model call and tool invocations are activities, driving the same `driveTurn` loop as the in-process executor.",
+	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/SmooAI/smooth-operator-core.git",
+		"directory": "typescript/temporal"
+	},
+	"homepage": "https://github.com/SmooAI/smooth-operator-core/tree/main/typescript/temporal",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./workflows": {
+			"types": "./dist/workflows.d.ts",
+			"import": "./dist/workflows.js"
+		},
+		"./activities": {
+			"types": "./dist/activities.d.ts",
+			"import": "./dist/activities.js"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"prepack": "pnpm run build",
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"test": "vitest run"
+	},
+	"dependencies": {
+		"@smooai/smooth-operator-core": "workspace:*",
+		"@temporalio/activity": "^1.11.0",
+		"@temporalio/client": "^1.11.0",
+		"@temporalio/worker": "^1.11.0",
+		"@temporalio/workflow": "^1.11.0"
+	},
+	"devDependencies": {
+		"@temporalio/testing": "^1.11.0",
+		"@types/node": "^25.9.2",
+		"typescript": "^5.7.3",
+		"vitest": "^2.1.8"
+	}
+}
