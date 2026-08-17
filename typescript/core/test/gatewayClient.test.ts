@@ -156,8 +156,9 @@ describe('createGatewayClient — streaming', () => {
             if (event.type === 'done') final = event.response;
         }
 
-        // This is the whole point of the streaming path: the headers are unreachable
-        // once the stream has been scanned, so a $0.75 here proves they were read first.
+        // The whole point of the streaming path: a plain `create({stream:true})` returns
+        // only the stream, leaving no response to read a header off at all — so a $0.75
+        // here proves the client kept the response, not that it read it early.
         expect(final?.costUsd).toBe(0.75);
     });
 

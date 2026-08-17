@@ -187,8 +187,9 @@ async def test_reads_the_cost_header_before_the_sse_body() -> None:
     ) as gw:
         _texts, final = await _drain(gw.agent())
 
-    # This is the whole point of the streaming path: the headers are unreachable
-    # once the stream has been scanned, so a $0.75 here proves they were read first.
+    # The whole point of the streaming path: a plain ``create(stream=True)`` returns only
+    # the stream, leaving no response object to read a header off at all — so a $0.75 here
+    # proves the client kept the response, not that it read it early.
     assert final.cost_usd == 0.75
 
 

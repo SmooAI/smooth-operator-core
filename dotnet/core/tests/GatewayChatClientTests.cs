@@ -227,9 +227,10 @@ public class GatewayChatClientTests : IDisposable
         Serve(headers: new() { ["x-litellm-response-cost"] = "0.75" }, deltas: ["hi"], usage: (10, 5));
         using var client = Client();
 
-        // Straight off the client (the agent's streaming loop has no cost tracker of its
-        // own yet): the headers are unreachable once the stream has been scanned, so a
-        // $0.75 surfacing here proves they were read first.
+        // Asserted straight off the client, which is the seam under test here. The whole
+        // point of the streaming path: keeping only the stream would leave no response to
+        // read a header off at all — so a $0.75 surfacing here proves the client kept the
+        // response, not that it read it early.
         var updates = new List<ChatResponseUpdate>();
         await foreach (var update in client.GetStreamingResponseAsync([new ChatMessage(ChatRole.User, "hi")]))
         {
