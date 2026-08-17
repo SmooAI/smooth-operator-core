@@ -15,3 +15,19 @@ cd core
 uv sync
 uv run pytest tests/ -q
 ```
+
+## Optional Temporal backend
+
+[`temporal/`](./temporal) is the optional Temporal-backed durable-execution
+backend (ADR-030), published as
+[`smooai-smooth-operator-temporal`](https://pypi.org/project/smooai-smooth-operator-temporal/).
+It runs an agent turn as a Temporal workflow driving the engine's deterministic
+`drive_turn` unchanged (crash-safe resume, durable HITL, durable timers), and is
+the Python sibling of the `smooai-smooth-operator-temporal` Rust crate. The
+Temporal SDK is an optional `temporal` extra; the serde DTO boundary needs no SDK.
+
+```bash
+cd temporal
+uv sync
+uv run pytest tests/ -q   # e2e tests self-skip when no Temporal dev server is reachable
+```
