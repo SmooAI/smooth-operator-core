@@ -25,7 +25,7 @@ Every engine supports the same core capabilities below. Beyond this shared core,
 - **Compaction** — sliding-window context-token budget keeps the prompt under a ceiling.
 - **Cost / budget** — per-model pricing, token + USD accounting, early stop on budget.
 - **Checkpointing** — persist/resume a conversation via a checkpoint store.
-- **Rerank** — rerank retrieved hits before injection (lexical reranker built into the four ports; the Rust reference delegates reranking to its host today).
+- **Rerank** — rerank retrieved hits before injection; a lexical reranker (query-term coverage normalized by document length) is built into all five.
 - **Sub-agents / delegation** — spawn child agents for sub-tasks.
 - **Cast** — roles + clearance (tool-access policy per role).
 - **Human-in-the-loop gate** — require approval before designated tool calls run.

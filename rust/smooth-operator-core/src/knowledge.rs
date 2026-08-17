@@ -4,6 +4,17 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Lowercase `text` and split it into `[a-z0-9]+` runs — the tokenizer the four
+/// ports share, so the vector store and reranker score identically across engines.
+// ponytail: char scan, not a regex — the pattern is one character class.
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Trait for pluggable RAG knowledge base backends.
 pub trait KnowledgeBase: Send + Sync {
     /// Ingest a document into the knowledge base.
@@ -95,7 +106,7 @@ impl InMemoryKnowledge {
     /// Split content into chunks: split on double newlines, then enforce a max
     /// character limit per chunk. Chunks exceeding the limit are split at word
     /// boundaries.
-    fn chunk_content(content: &str) -> Vec<String> {
+    pub(crate) fn chunk_content(content: &str) -> Vec<String> {
         const MAX_CHUNK_CHARS: usize = 500;
 
         let sections: Vec<&str> = content.split("\n\n").collect();

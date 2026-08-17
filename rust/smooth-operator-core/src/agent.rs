@@ -9,6 +9,7 @@ use crate::cost::{CostBudget, CostTracker, ModelPricing};
 use crate::human::{HumanRequest, HumanResponse};
 use crate::knowledge::KnowledgeBase;
 use crate::memory::Memory;
+use crate::rerank::Reranker;
 use futures_util::StreamExt;
 
 use crate::conversation::{CompactionStrategy, Conversation, Message, ReactiveCompaction, Role};
@@ -61,6 +62,9 @@ This task is being scored against a test suite. You MUST NOT produce a final res
 If tests are failing after a run, your ONLY valid next action is to fix the failures and re-run the test command. Do NOT summarize. Do NOT declare done. Do NOT say things like \"the implementation should work\" or \"all tests should pass now\" — re-run the tests and quote the actual output.\n\n\
 The test-runner output (exit code + summary line) is the authoritative completion signal. Your own assessment of correctness is not.\n";
 
+/// How many retrieved knowledge hits are injected into the turn's context.
+pub const KNOWLEDGE_TOP_K: usize = 3;
+
 /// Configuration for an agent.
 #[allow(missing_debug_implementations)]
 pub struct AgentConfig {
@@ -74,6 +78,13 @@ pub struct AgentConfig {
     pub parallel_tools: bool,
     pub memory: Option<Arc<dyn Memory>>,
     pub knowledge: Option<Arc<dyn KnowledgeBase>>,
+    /// Reranker applied to retrieved knowledge hits before injection. `None` =
+    /// passthrough (the retriever's own order wins).
+    pub reranker: Option<Arc<dyn Reranker>>,
+    /// Candidate pool retrieved before reranking. When larger than the injected
+    /// top-K ([`KNOWLEDGE_TOP_K`]) the reranker can promote a hit the retriever
+    /// ranked below the cut. `0` = retrieve exactly top-K.
+    pub knowledge_candidate_k: usize,
     pub budget: Option<CostBudget>,
     pub human_tx: Option<UnboundedSender<HumanRequest>>,
     pub human_rx: Option<Arc<tokio::sync::Mutex<UnboundedReceiver<HumanResponse>>>>,
@@ -173,6 +184,8 @@ impl AgentConfig {
             parallel_tools: false,
             memory: None,
             knowledge: None,
+            reranker: None,
+            knowledge_candidate_k: 0,
             budget: None,
             human_tx: None,
             human_rx: None,
@@ -299,6 +312,15 @@ impl AgentConfig {
 
     pub fn with_knowledge(mut self, knowledge: Arc<dyn KnowledgeBase>) -> Self {
         self.knowledge = Some(knowledge);
+        self
+    }
+
+    /// Rerank retrieved knowledge hits before injection, pulling `candidate_k`
+    /// candidates from the retriever first (`0` = exactly [`KNOWLEDGE_TOP_K`]).
+    #[must_use]
+    pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>, candidate_k: usize) -> Self {
+        self.reranker = Some(reranker);
+        self.knowledge_candidate_k = candidate_k;
         self
     }
 
@@ -1459,8 +1481,13 @@ impl Agent {
         }
 
         if let Some(knowledge) = &self.config.knowledge {
-            match knowledge.query(last_user_message, 3) {
-                Ok(results) if !results.is_empty() => {
+            let candidate_k = self.config.knowledge_candidate_k.max(KNOWLEDGE_TOP_K);
+            match knowledge.query(last_user_message, candidate_k) {
+                Ok(mut results) if !results.is_empty() => {
+                    if let Some(reranker) = &self.config.reranker {
+                        results = reranker.rerank(last_user_message, results);
+                    }
+                    results.truncate(KNOWLEDGE_TOP_K);
                     let mut buf = String::from("[Relevant knowledge]\n");
                     for result in &results {
                         let _ = writeln!(buf, "- (source={}, score={:.2}): {}", result.source, result.score, result.chunk);
@@ -1879,6 +1906,52 @@ mod tests {
 
     fn test_config() -> AgentConfig {
         AgentConfig::new("test-agent", "You are a test agent", LlmConfig::openrouter("fake-key"))
+    }
+
+    #[test]
+    fn agent_accepts_vector_knowledge() {
+        use crate::knowledge::{Document, DocumentType};
+        use crate::vector::VectorKnowledge;
+
+        let kb = VectorKnowledge::default();
+        kb.ingest(Document::new("Gift wrapping costs 4.99 per item.", "wrapping.md", DocumentType::Documentation))
+            .expect("ingest");
+        kb.ingest(Document::new("Returns are accepted within 30 days.", "returns.md", DocumentType::Documentation))
+            .expect("ingest");
+
+        let agent = Agent::new(test_config().with_knowledge(Arc::new(kb)), ToolRegistry::new());
+        let context = agent.build_context_messages("how much is gift wrapping?");
+
+        assert_eq!(context.len(), 1);
+        assert!(
+            context[0].content.contains("wrapping.md"),
+            "vector knowledge should be injected: {}",
+            context[0].content
+        );
+    }
+
+    #[test]
+    fn reranker_reorders_retrieved_knowledge_before_injection() {
+        use crate::knowledge::{Document, DocumentType, InMemoryKnowledge};
+        use crate::rerank::LexicalReranker;
+
+        let kb = InMemoryKnowledge::new();
+        let verbose = format!("return {}policy", "filler ".repeat(60));
+        kb.ingest(Document::new(verbose, "long.md", DocumentType::Documentation)).expect("ingest");
+        kb.ingest(Document::new("return policy", "short.md", DocumentType::Documentation))
+            .expect("ingest");
+
+        // The lexical retriever scores the long doc higher (it repeats the query
+        // terms); the reranker must promote the concise doc past that ordering.
+        let config = test_config().with_knowledge(Arc::new(kb)).with_reranker(Arc::new(LexicalReranker), 4);
+        let agent = Agent::new(config, ToolRegistry::new());
+        let context = agent.build_context_messages("return policy");
+
+        assert_eq!(context.len(), 1);
+        let injected = &context[0].content;
+        let short_at = injected.find("short.md").expect("short.md should be injected");
+        let long_at = injected.find("long.md").expect("long.md should be injected");
+        assert!(short_at < long_at, "reranked short.md should lead: {injected}");
     }
 
     #[tokio::test]
