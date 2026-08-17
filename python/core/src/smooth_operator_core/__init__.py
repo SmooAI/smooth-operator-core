@@ -24,6 +24,14 @@ from .checkpoint import Checkpoint, CheckpointStore, InMemoryCheckpointStore
 from .context import FileRef, load_project_context, parse_file_references
 from .cost import GATEWAY_COST_HEADERS, CostBudget, CostTracker, ModelPricing, Usage, parse_gateway_cost
 from .deny_policy import DenyPolicy, DenyPredicate, DenyReason, DenyRules
+from .executor import (
+    AgentActivities,
+    AgentExecutor,
+    InProcessActivities,
+    InProcessExecutor,
+    TurnPolicy,
+    drive_turn,
+)
 from .gateway_client import GatewayLlmProvider
 from .hooks import ToolCall, ToolHook, ToolResult
 from .human_gate import (
@@ -87,8 +95,14 @@ from .vector import Embedder, HashEmbedder, VectorKnowledge
 from .workflow import END, Workflow, WorkflowError, sub_workflow_node
 
 __all__ = [
+    "AgentActivities",
+    "AgentExecutor",
     "AgentOptions",
     "AgentRunResponse",
+    "InProcessActivities",
+    "InProcessExecutor",
+    "TurnPolicy",
+    "drive_turn",
     "Cast",
     "DoneEvent",
     "StreamEvent",
