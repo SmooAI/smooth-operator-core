@@ -1,5 +1,33 @@
 # @smooai/smooth-operator-core
 
+## 1.9.0
+
+### Minor Changes
+
+- 60c29b9: Add the .NET Temporal-backed durable execution backend (ADR-030), the C# sibling of the Rust
+  `smooth-operator-temporal` crate. The new, optional `SmooAI.SmoothOperator.Temporal` package runs an
+  agent turn as a Temporal workflow (`AgentTurnWorkflow`) whose model call and each tool invocation are
+  Temporal activities, driving the engine's `AgentTurn.DriveTurnAsync` orchestration unchanged — one
+  loop, two backends. It ships crash-safe resume, durable human-in-the-loop via `ApproveTool` /
+  `DenyTool` signals, and a durable-wait timer, plus a `TemporalExecutor : IAgentExecutor` that swaps in
+  behind the executor seam. The `Temporalio` SDK lives only in this separate package, so the published
+  core stays zero-infra.
+
+  This closes the last language gap in the parity docs' one honest exception — the durable-execution
+  backend now ships for Rust **and** .NET, not Rust alone (the `AgentExecutor` seam was already in all
+  five). Also removes `ConfigureAwait(false)` from `AgentTurn.DriveTurnAsync`, which its own contract
+  promised is valid Temporal workflow code: inside the workflow scheduler that call posted the
+  continuation off the single-threaded scheduler and hung the turn; in-process it has no captured
+  context to marshal back to, so dropping it is behavior-neutral there.
+
+### Patch Changes
+
+- 9dbb8fd: Reconcile the parity docs now that the durable-execution backend ships in all five engines.
+
+  The durable-execution **backend** (Temporal) is no longer a Rust-first exception. It now ships in all five languages, each as a separate, optional per-language package that mirrors the Rust `smooth-operator-temporal` crate: the Go `go/temporal` module (#170), TS `@smooai/smooth-operator-temporal` (#168), Python `smooai-smooth-operator-temporal` (#169), and .NET `SmooAI.SmoothOperator.Temporal` (#173). Each runs an agent turn as a Temporal `AgentTurnWorkflow` with the model call and tool invocations as activities, giving crash-safe resume, durable human-in-the-loop via approve/deny signals, and a durable-wait timer, and is verified by a skip-gated e2e against a real ephemeral Temporal server. The Temporal SDK stays isolated in the optional package, so no engine pulls it into your dependency tree.
+
+  The README and `docs/Polyglot-Engines.md` now state the durable backend as in all five, and the only remaining Rust-first engine surface is the extension **sandbox / integrity hardening**. The honest ADR-030 follow-ups are kept and reframed as shared across all five (including Rust), not a Rust-vs-others gap: the durable path yields only a terminal result (no token-delta streaming) and reports `costUsd = 0` on the workflow result, and the executor seeds from agent config only — the workflow→streaming adapter bridge that closes these is still open.
+
 ## 1.8.12
 
 ### Patch Changes
