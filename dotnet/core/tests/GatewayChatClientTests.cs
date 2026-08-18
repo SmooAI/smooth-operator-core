@@ -219,6 +219,27 @@ public class GatewayChatClientTests : IDisposable
 
         Assert.Equal("Hello world", text.ToString());
         Assert.True(FirstRequest["stream"]!.GetValue<bool>());
+
+        // The stream must ASK for usage. The OpenAI streaming API omits it otherwise, so
+        // a stream built without this carries no usage chunk at all — which was never the
+        // gateway losing data, it was the gateway honouring a request that never asked.
+        // Verified against llm.smoo.ai (LiteLLM 1.95.0, groq-gpt-oss-120b): 0 chunks carry
+        // usage without the field, 1 carries real counts with it. Pearl th-5e59a5.
+        Assert.True(FirstRequest["stream_options"]!["include_usage"]!.GetValue<bool>());
+    }
+
+    /// <summary>Meaningless on a non-streaming request, and omitting it keeps that wire
+    /// byte-identical to a client without the field.</summary>
+    [Fact]
+    public async Task OmitsStreamOptionsOnANonStreamingRequest()
+    {
+        Serve(text: "hi", usage: (10, 5));
+        using var client = Client();
+
+        await Agent(client).RunAsync("hi");
+        await _serving!;
+
+        Assert.False(FirstRequest.ContainsKey("stream_options"));
     }
 
     [Fact]

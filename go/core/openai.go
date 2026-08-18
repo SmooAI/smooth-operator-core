@@ -181,6 +181,19 @@ type wireRequest struct {
 	// Structured output. Pointer + omitempty so an unset format leaves the
 	// request byte-identical to before (Rust parity).
 	ResponseFormat *wireResponseFormat `json:"response_format,omitempty"`
+	// The OpenAI streaming API OMITS usage unless it is explicitly requested; the
+	// missing usage chunk was never the gateway losing data, it was the gateway
+	// honouring a request that never asked. Verified against llm.smoo.ai (LiteLLM
+	// 1.95.0): 0 chunks carry usage without this, 1 carries real prompt/completion
+	// counts with it. Only sent when streaming — it is meaningless otherwise, and
+	// omitempty keeps a non-streaming request byte-identical. Pearl th-5e59a5.
+	StreamOptions *wireStreamOptions `json:"stream_options,omitempty"`
+}
+
+// wireStreamOptions carries `stream_options.include_usage`, which makes the gateway
+// emit a final usage-only chunk. See wireRequest.StreamOptions.
+type wireStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 // wireResponseFormat is the OpenAI-compatible `response_format` object:
@@ -326,6 +339,9 @@ func wrapWithCacheControl(existing any) any {
 // to what it was before caching existed.
 func buildWireRequest(req ChatRequest, stream bool, apiURL ...string) wireRequest {
 	wreq := wireRequest{Model: req.Model, Temperature: req.Temperature, MaxTokens: req.MaxTokens, Stream: stream, Metadata: normalizeMetadata(req.Metadata)}
+	if stream {
+		wreq.StreamOptions = &wireStreamOptions{IncludeUsage: true}
+	}
 	for _, m := range req.Messages {
 		wm := wireMessage{Role: m.Role, Content: messageContent(m), ToolCallID: m.ToolCallID}
 		for _, tc := range m.ToolCalls {

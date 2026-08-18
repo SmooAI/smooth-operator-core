@@ -1193,6 +1193,17 @@ impl LlmClient {
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("serialized request is not a JSON object"))?
             .insert("stream".into(), serde_json::Value::Bool(true));
+        // The OpenAI streaming API OMITS usage unless it is explicitly requested.
+        // Without this the stream simply carries no usage chunk — which is not the
+        // gateway losing data, it is the gateway honouring a request that never asked.
+        // Verified against llm.smoo.ai (LiteLLM 1.95.0, groq-gpt-oss-120b): 0 chunks
+        // carry usage without it, 1 carries real `prompt_tokens`/`completion_tokens`
+        // with it. Every char-count estimate downstream exists only because this was
+        // unset. Pearl th-5e59a5.
+        request_body
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("serialized request is not a JSON object"))?
+            .insert("stream_options".into(), serde_json::json!({ "include_usage": true }));
 
         // Retry BEFORE reading any stream bytes — idempotent, since no partial
         // response has been emitted yet. Mirrors the non-streaming `chat()` retry:
@@ -3887,6 +3898,48 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         let msgs = vec![&user];
         let stream = client.chat_stream(&msgs, &[]).await.expect("chat_stream should succeed");
         accumulate_stream_events(stream).await.expect("accumulate should succeed")
+    }
+
+    /// The streaming request must ASK for usage. The OpenAI streaming API omits it
+    /// otherwise, which is why every stream arrived with no usage chunk and core
+    /// fabricated one from character counts. Verified against llm.smoo.ai (LiteLLM
+    /// 1.95.0, groq-gpt-oss-120b): 0 chunks carry usage without
+    /// `stream_options.include_usage`, 1 carries real prompt/completion counts with
+    /// it. Pearl th-5e59a5.
+    #[tokio::test]
+    async fn chat_stream_asks_the_gateway_for_usage() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+
+        let mut config = LlmConfig::openrouter("test-key");
+        config.api_url = format!("http://{addr}");
+        config.model = "test-model".into();
+        let client = LlmClient::new(config);
+        let user = Message::user("hello");
+        let stream = client.chat_stream(&[&user], &[]).await.expect("chat_stream");
+        let _ = accumulate_stream_events(stream).await;
+
+        let request = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("captured request");
+        assert!(
+            request.contains(r#""stream_options":{"include_usage":true}"#),
+            "a streaming request must ask for usage or the gateway sends none; got: {request}"
+        );
     }
 
     /// Pearl th-11f9bb: llm.smoo.ai reports per-request cost ONLY in the

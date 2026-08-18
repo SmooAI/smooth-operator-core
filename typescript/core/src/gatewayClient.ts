@@ -107,7 +107,12 @@ export function gatewayClientFrom(sdk: OpenAI): ChatClientLike {
  */
 async function* streamCompletion(sdk: OpenAI, body: Record<string, unknown>): AsyncIterable<ChatChunk> {
     const { data, response } = await sdk.chat.completions
-        .create({ ...body, stream: true } as unknown as ChatCompletionCreateParamsStreaming)
+        // `stream_options.include_usage` — the OpenAI streaming API OMITS usage unless
+        // it is explicitly requested. The missing usage chunk was never the gateway
+        // losing data, it was the gateway honouring a request that never asked.
+        // Verified against llm.smoo.ai (LiteLLM 1.95.0): 0 chunks carry usage without
+        // it, 1 carries real prompt/completion counts with it. Pearl th-5e59a5.
+        .create({ ...body, stream: true, stream_options: { include_usage: true } } as unknown as ChatCompletionCreateParamsStreaming)
         .withResponse();
     const gatewayCostUsd = parseGatewayCost(response.headers);
     if (gatewayCostUsd !== undefined) {
