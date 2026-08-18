@@ -246,6 +246,24 @@ pub struct LlmResponse {
     /// appends to the conversation, and the chat builder serializes
     /// it back into the wire request.
     pub reasoning_content: Option<String>,
+    /// True when `usage` was ESTIMATED from character counts rather than
+    /// reported by the gateway, because the response carried no usage at all
+    /// (LiteLLM at llm.smoo.ai drops it for `smooth-*` aliases — pearl
+    /// th-eff0d0). The estimate is deliberately kept so budget enforcement
+    /// still has something to work with, but nothing may publish these counts
+    /// as a measurement: on the streaming path `prompt_tokens` is not even
+    /// estimated, it is hardcoded to 0. Pearl th-126fe6.
+    pub usage_estimated: bool,
+    /// The gateway's own id for this response (`chatcmpl-…` on the
+    /// OpenAI-compatible path, `msg_…` on Anthropic-native), copied from the
+    /// response body.
+    ///
+    /// This is the join key to LiteLLM's spend log:
+    /// `LiteLLM_SpendLogs.request_id == this value`. That row carries the
+    /// gateway's authoritative dollars AND its real prompt/completion counts,
+    /// which is the only trustworthy source for either while `usage_estimated`
+    /// can be true. `None` when the body omitted it.
+    pub response_id: Option<String>,
 }
 
 impl LlmResponse {
@@ -556,6 +574,9 @@ struct ChatToolCallFunction {
 /// OpenAI-compatible chat completion response.
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
+    /// `chatcmpl-…`; the join key to `LiteLLM_SpendLogs.request_id`.
+    #[serde(default)]
+    id: Option<String>,
     choices: Vec<ChatChoice>,
     #[serde(default)]
     usage: Option<ChatUsage>,
@@ -643,6 +664,15 @@ pub enum StreamEvent {
     Model {
         name: String,
     },
+    /// The gateway's id for this response (`chatcmpl-…` / `msg_…`), echoed on
+    /// the SSE chunks. Emitted like [`StreamEvent::Model`] — on every chunk
+    /// that carries it, with the accumulator keeping the first non-empty value.
+    /// It is the join key to `LiteLLM_SpendLogs.request_id`, which is where the
+    /// real token counts live when the stream carried no usage. Pearl
+    /// th-126fe6.
+    ResponseId {
+        id: String,
+    },
     Done {
         finish_reason: String,
     },
@@ -662,6 +692,10 @@ struct StreamChunk {
     /// Pearl th-a10c2d.
     #[serde(default)]
     model: Option<String>,
+    /// `chatcmpl-…`, echoed on every chunk like `model`. The accumulator keeps
+    /// the first non-empty value.
+    #[serde(default)]
+    id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1054,11 +1088,13 @@ impl LlmClient {
                 // thumb; this isn't billing-grade but a non-zero
                 // estimate is a real improvement on a hard zero.
                 let content_for_estimate = choice.message.content.clone().unwrap_or_default();
+                let mut usage_estimated = false;
                 if usage.prompt_tokens == 0 && usage.completion_tokens == 0 {
                     let prompt_chars: usize = serde_json::to_string(&request).map(|s| s.len()).unwrap_or(0);
                     usage.prompt_tokens = u32::try_from(prompt_chars / 4).unwrap_or(u32::MAX);
                     usage.completion_tokens = u32::try_from(content_for_estimate.len() / 4).unwrap_or(u32::MAX);
                     usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+                    usage_estimated = true;
                     tracing::debug!(
                         prompt_tokens_est = usage.prompt_tokens,
                         completion_tokens_est = usage.completion_tokens,
@@ -1075,6 +1111,8 @@ impl LlmClient {
                     gateway_cost_usd,
                     resolved_model,
                     reasoning_content: choice.message.reasoning_content.clone(),
+                    usage_estimated,
+                    response_id: chat_resp.id,
                 });
             }
 
@@ -1454,6 +1492,10 @@ impl LlmClient {
                     rate_limit: Some(rate_limit_info),
                     gateway_cost_usd,
                     resolved_model,
+                    // The Anthropic-native path gets real usage from the API,
+                    // so nothing is estimated here.
+                    usage_estimated: false,
+                    response_id: Some(anthropic_resp.id),
                 });
             }
 
@@ -1991,6 +2033,9 @@ fn parse_anthropic_sse_block(
                 if let Some(model) = msg.get("model").and_then(|v| v.as_str()) {
                     out.push(Ok(StreamEvent::Model { name: model.to_string() }));
                 }
+                if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
+                    out.push(Ok(StreamEvent::ResponseId { id: id.to_string() }));
+                }
                 if let Some(u) = msg.get("usage") {
                     if let Some(n) = u.get("input_tokens").and_then(serde_json::Value::as_u64) {
                         *prompt_tokens = u32::try_from(n).unwrap_or(u32::MAX);
@@ -2149,6 +2194,13 @@ fn parse_sse_line(line: &str) -> Vec<anyhow::Result<StreamEvent>> {
             events.push(Ok(StreamEvent::Model { name: model.to_string() }));
         }
     }
+    // Same treatment for the response id — echoed on every chunk, deduped by
+    // the accumulator. Pearl th-126fe6.
+    if let Some(id) = chunk.id.as_deref() {
+        if !id.is_empty() {
+            events.push(Ok(StreamEvent::ResponseId { id: id.to_string() }));
+        }
+    }
 
     for choice in &chunk.choices {
         // Text delta
@@ -2236,6 +2288,7 @@ pub async fn accumulate_stream_events(mut stream: Pin<Box<dyn Stream<Item = anyh
     let mut usage = Usage::default();
     let mut resolved_model: Option<String> = None;
     let mut gateway_cost_usd: Option<f64> = None;
+    let mut response_id: Option<String> = None;
 
     // Track tool calls keyed by index (stable across chunks; `id` is only sent once
     // on some providers like MiniMax, `index` is sent on every chunk). Value is
@@ -2276,6 +2329,11 @@ pub async fn accumulate_stream_events(mut stream: Pin<Box<dyn Stream<Item = anyh
             }
             StreamEvent::Cost { usd } => {
                 gateway_cost_usd = Some(usd);
+            }
+            StreamEvent::ResponseId { id } => {
+                if response_id.is_none() && !id.is_empty() {
+                    response_id = Some(id);
+                }
             }
             StreamEvent::Model { name } => {
                 // Capture the first non-empty model name and ignore
@@ -2343,17 +2401,30 @@ pub async fn accumulate_stream_events(mut stream: Pin<Box<dyn Stream<Item = anyh
     // currently drops it for smooth-* aliases), estimate from
     // content lengths so cost_tracker has something to multiply.
     // Pearl th-eff0d0.
+    let mut usage_estimated = false;
     if usage.prompt_tokens == 0 && usage.completion_tokens == 0 {
         // Streaming path doesn't have the outgoing request in
-        // scope; estimate prompt_tokens at zero and only
-        // capture completion (~4 chars/token rule of thumb).
-        // The caller's record path will still see non-zero
-        // tokens and produce a real cost number against
-        // ModelPricing.
+        // scope, so prompt_tokens stays a hard 0 and only
+        // completion is estimated (~4 chars/token rule of thumb).
+        //
+        // The estimate is kept because budget enforcement needs
+        // something to multiply, but it is NOT a measurement and the
+        // `usage_estimated` flag below says so. The old comment here
+        // claimed this would "produce a real cost number against
+        // ModelPricing" — it does not. `prompt_tokens = 0` drops the
+        // larger, more expensive half of a grounded turn, and every
+        // prod span recorded `input_tokens = 0` beside a completion
+        // count that was only ever `content.len() / 4`. Nothing may
+        // publish these as measured. Pearl th-126fe6.
         let total_args_chars: usize = tool_calls.iter().map(|tc| tc.arguments.to_string().len()).sum();
         let completion_chars = content.len() + total_args_chars;
         usage.completion_tokens = u32::try_from(completion_chars / 4).unwrap_or(u32::MAX);
         usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+        usage_estimated = true;
+        // ponytail: estimating prompt_tokens here too would need the outgoing
+        // request threaded into the collector. Not done — a flagged estimate is
+        // no more publishable than a flagged zero, and the real fix is the
+        // `response_id` join to LiteLLM's spend log, which has the true counts.
     }
 
     Ok(LlmResponse {
@@ -2365,6 +2436,8 @@ pub async fn accumulate_stream_events(mut stream: Pin<Box<dyn Stream<Item = anyh
         gateway_cost_usd,
         resolved_model,
         reasoning_content: if reasoning.is_empty() { None } else { Some(reasoning) },
+        usage_estimated,
+        response_id,
     })
 }
 
@@ -3867,6 +3940,70 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         assert_eq!(response.content, "ok");
     }
 
+    /// The response id must reach `LlmResponse` from the stream, because it is
+    /// the join key to `LiteLLM_SpendLogs.request_id` — and that spend row is
+    /// the ONLY authoritative source of token counts on a stream that carried
+    /// no usage chunk. Pearl th-126fe6.
+    #[tokio::test]
+    async fn accumulate_stream_events_captures_response_id() {
+        use futures_util::stream;
+
+        let events: Vec<anyhow::Result<StreamEvent>> = vec![
+            Ok(StreamEvent::ResponseId {
+                id: "chatcmpl-f1e896f1".into(),
+            }),
+            // Echoed on every chunk in practice; only the first is kept.
+            Ok(StreamEvent::ResponseId {
+                id: "chatcmpl-SHOULD-BE-IGNORED".into(),
+            }),
+            Ok(StreamEvent::Delta { content: "ok".into() }),
+            Ok(StreamEvent::Usage(Usage {
+                prompt_tokens: 493,
+                completion_tokens: 1049,
+                total_tokens: 1542,
+                cached_tokens: 0,
+            })),
+            Ok(StreamEvent::Done { finish_reason: "stop".into() }),
+        ];
+        let stream: Pin<Box<dyn Stream<Item = anyhow::Result<StreamEvent>> + Send>> = Box::pin(stream::iter(events));
+        let response = accumulate_stream_events(stream).await.unwrap();
+        assert_eq!(response.response_id.as_deref(), Some("chatcmpl-f1e896f1"));
+        assert!(!response.usage_estimated, "a stream that reported usage must not be flagged as estimated");
+        assert_eq!(response.usage.prompt_tokens, 493);
+    }
+
+    /// A stream with NO usage chunk gets its usage fabricated — `prompt_tokens`
+    /// is not even estimated, it is a hard 0, and `completion_tokens` is
+    /// `content.len() / 4`. The flag is what stops a consumer publishing that
+    /// as a measurement; without it, every prod span recorded `input = 0`
+    /// beside a fake output count. Pearl th-126fe6.
+    #[tokio::test]
+    async fn accumulate_stream_events_flags_fabricated_usage() {
+        use futures_util::stream;
+
+        let events: Vec<anyhow::Result<StreamEvent>> = vec![
+            Ok(StreamEvent::Delta { content: "12345678".into() }),
+            Ok(StreamEvent::Done { finish_reason: "stop".into() }),
+        ];
+        let stream: Pin<Box<dyn Stream<Item = anyhow::Result<StreamEvent>> + Send>> = Box::pin(stream::iter(events));
+        let response = accumulate_stream_events(stream).await.unwrap();
+
+        assert!(response.usage_estimated, "fabricated usage MUST be flagged");
+        assert_eq!(response.usage.prompt_tokens, 0, "the streaming path never estimates prompt tokens");
+        assert_eq!(response.usage.completion_tokens, 2, "8 chars / 4 = the estimate that looked plausible in prod");
+    }
+
+    /// The SSE chunk parser lifts `id` off the wire like it does `model`.
+    #[test]
+    fn openai_sse_chunk_emits_response_id() {
+        let chunk = r#"data: {"id":"chatcmpl-f1e896f1","model":"groq-gpt-oss-120b","choices":[{"delta":{"content":"hi"}}]}"#;
+        let events: Vec<StreamEvent> = parse_sse_line(chunk).into_iter().map(Result::unwrap).collect();
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::ResponseId { id } if id == "chatcmpl-f1e896f1")),
+            "expected a ResponseId event; got {events:?}"
+        );
+    }
+
     #[test]
     fn calculate_backoff_exponential_growth() {
         let policy = RetryPolicy {
@@ -4448,6 +4585,8 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             gateway_cost_usd: None,
             resolved_model: None,
             reasoning_content: None,
+            usage_estimated: false,
+            response_id: None,
         };
         let value = resp.structured_json().expect("valid JSON");
         assert_eq!(value["city"], "SF");
@@ -4474,6 +4613,8 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             gateway_cost_usd: None,
             resolved_model: None,
             reasoning_content: None,
+            usage_estimated: false,
+            response_id: None,
         };
         let err = resp.structured_json().expect_err("non-JSON must error");
         assert!(err.to_string().contains("not valid JSON"), "err was: {err}");
@@ -4492,6 +4633,8 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             gateway_cost_usd: None,
             resolved_model: None,
             reasoning_content: None,
+            usage_estimated: false,
+            response_id: None,
         };
         let err = resp.structured_json().expect_err("empty must error");
         assert!(err.to_string().contains("empty content"), "err was: {err}");

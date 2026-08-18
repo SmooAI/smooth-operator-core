@@ -193,6 +193,10 @@ fn to_llm_response(r: ProviderCompleteResult) -> LlmResponse {
         rate_limit: None,
         gateway_cost_usd: None,
         resolved_model: r.resolved_model,
+        // A hosted extension provider reports usage directly; it never goes
+        // through the char-count estimator, and it carries no gateway id.
+        usage_estimated: false,
+        response_id: None,
         reasoning_content: r.reasoning_content,
     }
 }

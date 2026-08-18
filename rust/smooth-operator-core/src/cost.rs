@@ -23,6 +23,30 @@ pub struct CostTracker {
     pub total_cached_tokens: u64,
     pub total_cost_usd: f64,
     pub calls: u32,
+    /// True once any call in this run was priced from the local
+    /// [`ModelPricing`] table instead of the gateway's own figure, which taints
+    /// `total_cost_usd` as an ESTIMATE. Local pricing cannot price aliased
+    /// routes and returns the free tier for any model it doesn't recognise, so
+    /// nothing may present a tainted total as a measured cost — a billed SKU
+    /// especially. Pearl th-126fe6.
+    #[serde(default)]
+    pub cost_estimated: bool,
+    /// True once any call in this run reported no usage and had its token
+    /// counts estimated from character counts (`LlmResponse::usage_estimated`).
+    /// Independent of [`Self::cost_estimated`]: the gateway sends cost on an
+    /// HTTP header and usage on an SSE chunk, so either can be authoritative
+    /// while the other is a guess.
+    #[serde(default)]
+    pub usage_estimated: bool,
+    /// The most recent call's gateway response id (`chatcmpl-…`), the join key
+    /// to `LiteLLM_SpendLogs.request_id`.
+    ///
+    /// ponytail: LAST call only, because the span it feeds has exactly one
+    /// `response_id` column. A multi-call turn therefore joins to its final
+    /// call, not the whole turn. Per-LLM-call inference spans are the upgrade
+    /// path if a turn's full spend ever needs reconstructing.
+    #[serde(default)]
+    pub last_response_id: Option<String>,
     entries: Vec<CostEntry>,
 }
 
@@ -82,6 +106,9 @@ impl CostTracker {
     pub fn record(&mut self, model: &str, usage: &Usage, pricing: &ModelPricing) {
         let cost = pricing.calculate(usage.prompt_tokens, usage.completion_tokens);
         self.record_with_cost(model, usage, cost);
+        // Taint AFTER the delegate, which resets nothing — this is the local
+        // pricing path, so the running total is no longer gateway-authoritative.
+        self.cost_estimated = true;
     }
 
     /// Record a single LLM call with an explicit cost (e.g. the
@@ -138,6 +165,9 @@ impl CostTracker {
         self.total_completion_tokens = 0;
         self.total_cached_tokens = 0;
         self.total_cost_usd = 0.0;
+        self.cost_estimated = false;
+        self.usage_estimated = false;
+        self.last_response_id = None;
         self.calls = 0;
         self.entries.clear();
     }
@@ -244,6 +274,42 @@ impl ModelPricing {
 mod tests {
     use super::*;
     use crate::llm::Usage;
+
+    /// Cost provenance: only a gateway-reported figure leaves the total
+    /// authoritative. The local `ModelPricing` path taints it, because that
+    /// table cannot price aliased routes and returns the FREE tier for any
+    /// model it doesn't recognise — so a total built from it may be a wild
+    /// under-count while looking exact. A billed surface has to be able to tell
+    /// the two apart. Pearl th-126fe6.
+    #[test]
+    fn local_pricing_taints_the_total_as_estimated() {
+        let usage = Usage {
+            prompt_tokens: 1000,
+            completion_tokens: 500,
+            total_tokens: 1500,
+            cached_tokens: 0,
+        };
+
+        let mut gateway = CostTracker::default();
+        gateway.record_with_cost("groq-gpt-oss-120b", &usage, 0.0007);
+        assert!(!gateway.cost_estimated, "a gateway-reported cost is authoritative");
+
+        let mut local = CostTracker::default();
+        local.record("groq-gpt-oss-120b", &usage, &ModelPricing::gpt_4o());
+        assert!(local.cost_estimated, "the ModelPricing path must taint the total");
+
+        // Taint is sticky: one estimated call in a multi-call turn makes the
+        // whole total an estimate, which is the conservative reading.
+        let mut mixed = CostTracker::default();
+        mixed.record_with_cost("groq-gpt-oss-120b", &usage, 0.0007);
+        mixed.record("groq-gpt-oss-120b", &usage, &ModelPricing::gpt_4o());
+        mixed.record_with_cost("groq-gpt-oss-120b", &usage, 0.0007);
+        assert!(mixed.cost_estimated, "one estimated call taints the turn");
+
+        let mut reset = local.clone();
+        reset.reset();
+        assert!(!reset.cost_estimated, "reset must clear provenance too");
+    }
 
     #[test]
     fn for_model_resolves_smooth_aliases() {

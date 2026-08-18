@@ -418,6 +418,26 @@ pub enum AgentEvent {
         /// consumer builds.
         #[serde(default)]
         cached_tokens: u64,
+        /// True when `cost_usd` is tainted by at least one call priced from the
+        /// local `ModelPricing` table instead of the gateway's own figure — an
+        /// ESTIMATE, not a measurement. A consumer that renders cost on a
+        /// billed surface must not present a tainted total as authoritative.
+        /// Defaults to false for back-compat with older runner output.
+        /// Pearl th-126fe6.
+        #[serde(default)]
+        cost_estimated: bool,
+        /// True when at least one call reported no usage and had its token
+        /// counts estimated from character counts. On the streaming path
+        /// `prompt_tokens` is not even estimated — it is a hard 0 — so these
+        /// counts must never be published as measured.
+        #[serde(default)]
+        usage_estimated: bool,
+        /// The final call's gateway response id (`chatcmpl-…`), the join key to
+        /// `LiteLLM_SpendLogs.request_id`. That spend row is the authoritative
+        /// source for both dollars and real token counts whenever the flags
+        /// above are set.
+        #[serde(default)]
+        response_id: Option<String>,
     },
     /// Emitted by a multi-phase orchestrator each time it enters a new
     /// phase. The engine itself never emits this — it's a hook for
@@ -1085,23 +1105,7 @@ impl Agent {
             // Act: execute tool calls
             if response.tool_calls.is_empty() {
                 // No tool calls = agent is done thinking
-                let (cost, prompt_tokens, completion_tokens, cached_tokens) = {
-                    let tracker = self.cost_tracker.lock().expect("lock cost_tracker");
-                    (
-                        tracker.total_cost_usd,
-                        tracker.total_prompt_tokens,
-                        tracker.total_completion_tokens,
-                        tracker.total_cached_tokens,
-                    )
-                };
-                self.emit(AgentEvent::Completed {
-                    agent_id: self.id.clone(),
-                    iterations: iteration,
-                    cost_usd: cost,
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                });
+                self.emit(self.completed_event(iteration));
                 if self.extension_host.is_some() {
                     let preview: String = response.content.chars().take(100).collect();
                     self.sep_dispatch(
@@ -1389,23 +1393,7 @@ impl Agent {
             self.maybe_checkpoint(&conversation, iteration, CheckpointEvent::LlmResponse);
 
             if response.tool_calls.is_empty() {
-                let (cost, prompt_tokens, completion_tokens, cached_tokens) = {
-                    let tracker = self.cost_tracker.lock().expect("lock cost_tracker");
-                    (
-                        tracker.total_cost_usd,
-                        tracker.total_prompt_tokens,
-                        tracker.total_completion_tokens,
-                        tracker.total_cached_tokens,
-                    )
-                };
-                let _ = tx.send(AgentEvent::Completed {
-                    agent_id: self.id.clone(),
-                    iterations: iteration,
-                    cost_usd: cost,
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                });
+                let _ = tx.send(self.completed_event(iteration));
                 if self.extension_host.is_some() {
                     let preview: String = response.content.chars().take(100).collect();
                     self.sep_dispatch(
@@ -1530,6 +1518,25 @@ impl Agent {
     /// the local `ModelPricing` table otherwise — which is only
     /// accurate for direct provider access; aliased routes through
     /// `smooth-coding` et al. won't price correctly locally.
+    /// Build the terminal [`AgentEvent::Completed`] from the run's cost tracker.
+    ///
+    /// One builder for both the sync and streaming loops so their terminal
+    /// events cannot drift apart — they previously duplicated this read.
+    fn completed_event(&self, iteration: u32) -> AgentEvent {
+        let tracker = self.cost_tracker.lock().expect("lock cost_tracker");
+        AgentEvent::Completed {
+            agent_id: self.id.clone(),
+            iterations: iteration,
+            cost_usd: tracker.total_cost_usd,
+            prompt_tokens: tracker.total_prompt_tokens,
+            completion_tokens: tracker.total_completion_tokens,
+            cached_tokens: tracker.total_cached_tokens,
+            cost_estimated: tracker.cost_estimated,
+            usage_estimated: tracker.usage_estimated,
+            response_id: tracker.last_response_id.clone(),
+        }
+    }
+
     fn record_cost_and_check_budget(&self, response: &crate::llm::LlmResponse) -> bool {
         let model = &self.config.llm.model;
 
@@ -1538,8 +1545,18 @@ impl Agent {
             if let Some(cost) = response.gateway_cost_usd {
                 tracker.record_with_cost(model, &response.usage, cost);
             } else {
+                // `record` taints `cost_estimated` — local pricing can't price
+                // aliased routes and returns the free tier for anything it
+                // doesn't recognise.
                 let pricing = ModelPricing::for_model(model);
                 tracker.record(model, &response.usage, &pricing);
+            }
+            // Usage provenance is tracked separately from cost provenance: the
+            // gateway sends cost on an HTTP header and usage on an SSE chunk,
+            // so either can be authoritative while the other is a guess.
+            tracker.usage_estimated |= response.usage_estimated;
+            if response.response_id.is_some() {
+                tracker.last_response_id.clone_from(&response.response_id);
             }
 
             if let Some(budget) = &self.config.budget {
@@ -2268,6 +2285,8 @@ mod tests {
             gateway_cost_usd: None,
             resolved_model: Some("qwen3-coder-flash".into()),
             reasoning_content: None,
+            usage_estimated: false,
+            response_id: None,
         };
 
         let event = agent.model_resolution_event(&resp).expect("event on first resolution");
@@ -2295,6 +2314,8 @@ mod tests {
             gateway_cost_usd: None,
             resolved_model: Some("qwen3-coder-flash".into()),
             reasoning_content: None,
+            usage_estimated: false,
+            response_id: None,
         };
 
         assert!(agent.model_resolution_event(&resp).is_some(), "first time emits");
@@ -2330,6 +2351,8 @@ mod tests {
             gateway_cost_usd: None,
             resolved_model: Some("qwen3-coder-flash".into()),
             reasoning_content: None,
+            usage_estimated: false,
+            response_id: None,
         };
 
         assert!(agent.model_resolution_event(&resp).is_none());
@@ -2352,6 +2375,8 @@ mod tests {
             gateway_cost_usd: None,
             resolved_model: None,
             reasoning_content: None,
+            usage_estimated: false,
+            response_id: None,
         };
 
         assert!(agent.model_resolution_event(&resp).is_none());
@@ -2389,6 +2414,9 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 cached_tokens: 0,
+                cost_estimated: true,
+                usage_estimated: true,
+                response_id: Some("chatcmpl-abc123".into()),
             },
             AgentEvent::MaxIterationsReached { agent_id: "a".into(), max: 50 },
             AgentEvent::BudgetExceeded {
