@@ -30,8 +30,8 @@ pub struct ModelCallInput {
 ///
 /// Carries the fields the orchestration reads (`content`, `tool_calls`,
 /// `reasoning_content`) plus the accounting fields (`finish_reason`, `usage`,
-/// `gateway_cost_usd`, `resolved_model`) so the durable path can preserve cost /
-/// audit data. The transient `rate_limit` is dropped (it is meaningless after
+/// `gateway_cost_usd`, `resolved_model`, `usage_estimated`, `response_id`) so
+/// the durable path can preserve cost / audit data AND its provenance. The transient `rate_limit` is dropped (it is meaningless after
 /// the call returns).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCallOutput {
@@ -54,6 +54,14 @@ pub struct ModelCallOutput {
     /// Reasoning/thinking content, preserved for the next request.
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// Whether `usage` was estimated from character counts rather than reported.
+    /// Must cross the activity boundary with the counts it qualifies — a
+    /// durable replay that lost this would republish an estimate as measured.
+    #[serde(default)]
+    pub usage_estimated: bool,
+    /// Gateway response id (`chatcmpl-…`), the join key to LiteLLM's spend log.
+    #[serde(default)]
+    pub response_id: Option<String>,
 }
 
 impl From<&LlmResponse> for ModelCallOutput {
@@ -66,6 +74,8 @@ impl From<&LlmResponse> for ModelCallOutput {
             gateway_cost_usd: r.gateway_cost_usd,
             resolved_model: r.resolved_model.clone(),
             reasoning_content: r.reasoning_content.clone(),
+            usage_estimated: r.usage_estimated,
+            response_id: r.response_id.clone(),
         }
     }
 }
@@ -84,6 +94,8 @@ impl ModelCallOutput {
             gateway_cost_usd: self.gateway_cost_usd,
             resolved_model: self.resolved_model,
             reasoning_content: self.reasoning_content,
+            usage_estimated: self.usage_estimated,
+            response_id: self.response_id,
         }
     }
 }
@@ -118,6 +130,8 @@ mod tests {
             gateway_cost_usd: Some(0.0001),
             resolved_model: Some("qwen3-coder-flash".into()),
             reasoning_content: Some("because".into()),
+            usage_estimated: true,
+            response_id: Some("chatcmpl-abc123".into()),
         }
     }
 
@@ -138,6 +152,11 @@ mod tests {
         assert_eq!(restored.gateway_cost_usd, Some(0.0001));
         assert_eq!(restored.resolved_model.as_deref(), Some("qwen3-coder-flash"));
         assert_eq!(restored.reasoning_content.as_deref(), Some("because"));
+        // Provenance must survive the boundary with the numbers it qualifies:
+        // a replay that dropped these would republish an estimate as measured,
+        // and lose the only join key to the authoritative spend row.
+        assert!(restored.usage_estimated, "usage_estimated must survive the DTO round trip");
+        assert_eq!(restored.response_id.as_deref(), Some("chatcmpl-abc123"));
         assert!(restored.rate_limit.is_none());
     }
 
@@ -151,6 +170,8 @@ mod tests {
         assert_eq!(back.content, "hello");
         assert_eq!(back.tool_calls[0].name, "echo");
         assert_eq!(back.usage.prompt_tokens, 10);
+        assert!(back.usage_estimated, "usage_estimated must survive JSON");
+        assert_eq!(back.response_id.as_deref(), Some("chatcmpl-abc123"));
     }
 
     /// Activity inputs serialize cleanly.

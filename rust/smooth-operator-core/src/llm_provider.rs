@@ -99,6 +99,8 @@ pub fn text_response(content: impl Into<String>) -> LlmResponse {
         gateway_cost_usd: None,
         resolved_model: None,
         reasoning_content: None,
+        usage_estimated: false,
+        response_id: None,
     }
 }
 
@@ -119,6 +121,8 @@ pub fn tool_call_response(id: impl Into<String>, name: impl Into<String>, argume
         gateway_cost_usd: None,
         resolved_model: None,
         reasoning_content: None,
+        usage_estimated: false,
+        response_id: None,
     }
 }
 

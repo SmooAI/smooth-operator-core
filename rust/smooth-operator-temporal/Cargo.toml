@@ -31,9 +31,20 @@ temporal = [
 [dependencies]
 # `path` for local dev, `version` because a published crate may not depend on a
 # bare path. `1.8` (i.e. `^1.8`) rather than the exact lockstep version so this
-# line never needs re-syncing on a patch release — any 1.x core from 1.8 up
+# line never needs re-syncing on a patch release — any 1.x core from 1.9 up
 # satisfies it, and the two ship in lockstep anyway.
-smooai-smooth-operator-core = { path = "../smooth-operator-core", version = "1.8" }
+#
+# Bumped 1.8 -> 1.9 because this crate now reads `LlmResponse::usage_estimated`
+# and `::response_id`, which only exist from core 1.9.0. It MUST be raised
+# whenever this crate starts using new core API, or the real publish resolves an
+# older core off the registry and fails there instead of here.
+#
+# Known consequence: `cargo publish --dry-run -p ...-temporal` in pr-checks.yml
+# cannot pass on the PR that adds the core API, because packaging resolves core
+# from the REGISTRY, not the workspace path — and the needed version is not
+# published yet. That is structural for any core change touching a public struct
+# this crate constructs, not specific to this PR.
+smooai-smooth-operator-core = { path = "../smooth-operator-core", version = "1.9" }
 anyhow = "1"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
