@@ -1,5 +1,69 @@
 # @smooai/smooth-operator-core
 
+## 1.11.0
+
+### Minor Changes
+
+- 875b7a6: Ask the gateway for usage on every streaming request (`stream_options: {"include_usage": true}`), in all
+  five engines.
+
+  The OpenAI streaming API **omits usage unless it is explicitly requested**, and nothing here ever
+  requested it. So the missing usage chunk was never the gateway losing data — it was the gateway
+  correctly honouring a request that never asked. Everything built on top of that misattribution
+  compensates for one unset request parameter: two char-count estimators, `prompt_tokens` hardcoded to
+  `0`, `completion_tokens = content.len() / 4`, the `usage_estimated` and `cost_estimated` flags, and a
+  cross-language "is this measured?" convention.
+
+  Verified against llm.smoo.ai (LiteLLM 1.95.0, `groq-gpt-oss-120b`), same prompt both ways:
+
+  - **without** the field — 7 chunks, **0** carrying usage
+  - **with** the field — 8 chunks, **1** carrying `"prompt_tokens": 73, "completion_tokens": 8`
+
+  Sent only when streaming: it is meaningless otherwise, and leaving it off keeps a non-streaming
+  request byte-identical to before. Python honours an explicit caller-supplied `stream_options` rather
+  than overriding it.
+
+  Not fixed by this, and worth knowing: the per-request **cost** headers are present on a streamed
+  response but all read `0.0`, because at header-flush time the completion has not been priced yet.
+  `parse_gateway_cost` already maps `0` to `None`, so gateway cost stays unavailable on the streaming
+  path and the `response_id` → `LiteLLM_SpendLogs.request_id` join remains the only authoritative
+  per-turn cost there.
+
+### Patch Changes
+
+- 8c8fb7e: fix(python): three defects on the Python engine's streaming path
+
+  All three lived only in `SmoothAgent.run_stream`. The non-streaming `run` was
+  correct in every case, and Rust runs the same logic on both of its paths — which
+  is precisely why these stayed invisible: `run_stream` is the path the polyglot
+  servers, the TUI, and every real UI actually drive.
+
+  - **The SEP `tool_call` hook was never folded in.** Streaming dispatched tools
+    directly, so an extension that `Block`s `payments.refund` was honored
+    non-streaming and IGNORED streaming, and `Modify` argument rewrites (redaction,
+    scoping) were silently dropped. Both loops now fold through the one
+    `_sep_tool_call_plan`, which takes either tool-call shape (the SDK object or the
+    dict reassembled from stream deltas). The emitted `ToolCallEvent` carries the
+    PLANNED arguments, so a rewrite that redacts a secret does not leak through the
+    UI event either — matching what Rust emits.
+
+  - **The model stream was never closed on early abandon.** A bare `async for` with
+    no close meant a WS client disconnecting mid-answer unwound the generator on
+    `GeneratorExit` and left the openai `AsyncStream`'s httpx response open until
+    GC; under load the connection pool exhausted and later turns blocked on
+    acquisition. The iteration is now wrapped so the stream is released on every
+    exit, via `close()` (the openai SDK) or `aclose()` (a plain async generator).
+
+  - **An abandoned turn checkpointed a torn conversation.** The `finally` runs on
+    `GeneratorExit` too, so abandoning between a tool call and its result persisted
+    an assistant message with `tool_calls` and no tool replies. Every provider
+    rejects that ("an assistant message with tool_calls must be followed by tool
+    messages"), and since each retry reloaded the same checkpoint the conversation
+    was permanently wedged. Persistence (checkpoint and thread alike, on both
+    loops) now drops a conversation left mid-tool-chain, so the store keeps its last
+    good state and the next turn resumes from that — the invariant Rust gets from
+    checkpointing only at well-formed points.
+
 ## 1.10.0
 
 ### Minor Changes
