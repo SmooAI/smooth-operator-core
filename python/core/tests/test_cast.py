@@ -51,6 +51,26 @@ def test_deny_list_with_empty_allow_blocks_only_denied():
     assert c.is_allowed("read") is True
 
 
+def test_star_in_deny_list_denies_every_tool():
+    # Rust's Clearance::deny_all() IS deny_tools = ["*"], so a role definition
+    # shared with (or migrated from) Rust must deny everything here too. Matching
+    # "*" literally would fail OPEN and permit every tool.
+    c = Clearance.deny("*")
+    assert c.is_deny_all() is True
+    assert c.is_allowed("bash") is False
+    assert c.is_allowed("read") is False
+    # A star deny beats an explicit allow-list, exactly like deny_everything.
+    assert Clearance(allow_tools=frozenset({"read"}), deny_tools=frozenset({"*"})).is_allowed("read") is False
+
+
+def test_star_in_allow_list_is_literal_not_a_wildcard():
+    # Rust matches allow entries literally (no wildcard on the allow side); Python
+    # must not diverge by quietly widening an allow-list to "everything".
+    c = Clearance.allow("*")
+    assert c.is_allowed("bash") is False
+    assert c.is_allowed("*") is True
+
+
 # ── Cast registry ────────────────────────────────────────────────────────────
 def test_cast_registers_and_lists_roles():
     cast = Cast()

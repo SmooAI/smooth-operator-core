@@ -291,6 +291,20 @@ async def test_approver_timeout_fails_closed():
         await hook.pre_call(call("bash", bash("npm install x")))
 
 
+def test_approver_timeout_defaults_to_bounded():
+    """An omitted timeout must NOT mean "wait forever" — Rust's approver timeout is a
+    non-optional Duration. An unbounded default lets a dropped approval-UI socket pin
+    the turn's connection and concurrency slot indefinitely."""
+
+    async def never(_req: HumanApprovalRequest) -> HumanApprovalResponse:
+        return HumanApprovalResponse.approve()
+
+    hook = PermissionHook(AutoMode.ASK).with_approver(_gate(never))
+    timeout = hook._approver.timeout  # noqa: SLF001 — asserting the fail-closed default
+    assert timeout is not None
+    assert 0 < timeout < float("inf")
+
+
 async def test_deny_is_never_routed_to_human():
     prompted = False
 

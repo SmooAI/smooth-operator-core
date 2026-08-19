@@ -8,7 +8,12 @@ which tools it may call.
 :class:`Clearance` semantics (mirrors the reference engines):
 
 * a **deny always wins** — a denied tool is never permitted;
-* a **non-empty allow-list is a whitelist** — only listed tools are permitted;
+* a deny entry of ``"*"`` denies **every** tool (the Rust engine's
+  ``Clearance::deny_all()`` is exactly ``deny_tools = ["*"]``, so a role
+  definition shared with or migrated from Rust must deny everything here too);
+* a **non-empty allow-list is a whitelist** — only listed tools are permitted,
+  matched literally: ``"*"`` is *not* a wildcard on the allow side, mirroring
+  Rust, so ``allow_tools = {"*"}`` permits only a tool literally named ``*``;
 * **empty allow + empty deny means "all tools"**.
 
 Clearance is wired into the agent loop: if ``AgentOptions.clearance`` forbids a
@@ -38,8 +43,10 @@ class RoleKind(Enum):
 class Clearance:
     """Tool-access policy for a role.
 
-    A deny always wins; a non-empty ``allow_tools`` is a whitelist; empty allow +
-    empty deny means "all tools". ``deny_everything`` blocks every tool regardless.
+    A deny always wins; a deny entry of ``"*"`` denies everything; a non-empty
+    ``allow_tools`` is a whitelist (literal names only — ``"*"`` is not a wildcard
+    there); empty allow + empty deny means "all tools". ``deny_everything`` blocks
+    every tool regardless.
     """
 
     allow_tools: frozenset[str] = field(default_factory=frozenset)
@@ -63,9 +70,13 @@ class Clearance:
     def deny(*tools: str) -> "Clearance":
         return Clearance(deny_tools=frozenset(tools))
 
+    def is_deny_all(self) -> bool:
+        """Whether this clearance denies every tool. Mirrors Rust's ``is_deny_all``."""
+        return self.deny_everything or "*" in self.deny_tools
+
     def is_allowed(self, tool: str) -> bool:
         """Whether ``tool`` is permitted under this clearance."""
-        if self.deny_everything:
+        if self.is_deny_all():
             return False
         if tool in self.deny_tools:
             return False

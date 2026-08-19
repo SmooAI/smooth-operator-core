@@ -26,7 +26,7 @@ from .compaction import compact
 from .cost import CostBudget, CostTracker, ModelPricing, Usage, parse_gateway_cost
 from .deny_policy import DenyPolicy
 from .hooks import ToolCall, ToolHook, ToolResult
-from .human_gate import HumanApprovalRequest, HumanGate
+from .human_gate import DEFAULT_APPROVAL_TIMEOUT_SECONDS, HumanApprovalRequest, HumanGate
 from .knowledge import Knowledge
 from .memory import Memory
 from .multimodal import ImageContent, user_content
@@ -201,6 +201,13 @@ class AgentOptions:
     #:
     #:     lambda name, args: name in {"delete_record", "send_email"}
     requires_approval: Callable[[str, dict[str, Any]], bool] | None = None
+    #: How long (seconds) to wait for ``human_gate`` to answer. On elapse the call
+    #: FAILS CLOSED — the tool never runs and the model is told approval timed out.
+    #: Mirrors the Rust engine, where the approver timeout is a non-optional
+    #: ``Duration``. There is deliberately no "wait forever" value: an approval UI
+    #: whose socket drops would otherwise pin the turn's connection, checkpoint lock
+    #: and concurrency slot indefinitely.
+    approval_timeout_seconds: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS
     #: Number of ADDITIONAL attempts after the first if the model call raises a
     #: transient error (rate-limit, 5xx, dropped connection). ``0`` (the default)
     #: preserves today's behaviour: a single attempt, error propagates immediately.
@@ -954,11 +961,20 @@ class SmoothAgent:
 
         # Human-in-the-loop: pause for approval before running a flagged (write/sensitive)
         # tool. A denial is fed back to the model as a result — the tool never runs.
+        # The wait is BOUNDED and fails closed: a gate that never answers (dropped
+        # approval-UI socket) denies the call rather than pinning the turn forever.
         gate = self._options.human_gate
         needs_approval = self._options.requires_approval
         if gate is not None and needs_approval is not None and needs_approval(name, args):
             request = HumanApprovalRequest(tool_name=name, arguments=args, prompt=f"Approve calling tool '{name}'?")
-            decision = await gate.request_approval(request)
+            try:
+                decision = await asyncio.wait_for(
+                    gate.request_approval(request), self._options.approval_timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                return err_result(
+                    f"Denied by human: approval timed out after {self._options.approval_timeout_seconds}s"
+                )
             if not decision.is_approved:
                 return err_result(f"Denied by human: {decision.reason or 'no reason given'}")
 
