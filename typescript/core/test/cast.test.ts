@@ -32,6 +32,25 @@ describe('Clearance', () => {
         expect(c.isAllowed('delete')).toBe(false);
         expect(c.isAllowed('read')).toBe(true);
     });
+
+    it("a '*' entry in the deny-list denies every tool", () => {
+        // Rust's Clearance::deny_all() *is* denyTools: ['*'], so a role definition
+        // shared with or migrated from Rust must not fail open here.
+        const c = Clearance.deny('*');
+        expect(c.isDenyAll()).toBe(true);
+        expect(c.isAllowed('bash')).toBe(false);
+        expect(c.isAllowed('anything-at-all')).toBe(false);
+        // Even against an explicit allow-list — deny still wins.
+        expect(new Clearance({ allowTools: ['read'], denyTools: ['*'] }).isAllowed('read')).toBe(false);
+    });
+
+    it("a '*' entry in the allow-list grants only a tool literally named '*'", () => {
+        // Pinned deliberately: Rust matches allow entries literally too, so this is
+        // fail-CLOSED and must not drift open into a wildcard grant.
+        const c = Clearance.allow('*');
+        expect(c.isAllowed('bash')).toBe(false);
+        expect(c.isAllowed('*')).toBe(true);
+    });
 });
 
 describe('Cast', () => {

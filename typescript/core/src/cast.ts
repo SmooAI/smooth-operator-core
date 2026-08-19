@@ -8,6 +8,8 @@
  *
  * {@link Clearance} semantics (mirrors the reference engines):
  * - a **deny always wins** — a denied tool is never permitted;
+ * - a deny entry of `'*'` denies **everything** — that is how Rust spells deny-all;
+ * - the allow side is matched **literally**: `allow('*')` permits only a tool named `*`;
  * - a **non-empty allow-list is a whitelist** — only listed tools are permitted;
  * - **empty allow + empty deny means "all tools"**.
  *
@@ -59,9 +61,19 @@ export class Clearance {
         return new Clearance({ denyTools: tools });
     }
 
+    /**
+     * Whether this clearance denies every tool — either via the `denyEverything`
+     * flag or via a `'*'` entry in `denyTools`. Rust has no `denyEverything`
+     * flag: its `Clearance::deny_all()` *is* `denyTools: ['*']`, so a role
+     * definition shared with or migrated from Rust expresses deny-all that way.
+     */
+    isDenyAll(): boolean {
+        return this.denyEverything || this.denyTools.has('*');
+    }
+
     /** Whether `tool` is permitted under this clearance. */
     isAllowed(tool: string): boolean {
-        if (this.denyEverything) return false;
+        if (this.isDenyAll()) return false;
         if (this.denyTools.has(tool)) return false;
         if (this.allowTools.size > 0) return this.allowTools.has(tool);
         return true;
