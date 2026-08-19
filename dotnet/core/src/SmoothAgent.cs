@@ -96,6 +96,43 @@ public sealed class SmoothAgent
     /// <summary>The agentic loop-iteration cap. Read-only view of <see cref="AgentOptions.MaxIterations"/>.</summary>
     public int MaxIterations => _options.MaxIterations;
 
+    /// <summary>The model client this agent calls. Read-only, exposed so an activity surface
+    /// (<see cref="InProcessActivities"/>, or <c>SmooAI.SmoothOperator.Temporal</c>'s
+    /// <c>EngineHandles</c>) runs its <c>model_call</c> against the same client the in-process loop
+    /// uses instead of being handed a second, unrelated one.</summary>
+    public IChatClient ChatClient => _chatClient;
+
+    /// <summary>
+    /// Dispatch one model-requested tool call through this agent's <b>full</b> gate chain — the SEP
+    /// <c>tool_call</c> extension fold, tool resolution (natives, the <c>tool_search</c> meta-tool,
+    /// promoted deferred tools), the permission engine (circuit breakers, deny policy, grants,
+    /// auto-mode), the human-approval gate, and the pre/post tool hooks — returning the result the
+    /// model would see.
+    ///
+    /// <para><b>Every</b> <see cref="IAgentExecutor"/> backend MUST route tool calls through here
+    /// rather than invoking an <see cref="AIFunction"/> directly. Invoking directly is what let a
+    /// durable backend run tools the inline path would have refused, which defeats the behavioral
+    /// equivalence the executor seam exists to provide (ADR-030). The sibling engines route the same
+    /// way: Python's activities delegate to <c>SmoothAgent._dispatch_tool_result</c>, Rust's go
+    /// through <c>ToolRegistry::execute</c>.</para>
+    ///
+    /// <para>Business failures — unknown tool, a denial, a throwing tool — come back as an error
+    /// string on the result, never as an exception, so the model can see them and recover.</para>
+    /// </summary>
+    public async Task<FunctionResultContent> DispatchToolAsync(FunctionCallContent call, CancellationToken cancellationToken = default)
+    {
+        // Same order as the inline loop: the extension fold can veto (or patch the arguments of) the
+        // call before the permission gate ever sees it. Folding a single call is equivalent to the
+        // loop's batch fold — the batch only exists so a veto lands before any sibling executes.
+        var planned = new List<FunctionCallContent> { call };
+        var blocked = await SepToolCallPlanAsync(planned).ConfigureAwait(false);
+        if (blocked is not null && blocked.TryGetValue(call.CallId, out var reason))
+        {
+            return new FunctionResultContent(call.CallId, SepBlockedResult(reason));
+        }
+        return await InvokeToolAsync(planned[0], cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>Start a fresh conversation thread for multi-turn use. (MAF: <c>GetNewThread</c>.)</summary>
     public SmoothAgentThread GetNewThread() => new();
 

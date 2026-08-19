@@ -159,14 +159,14 @@ public class E2ETests
         // Approved turn: the gated tool actually ran, its real result is in the conversation.
         var approvedTools = approved.Messages.Where(m => m.Role == ChatRole.Tool.Value).ToList();
         var approvedTool = Assert.Single(approvedTools);
-        Assert.Equal("ran-after-approval", approvedTool.Content);
+        Assert.Equal("ran-after-approval", approvedTool.ToolResultContent);
         Assert.Equal("done after approval", approved.LastAssistantContent);
 
         // Denied turn: the tool NEVER ran — the tool message is a denial error, not the echo payload.
         var deniedTools = denied.Messages.Where(m => m.Role == ChatRole.Tool.Value).ToList();
         var deniedTool = Assert.Single(deniedTools);
-        Assert.Contains("denied by human approval", deniedTool.Content);
-        Assert.NotEqual("should-not-run", deniedTool.Content);
+        Assert.Contains("denied by human approval", deniedTool.ToolResultContent);
+        Assert.NotEqual("should-not-run", deniedTool.ToolResultContent);
         Assert.Equal("done after denial", denied.LastAssistantContent);
     }
 
@@ -203,7 +203,7 @@ public class E2ETests
 
         var toolMsgs = conversation.Messages.Where(m => m.Role == ChatRole.Tool.Value).ToList();
         var toolMsg = Assert.Single(toolMsgs);
-        Assert.Contains("durable timer", toolMsg.Content);
+        Assert.Contains("durable timer", toolMsg.ToolResultContent);
         Assert.Equal("resumed after the timer", conversation.LastAssistantContent);
         // It actually waited (the 1s timer elapsed), not skipped instantly.
         Assert.True(started.Elapsed >= TimeSpan.FromMilliseconds(900), $"turn returned too fast to have honored the timer: {started.Elapsed}");

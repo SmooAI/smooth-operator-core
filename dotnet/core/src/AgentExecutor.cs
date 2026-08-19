@@ -114,6 +114,12 @@ public interface IAgentActivities
     /// <summary>
     /// Execute a single tool call and return its result.
     ///
+    /// <para><b>An implementation must dispatch through <see cref="SmoothAgent.DispatchToolAsync"/>,
+    /// not through <see cref="AIFunction.InvokeAsync(AIFunctionArguments, CancellationToken)"/>.</b>
+    /// The permission engine, deny policy, human gate and tool hooks all live behind that call; an
+    /// implementation that invokes the function directly silently runs tools the inline path would
+    /// have refused, which is precisely the equivalence ADR-030 exists to guarantee.</para>
+    ///
     /// <para>Tool <b>business</b> failures — the tool threw, was denied, or does not exist — are
     /// reported <i>on the returned result</i> (an error string in
     /// <see cref="FunctionResultContent.Result"/>), never as a thrown exception, so the model can
@@ -215,19 +221,43 @@ public static class AgentTurn
 
 /// <summary>
 /// The default, zero-infra <see cref="IAgentActivities"/>: it runs the model call through this
-/// engine's provider seam (<see cref="IChatClient"/>) and tool calls through the supplied tool set,
-/// inline in the calling task.
+/// engine's provider seam (<see cref="IChatClient"/>) and tool calls through the agent's gated
+/// dispatch, inline in the calling task.
+///
+/// <para>It holds a <see cref="SmoothAgent"/> purely as the <i>dispatch surface</i> — that is where
+/// this engine keeps tool resolution, the permission engine, the human gate and the tool hooks.
+/// Reusing it is what makes the activity path refuse exactly what the inline loop refuses; the
+/// agent's own turn loop is not used. Mirrors Python's <c>InProcessActivities</c>, which holds a
+/// <c>SmoothAgent</c> for the same reason.</para>
 /// </summary>
 public sealed class InProcessActivities : IAgentActivities
 {
-    private readonly IChatClient _chatClient;
-    private readonly Dictionary<string, AIFunction> _functions;
+    private readonly SmoothAgent _agent;
 
-    /// <summary>Build an in-process activity surface from a model client and a tool set.</summary>
-    public InProcessActivities(IChatClient chatClient, IEnumerable<AITool>? tools = null)
+    /// <summary>Build an in-process activity surface that runs against <paramref name="agent"/>: its
+    /// model client for the model call, its gated dispatch for every tool call.</summary>
+    public InProcessActivities(SmoothAgent agent)
     {
-        _chatClient = chatClient ?? throw new ArgumentNullException(nameof(chatClient));
-        _functions = (tools ?? Enumerable.Empty<AITool>()).OfType<AIFunction>().ToDictionary(f => f.Name, StringComparer.Ordinal);
+        _agent = agent ?? throw new ArgumentNullException(nameof(agent));
+    }
+
+    /// <summary>Build an in-process activity surface from a model client and a tool set — equivalent
+    /// to building it from a <see cref="SmoothAgent"/> configured with those tools and nothing else.
+    /// Nothing is configured, so nothing is gated; pass an agent to carry a permission mode, a deny
+    /// policy, a human gate or tool hooks onto this surface.</summary>
+    public InProcessActivities(IChatClient chatClient, IEnumerable<AITool>? tools = null)
+        : this(AgentFor(chatClient, tools))
+    {
+    }
+
+    private static SmoothAgent AgentFor(IChatClient chatClient, IEnumerable<AITool>? tools)
+    {
+        var options = new AgentOptions();
+        foreach (var tool in tools ?? Enumerable.Empty<AITool>())
+        {
+            options.Tools.Add(tool);
+        }
+        return new SmoothAgent(chatClient ?? throw new ArgumentNullException(nameof(chatClient)), options);
     }
 
     /// <inheritdoc />
@@ -237,27 +267,12 @@ public sealed class InProcessActivities : IAgentActivities
         CancellationToken cancellationToken = default)
     {
         var options = tools.Count > 0 ? new ChatOptions { Tools = tools.ToList() } : null;
-        return _chatClient.GetResponseAsync(messages, options, cancellationToken);
+        return _agent.ChatClient.GetResponseAsync(messages, options, cancellationToken);
     }
 
     /// <inheritdoc />
-    public async Task<FunctionResultContent> ToolInvokeAsync(FunctionCallContent call, CancellationToken cancellationToken = default)
-    {
-        if (!_functions.TryGetValue(call.Name, out var function))
-        {
-            return new FunctionResultContent(call.CallId, $"Error: unknown tool '{call.Name}'");
-        }
-
-        try
-        {
-            var result = await function.InvokeAsync(new AIFunctionArguments(call.Arguments), cancellationToken).ConfigureAwait(false);
-            return new FunctionResultContent(call.CallId, result);
-        }
-        catch (Exception ex)
-        {
-            // Business failure, not a dispatch failure: reported on the result so the model can
-            // recover. Only an unrecoverable dispatch error would throw out of here.
-            return new FunctionResultContent(call.CallId, $"Error: {ex.Message}");
-        }
-    }
+    public Task<FunctionResultContent> ToolInvokeAsync(FunctionCallContent call, CancellationToken cancellationToken = default) =>
+        // Through the agent's gate chain, never straight to the function: an executor backend must
+        // not be a way around the permission engine. See SmoothAgent.DispatchToolAsync.
+        _agent.DispatchToolAsync(call, cancellationToken);
 }
