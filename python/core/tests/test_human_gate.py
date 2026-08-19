@@ -230,8 +230,11 @@ async def test_gate_that_never_answers_times_out_and_fails_closed():
             approval_timeout_seconds=0.05,
         ),
     )
-    # Bounded outer wait: without the fix this hangs and the test fails here.
-    result = await asyncio.wait_for(agent.run("delete record 42"), 10)
+    # Hang detector, NOT a latency assertion: the assertions below are all on the
+    # outcome (denied, tool never ran), never on elapsed time. Without the fix this
+    # waits an hour, so any generous finite bound catches it — keep it far above the
+    # injected 0.05s so a loaded CI runner can't trip it.
+    result = await asyncio.wait_for(agent.run("delete record 42"), 120)
 
     assert invocations == []  # failed closed — the tool never ran
     denial = next(m for m in client.chat.completions.calls[1]["messages"] if m.get("role") == "tool")
