@@ -69,6 +69,14 @@ class _Completions:
         # Nones keeps the wire byte-identical to an unset field (Rust parity, and
         # the same reason the agent omits empty metadata entirely).
         body = {k: v for k, v in kwargs.items() if v is not None}
+        # The OpenAI streaming API OMITS usage unless it is explicitly requested. The
+        # missing usage chunk was never the gateway losing data, it was the gateway
+        # honouring a request that never asked. Verified against llm.smoo.ai (LiteLLM
+        # 1.95.0): 0 chunks carry usage without this, 1 carries real prompt/completion
+        # counts with it. Streaming only — meaningless otherwise, and leaving it off a
+        # non-streaming request keeps that wire byte-identical. Pearl th-5e59a5.
+        if body.get("stream"):
+            body.setdefault("stream_options", {"include_usage": True})
         # with_raw_response resolves once the response HEAD is in, so the cost header
         # is read while the SSE body is still untouched. Reading it after iterating
         # the stream would find nothing — the exact bug core#102 fixed in Rust.

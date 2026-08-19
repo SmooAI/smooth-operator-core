@@ -194,6 +194,27 @@ describe('createGatewayClient — request metadata (core#100)', () => {
         expect(received[0].metadata).toEqual({ agent_slug: 'support' });
     });
 
+    it('asks for usage on the streaming wire — the OpenAI API omits it otherwise', async () => {
+        const baseURL = await startGateway({ deltas: ['hi'] });
+        const agent = new SmoothAgent(createGatewayClient({ baseURL, apiKey: 'k' }), options);
+        for await (const _event of agent.runStream('hi')) {
+            // drain
+        }
+
+        // Verified against llm.smoo.ai (LiteLLM 1.95.0, groq-gpt-oss-120b): 0 chunks
+        // carry usage without this field, 1 carries real prompt/completion counts with
+        // it. The missing usage chunk was never the gateway losing data — it was the
+        // gateway honouring a request that never asked. Pearl th-5e59a5.
+        expect(received[0].stream_options).toEqual({ include_usage: true });
+    });
+
+    it('does NOT ask for usage on a non-streaming request — meaningless there', async () => {
+        const baseURL = await startGateway({ text: 'hi' });
+        await new SmoothAgent(createGatewayClient({ baseURL, apiKey: 'k' }), options).run('hi');
+
+        expect('stream_options' in received[0]).toBe(false);
+    });
+
     it('omits the field entirely when unset — byte-identical to a client without it', async () => {
         const baseURL = await startGateway({ text: 'hi' });
         await new SmoothAgent(createGatewayClient({ baseURL, apiKey: 'k' }), options).run('hi');
