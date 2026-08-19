@@ -15,6 +15,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable, Protocol
 
+#: How long a caller waits for a :class:`HumanGate` to answer before treating the
+#: silence as a denial. Every wait on a gate is bounded: an approval UI whose socket
+#: drops must not leave a turn holding its connection, checkpoint lock and
+#: concurrency slot forever. Mirrors the Rust engine, where the approver timeout is a
+#: non-optional ``Duration`` and ``agent.rs`` wires 300s.
+DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300.0
+
 
 class HumanDecision(Enum):
     """The human's verdict on a tool call that required approval."""

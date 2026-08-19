@@ -8,6 +8,7 @@ gate configured behavior is unchanged.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,7 @@ from smooth_operator_core import (
     HumanDecision,
     SmoothAgent,
 )
+from smooth_operator_core.human_gate import DEFAULT_APPROVAL_TIMEOUT_SECONDS
 
 
 # ── a tiny fake of the openai client surface the agent uses ──────────────────
@@ -200,3 +202,44 @@ async def test_gate_only_consults_flagged_tools():
     assert consulted == []
     assert invocations == [{"id": "7"}]
     assert result.text == "done"
+
+
+@pytest.mark.asyncio
+async def test_gate_that_never_answers_times_out_and_fails_closed():
+    """A gate whose approver never responds must DENY, not hang forever holding the
+    turn's connection, checkpoint lock and concurrency slot. Rust's approver timeout
+    is a non-optional Duration that fails closed on elapse."""
+    tool, invocations = _spy_tool()
+
+    async def never_answers(_req: HumanApprovalRequest) -> HumanApprovalResponse:
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+    client = FakeClient(
+        [
+            _msg(tool_calls=[_tool_call("c1", "delete_record", '{"id": "42"}')]),
+            _msg(content="understood, I won't delete it"),
+        ]
+    )
+    agent = SmoothAgent(
+        client,
+        AgentOptions(
+            tools=[tool],
+            human_gate=DelegateHumanGate(never_answers),
+            requires_approval=lambda name, _args: name == "delete_record",
+            approval_timeout_seconds=0.05,
+        ),
+    )
+    # Bounded outer wait: without the fix this hangs and the test fails here.
+    result = await asyncio.wait_for(agent.run("delete record 42"), 10)
+
+    assert invocations == []  # failed closed — the tool never ran
+    denial = next(m for m in client.chat.completions.calls[1]["messages"] if m.get("role") == "tool")
+    assert "timed out" in denial["content"]
+    assert result.text == "understood, I won't delete it"
+
+
+def test_approval_timeout_defaults_to_a_bounded_wait():
+    # There is no "wait forever" default: an unset timeout must still be finite.
+    assert AgentOptions().approval_timeout_seconds == DEFAULT_APPROVAL_TIMEOUT_SECONDS
+    assert 0 < DEFAULT_APPROVAL_TIMEOUT_SECONDS < float("inf")

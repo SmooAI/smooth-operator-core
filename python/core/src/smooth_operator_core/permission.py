@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 from .hooks import ToolCall, ToolHook
-from .human_gate import HumanApprovalRequest, HumanDecision, HumanGate
+from .human_gate import DEFAULT_APPROVAL_TIMEOUT_SECONDS, HumanApprovalRequest, HumanDecision, HumanGate
 from .permission_grants import (
     BashGrant,
     GrantQuery,
@@ -652,7 +652,9 @@ class _Approver:
     hard circuit-breaker and is **never** routed here."""
 
     gate: HumanGate
-    timeout: float | None = None
+    #: Always bounded — matching Rust, where this is a non-optional ``Duration``.
+    #: There is no "wait forever": a gate that never answers must not pin the turn.
+    timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS
 
     async def request(self, call: ToolCall, reason: str) -> _Approval:
         request = HumanApprovalRequest(
@@ -661,10 +663,7 @@ class _Approver:
             prompt=f"Permission: {reason}. Allow `{call.name}`?",
         )
         try:
-            if self.timeout is not None:
-                resp = await asyncio.wait_for(self.gate.request_approval(request), self.timeout)
-            else:
-                resp = await self.gate.request_approval(request)
+            resp = await asyncio.wait_for(self.gate.request_approval(request), self.timeout)
         except asyncio.TimeoutError as e:
             raise PermissionError("permission approval timed out; failing closed") from e
         if resp.decision is HumanDecision.DENIED:
@@ -702,10 +701,11 @@ class PermissionHook(ToolHook):
     def mode(self) -> AutoMode:
         return self._mode
 
-    def with_approver(self, gate: HumanGate, timeout: float | None = None) -> "PermissionHook":
+    def with_approver(self, gate: HumanGate, timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS) -> "PermissionHook":
         """Wire an interactive approver. When set, an ``Ask`` verdict consults the
         gate and blocks (up to ``timeout`` seconds) on the human's answer — approve
-        lets the call run, anything else (deny / timeout / raise) blocks it."""
+        lets the call run, anything else (deny / timeout / raise) blocks it. The wait
+        is always bounded; on elapse the call fails closed."""
         self._approver = _Approver(gate, timeout)
         return self
 
@@ -769,5 +769,8 @@ class PermissionHook(ToolHook):
             raise PermissionError(f"permission requires approval (fail-closed, no approver): {verdict.reason}")
         approval = await self._approver.request(call, verdict.reason)
         if approval is _Approval.ALWAYS:
-            self._persist_grant(call)
+            # Off the event loop: _persist_grant does blocking file I/O (read + atomic
+            # rewrite of wonk-allow.toml), which would otherwise stall every other
+            # concurrent turn sharing this loop for the duration of the write.
+            await asyncio.to_thread(self._persist_grant, call)
         # approved → allow (fall through)
