@@ -14,6 +14,7 @@ when the C# core grew past Phase 0.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Protocol, Union
@@ -300,6 +301,58 @@ def _extract_usage(response: Any) -> Usage:
     )
 
 
+def _tool_call_name_args(tool_call: Any) -> tuple[str, str]:
+    """Tool name + raw JSON arguments from either shape the loop carries: the SDK's
+    tool-call object (:meth:`SmoothAgent.run`) or the dict reassembled from stream
+    deltas (:meth:`SmoothAgent.run_stream`). Lets ONE SEP plan serve both paths."""
+    if isinstance(tool_call, dict):
+        return tool_call["name"], tool_call.get("arguments") or ""
+    return tool_call.function.name, tool_call.function.arguments
+
+
+def _has_unanswered_tool_calls(messages: list[dict[str, Any]]) -> bool:
+    """True when the conversation ends mid-tool-chain — an assistant message with
+    ``tool_calls`` whose ``role: tool`` replies were never appended.
+
+    Persisting that state permanently wedges the conversation: every provider
+    rejects it ("an assistant message with tool_calls must be followed by tool
+    messages"), and the next turn reloads the same broken checkpoint, so every
+    retry fails identically. Rust never hits this because it checkpoints only at
+    explicit well-formed points (``agent.rs`` ``CheckpointEvent::LlmResponse`` /
+    ``ToolCallComplete``); Python persists from a ``finally``, which also runs when
+    a streaming consumer abandons the generator mid-chain (``GeneratorExit``).
+    """
+    pending: set[str] = set()
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant":
+            pending = {str(tc.get("id")) for tc in m.get("tool_calls") or []}
+        elif role == "tool":
+            pending.discard(str(m.get("tool_call_id")))
+    return bool(pending)
+
+
+async def _close_stream(stream: Any) -> None:
+    """Release a model stream's underlying HTTP response.
+
+    Leaving ``async for`` early — breaking out, or unwinding on ``GeneratorExit``
+    when a WS client disconnects mid-answer — leaves the openai ``AsyncStream``'s
+    httpx response open until GC. Under load that exhausts the connection pool and
+    every later turn blocks acquiring one. The openai SDK spells the release
+    ``close()``; a plain async generator spells it ``aclose()``. Call whichever
+    exists, and swallow failures — teardown must never mask the real error.
+    """
+    closer = getattr(stream, "aclose", None) or getattr(stream, "close", None)
+    if closer is None:
+        return
+    try:
+        result = closer()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:  # noqa: BLE001 — a failed teardown must not replace the real error
+        pass
+
+
 class SmoothAgent:
     """A native, in-process agent. Construct with an OpenAI-compatible async client
     (e.g. ``openai.AsyncOpenAI(base_url=..., api_key=...)``) and :class:`AgentOptions`.
@@ -402,40 +455,70 @@ class SmoothAgent:
         self._sep_dispatch(_SEP_MESSAGE_END, {"iteration": iterations, "content": content})
         self._sep_dispatch(_SEP_TURN_END, {"agent_id": self._options.model, "iterations": iterations})
 
-    async def _sep_tool_call_plan(self, tool_calls: list[Any]) -> list[tuple[Any, str, str | None]]:
+    async def _sep_tool_call_plan(self, tool_calls: list[Any]) -> list[tuple[Any, str, str, str | None]]:
         """Fold the ``tool_call`` hook over every pending call BEFORE any of them run
         — the Python sibling of Rust's ``sep_tool_call_plan``.
 
-        Returns one ``(tool_call, arguments, blocked_reason)`` per input call, in
-        order: ``blocked_reason`` set means the call must not execute; otherwise
+        Returns one ``(tool_call, name, arguments, blocked_reason)`` per input call,
+        in order: ``blocked_reason`` set means the call must not execute; otherwise
         ``arguments`` is the (possibly hook-rewritten) JSON string to run with.
         Rewrites are already scoped by the host's cross-tool guard — an extension
         may only rewrite a tool it owns, and may never redirect the call.
+
+        Takes either tool-call shape (see :func:`_tool_call_name_args`) so both the
+        streaming and non-streaming loops fold through this ONE plan, exactly as
+        Rust runs it on both of its paths.
 
         With no host configured every call passes through untouched.
         """
         host = self._options.extensions
         if host is None:
-            return [(tc, tc.function.arguments, None) for tc in tool_calls]
+            return [(tc, *_tool_call_name_args(tc), None) for tc in tool_calls]
 
-        plan: list[tuple[Any, str, str | None]] = []
+        plan: list[tuple[Any, str, str, str | None]] = []
         for tc in tool_calls:
-            raw = tc.function.arguments
+            name, raw = _tool_call_name_args(tc)
             try:
                 parsed = json.loads(raw) if raw else {}
             except json.JSONDecodeError:
                 parsed = {}
-            folded = await host.run_tool_call_hook(tc.function.name, parsed)
+            folded = await host.run_tool_call_hook(name, parsed)
             if folded.blocked:
-                plan.append((tc, raw, folded.reason or "blocked by extension"))
+                plan.append((tc, name, raw, folded.reason or "blocked by extension"))
                 continue
             # A Modify outcome replaces the whole ``{tool, arguments}`` hook input;
             # lift its ``arguments`` back out. Anything else leaves the call as-is.
             patched = raw
             if isinstance(folded.value, dict) and "arguments" in folded.value:
                 patched = json.dumps(folded.value["arguments"])
-            plan.append((tc, patched, None))
+            plan.append((tc, name, patched, None))
         return plan
+
+    def _persist_turn(
+        self,
+        messages: list[dict[str, Any]],
+        turn_messages: list[dict[str, Any]],
+        thread: SmoothAgentThread | None,
+    ) -> None:
+        """Persist the turn on exit: checkpoint the conversation (sans system prompt,
+        which is rebuilt each turn) and append this turn's new messages to the thread.
+
+        Both loops call this from a ``finally``, so it also runs on the ABNORMAL
+        exits — an exception, or a streaming consumer abandoning the generator
+        part-way through a tool chain. A conversation saved from there is torn and
+        unusable (see :func:`_has_unanswered_tool_calls`), so it is dropped instead:
+        the store keeps the last good state and the next turn resumes from that.
+        """
+        if _has_unanswered_tool_calls(messages):
+            return
+        cp_store = self._options.checkpoint_store
+        cp_id = self._options.conversation_id
+        if cp_store is not None and cp_id is not None:
+            cp_store.save(
+                Checkpoint(conversation_id=cp_id, messages=[m for m in messages if m.get("role") != "system"])
+            )
+        if thread is not None:
+            thread.extend(turn_messages)
 
     async def run(
         self,
@@ -544,19 +627,19 @@ class SmoothAgent:
                 # so the model learns why. The registry's own hooks still apply after.
                 plan = await self._sep_tool_call_plan(choice.tool_calls)
 
-                async def _run_planned(tc: Any, args: str, blocked: str | None) -> str:
+                async def _run_planned(name: str, args: str, blocked: str | None) -> str:
                     if blocked is not None:
                         return f"error: blocked by extension: {blocked}"
-                    return await self._dispatch_tool(tc.function.name, args, search)
+                    return await self._dispatch_tool(name, args, search)
 
                 if self._options.parallel_tool_calls and len(plan) > 1:
                     # Dispatch all tool calls concurrently, but append the results in the
                     # original tool_calls order so the transcript stays deterministic. Each
                     # _dispatch_tool already turns failures/denials into a result string, so
                     # gather never sees an exception that would cancel its siblings.
-                    results = await asyncio.gather(*(_run_planned(tc, args, blocked) for tc, args, blocked in plan))
+                    results = await asyncio.gather(*(_run_planned(n, a, b) for _tc, n, a, b in plan))
                 else:
-                    results = [await _run_planned(tc, args, blocked) for tc, args, blocked in plan]
+                    results = [await _run_planned(n, a, b) for _tc, n, a, b in plan]
                 for tc, result in zip(choice.tool_calls, results):
                     tool_msg = {"role": "tool", "tool_call_id": tc.id, "content": result}
                     messages.append(tool_msg)
@@ -571,15 +654,7 @@ class SmoothAgent:
                 cost_usd=tracker.cost_usd,
             )
         finally:
-            # Persist the conversation (sans system prompt, which is rebuilt each turn).
-            if cp_store is not None and cp_id is not None:
-                cp_store.save(
-                    Checkpoint(conversation_id=cp_id, messages=[m for m in messages if m.get("role") != "system"])
-                )
-            # Append this turn's new messages (user + assistant + tool, never system)
-            # back to the thread so the next run sees the full conversation.
-            if thread is not None:
-                thread.extend(turn_messages)
+            self._persist_turn(messages, turn_messages, thread)
 
     async def run_stream(
         self,
@@ -648,37 +723,44 @@ class SmoothAgent:
                 # has no response object to read one off at all, so read it from the
                 # stream object when one surfaces it, and let a chunk carry it too.
                 gateway_cost = _response_gateway_cost(stream)
-                async for chunk in stream:
-                    chunk_cost = _response_gateway_cost(chunk)
-                    if chunk_cost is not None:
-                        gateway_cost = chunk_cost
-                    chunk_usage = getattr(chunk, "usage", None)
-                    if chunk_usage is not None:
-                        usage = Usage(
-                            prompt_tokens=int(getattr(chunk_usage, "prompt_tokens", 0) or 0),
-                            completion_tokens=int(getattr(chunk_usage, "completion_tokens", 0) or 0),
-                        )
-                    choices = getattr(chunk, "choices", None) or []
-                    if not choices:
-                        continue
-                    delta = getattr(choices[0], "delta", None)
-                    if delta is None:
-                        continue
-                    text_delta = getattr(delta, "content", None)
-                    if text_delta:
-                        content += text_delta
-                        yield TextEvent(text=text_delta)
-                    for tc in getattr(delta, "tool_calls", None) or []:
-                        idx = int(getattr(tc, "index", 0))
-                        cur = partials.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                        if getattr(tc, "id", None):
-                            cur["id"] = tc.id
-                        fn = getattr(tc, "function", None)
-                        if fn is not None:
-                            if getattr(fn, "name", None):
-                                cur["name"] = fn.name
-                            if getattr(fn, "arguments", None):
-                                cur["arguments"] += fn.arguments
+                # The stream is closed on EVERY exit, not just exhaustion: a consumer
+                # that stops iterating (WS client disconnects mid-answer) unwinds this
+                # generator with GeneratorExit, and without the close the upstream
+                # httpx response stays open until GC — see :func:`_close_stream`.
+                try:
+                    async for chunk in stream:
+                        chunk_cost = _response_gateway_cost(chunk)
+                        if chunk_cost is not None:
+                            gateway_cost = chunk_cost
+                        chunk_usage = getattr(chunk, "usage", None)
+                        if chunk_usage is not None:
+                            usage = Usage(
+                                prompt_tokens=int(getattr(chunk_usage, "prompt_tokens", 0) or 0),
+                                completion_tokens=int(getattr(chunk_usage, "completion_tokens", 0) or 0),
+                            )
+                        choices = getattr(chunk, "choices", None) or []
+                        if not choices:
+                            continue
+                        delta = getattr(choices[0], "delta", None)
+                        if delta is None:
+                            continue
+                        text_delta = getattr(delta, "content", None)
+                        if text_delta:
+                            content += text_delta
+                            yield TextEvent(text=text_delta)
+                        for tc in getattr(delta, "tool_calls", None) or []:
+                            idx = int(getattr(tc, "index", 0))
+                            cur = partials.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                            if getattr(tc, "id", None):
+                                cur["id"] = tc.id
+                            fn = getattr(tc, "function", None)
+                            if fn is not None:
+                                if getattr(fn, "name", None):
+                                    cur["name"] = fn.name
+                                if getattr(fn, "arguments", None):
+                                    cur["arguments"] += fn.arguments
+                finally:
+                    await _close_stream(stream)
 
                 tool_calls = [partials[i] for i in sorted(partials)]
                 tracker.record_with_gateway_cost(self._options.model, usage, gateway_cost, self._options.pricing)
@@ -723,21 +805,32 @@ class SmoothAgent:
                     return
 
                 tool_call_count += len(tool_calls)
-                # Emit a tool_call event per requested call (original order) BEFORE dispatch.
-                for tc in tool_calls:
-                    yield ToolCallEvent(name=tc["name"], arguments=tc["arguments"])
+                # SEP ``tool_call`` hook, folded over EVERY pending call before any of
+                # them run — the SAME plan ``run`` uses, and the one Rust runs on both
+                # of its paths. This path is what every real UI and server drives, so
+                # skipping it made an extension's Block a no-op and dropped its Modify
+                # argument rewrites (redaction, scoping) silently.
+                plan = await self._sep_tool_call_plan(tool_calls)
+
+                # Emit a tool_call event per requested call (original order) BEFORE
+                # dispatch, carrying the PLANNED arguments — a rewrite that redacts a
+                # secret must not leak through the UI event either (Rust likewise emits
+                # ToolCallStart from the planned calls).
+                for _tc, name, args, _blocked in plan:
+                    yield ToolCallEvent(name=name, arguments=args)
 
                 # Reuse the SAME dispatch path as ``run`` (clearance, human-gate,
                 # tool_search, JSON parsing, error-to-string, parallel_tool_calls).
                 # Results surface in original call order so the stream stays deterministic.
-                if self._options.parallel_tool_calls and len(tool_calls) > 1:
-                    results = await asyncio.gather(
-                        *(self._dispatch_tool_result(tc["name"], tc["arguments"], search) for tc in tool_calls)
-                    )
+                async def _run_planned(name: str, args: str, blocked: str | None) -> ToolResult:
+                    if blocked is not None:
+                        return ToolResult(content=f"error: blocked by extension: {blocked}", is_error=True)
+                    return await self._dispatch_tool_result(name, args, search)
+
+                if self._options.parallel_tool_calls and len(plan) > 1:
+                    results = await asyncio.gather(*(_run_planned(n, a, b) for _tc, n, a, b in plan))
                 else:
-                    results = [
-                        await self._dispatch_tool_result(tc["name"], tc["arguments"], search) for tc in tool_calls
-                    ]
+                    results = [await _run_planned(n, a, b) for _tc, n, a, b in plan]
                 for tc, result in zip(tool_calls, results):
                     tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result.content}
                     messages.append(tool_msg)
@@ -754,12 +847,9 @@ class SmoothAgent:
                 )
             )
         finally:
-            if cp_store is not None and cp_id is not None:
-                cp_store.save(
-                    Checkpoint(conversation_id=cp_id, messages=[m for m in messages if m.get("role") != "system"])
-                )
-            if thread is not None:
-                thread.extend(turn_messages)
+            # Also runs on GeneratorExit — a consumer that stops iterating mid-tool-chain
+            # must NOT leave a torn conversation behind; ``_persist_turn`` drops it.
+            self._persist_turn(messages, turn_messages, thread)
 
     def _mark_prompt_cache(self, messages: list[dict[str, Any]], tool_specs: list[dict[str, Any]] | None) -> None:
         """Stamp Anthropic prompt-cache markers, when the upstream understands them.
