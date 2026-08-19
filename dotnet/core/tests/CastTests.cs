@@ -33,6 +33,31 @@ public class CastTests
     }
 
     [Fact]
+    public void Clearance_StarInDenyListDeniesEveryTool()
+    {
+        // Rust's Clearance::deny_all() *is* deny_tools = ["*"], so a role definition
+        // shared with or migrated from Rust must not fail open here.
+        var deny = Clearance.Deny("*");
+        Assert.True(deny.IsDenyAll());
+        Assert.False(deny.Allows("bash"));
+        Assert.False(deny.Allows("anything-at-all"));
+
+        // Even against an explicit allow-list — deny still wins.
+        var withAllow = new Clearance { AllowTools = ["read"], DenyTools = ["*"] };
+        Assert.False(withAllow.Allows("read"));
+    }
+
+    [Fact]
+    public void Clearance_StarInAllowListIsLiteral()
+    {
+        // Pinned deliberately: Rust matches allow entries literally too, so this is
+        // fail-CLOSED and must not drift open into a wildcard grant.
+        var allow = Clearance.Allow("*");
+        Assert.False(allow.Allows("bash"));
+        Assert.True(allow.Allows("*"));
+    }
+
+    [Fact]
     public void Cast_RegisterAndQuery()
     {
         var cast = new Cast()

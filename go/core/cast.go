@@ -9,6 +9,8 @@ package core
 //
 // Clearance semantics (mirrors the reference engines):
 //   - a deny always wins — a denied tool is never permitted;
+//   - a deny entry of "*" denies everything — that is how Rust spells deny-all;
+//   - the allow side is matched literally: AllowClearance("*") permits only a tool named "*";
 //   - a non-empty allow-list is a whitelist — only listed tools are permitted;
 //   - empty allow + empty deny means "all tools".
 //
@@ -67,9 +69,21 @@ func NewClearance(allow, deny []string, denyEverything bool) Clearance {
 	return Clearance{allow: toSet(allow), deny: toSet(deny), denyEverything: denyEverything}
 }
 
+// IsDenyAll reports whether this clearance denies every tool — either via the
+// denyEverything flag or via a "*" entry in the deny list. Rust has no
+// denyEverything flag: its Clearance::deny_all() is deny_tools = ["*"], so a
+// role definition shared with or migrated from Rust spells deny-all that way.
+func (c Clearance) IsDenyAll() bool {
+	if c.denyEverything {
+		return true
+	}
+	_, star := c.deny["*"]
+	return star
+}
+
 // IsAllowed reports whether tool is permitted under this clearance.
 func (c Clearance) IsAllowed(tool string) bool {
-	if c.denyEverything {
+	if c.IsDenyAll() {
 		return false
 	}
 	if _, denied := c.deny[tool]; denied {

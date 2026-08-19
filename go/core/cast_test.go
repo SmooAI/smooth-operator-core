@@ -55,6 +55,34 @@ func TestClearanceDenyListOnly(t *testing.T) {
 	}
 }
 
+func TestClearanceStarInDenyListDeniesEveryTool(t *testing.T) {
+	// Rust's Clearance::deny_all() is deny_tools = ["*"], so a role definition
+	// shared with or migrated from Rust must not fail open here.
+	c := DenyClearance("*")
+	if !c.IsDenyAll() {
+		t.Fatal(`a "*" deny entry should report IsDenyAll`)
+	}
+	if c.IsAllowed("bash") || c.IsAllowed("anything-at-all") {
+		t.Fatal(`a "*" deny entry must deny every tool`)
+	}
+	// Even against an explicit allow-list — deny still wins.
+	if NewClearance([]string{"read"}, []string{"*"}, false).IsAllowed("read") {
+		t.Fatal(`a "*" deny entry must override the allow-list`)
+	}
+}
+
+func TestClearanceStarInAllowListIsLiteral(t *testing.T) {
+	// Pinned deliberately: Rust matches allow entries literally too, so this is
+	// fail-CLOSED and must not drift open into a wildcard grant.
+	c := AllowClearance("*")
+	if c.IsAllowed("bash") {
+		t.Fatal(`a "*" allow entry must not grant arbitrary tools`)
+	}
+	if !c.IsAllowed("*") {
+		t.Fatal(`a "*" allow entry should grant a tool literally named "*"`)
+	}
+}
+
 // ── Cast registry ────────────────────────────────────────────────────────────
 func TestCastRegistersAndFilters(t *testing.T) {
 	cast := NewCast()

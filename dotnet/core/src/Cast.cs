@@ -16,6 +16,8 @@ public enum RoleKind
 /// <summary>
 /// Tool-access policy for a role. Mirrors the Rust engine's <c>Clearance</c>: a deny always
 /// wins; a non-empty allow-list is a whitelist; empty allow + empty deny means "all tools".
+/// A deny entry of <c>"*"</c> denies everything — that is how Rust spells deny-all. The allow
+/// side is matched literally: <c>Allow("*")</c> permits only a tool named <c>*</c>.
 /// </summary>
 public sealed record Clearance
 {
@@ -34,10 +36,18 @@ public sealed record Clearance
 
     public static Clearance Deny(params string[] tools) => new() { DenyTools = tools };
 
+    /// <summary>
+    /// Whether this clearance denies every tool — either via <see cref="DenyEverything"/> or via a
+    /// <c>"*"</c> entry in <see cref="DenyTools"/>. Rust has no <c>DenyEverything</c> flag: its
+    /// <c>Clearance::deny_all()</c> <em>is</em> <c>deny_tools = ["*"]</c>, so a role definition
+    /// shared with or migrated from Rust spells deny-all that way.
+    /// </summary>
+    public bool IsDenyAll() => DenyEverything || DenyTools.Contains("*", StringComparer.Ordinal);
+
     /// <summary>Whether <paramref name="tool"/> is permitted under this clearance.</summary>
     public bool Allows(string tool)
     {
-        if (DenyEverything)
+        if (IsDenyAll())
         {
             return false;
         }
