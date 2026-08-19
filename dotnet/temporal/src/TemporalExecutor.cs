@@ -18,11 +18,16 @@ namespace SmooAI.SmoothOperator.Temporal;
 /// <see cref="AgentTurnWorkflow"/> + <see cref="AgentTurnActivities"/> on <see cref="TaskQueue"/> must
 /// be up for the turn to make progress.</para>
 ///
-/// <para>ponytail: this maps a <see cref="SmoothAgent"/> to an <see cref="AgentTurnInput"/> from the
-/// agent's public config (instructions, eager tool schemas, iteration cap). Carrying prior-thread
-/// history and a per-turn tool registry into the workflow is the documented open design gap
-/// (ADR-030 / runner.rs TODO), deferred until the durable path needs multi-turn memory — not
-/// invented here.</para>
+/// <para>This maps a <see cref="SmoothAgent"/> to an <see cref="AgentTurnInput"/> from the agent's
+/// public config (instructions, eager tool schemas, iteration cap) plus the passed thread's history,
+/// and appends the turn's new messages back onto that thread — so a durable turn has the same
+/// cross-turn memory an inline one does. Permission mode, deny policy, human gate and tool hooks are
+/// deliberately <i>not</i> carried on the wire: they are enforced where the tool actually runs, by the
+/// agent the <b>worker's</b> <see cref="EngineHandles"/> holds.</para>
+///
+/// <para>ponytail: <see cref="AgentOptions.Budget"/> is still not enforced on the durable path —
+/// <see cref="AgentTurn.DriveTurnAsync"/> has no spend concept in any language, and neither does the
+/// Rust reference's <c>drive_turn</c>. Wire it when the durable path carries usage back at all.</para>
 /// </summary>
 public sealed class TemporalExecutor : IAgentExecutor
 {
@@ -61,12 +66,21 @@ public sealed class TemporalExecutor : IAgentExecutor
         SmoothAgentThread? thread = null,
         CancellationToken cancellationToken = default)
     {
-        var input = BuildInput(agent, message);
+        var input = BuildInput(agent, message, thread);
         var handle = await _client.StartWorkflowAsync(
             (AgentTurnWorkflow wf) => wf.RunAsync(input),
             new WorkflowOptions(id: $"agent-turn-{Guid.NewGuid():N}", taskQueue: TaskQueue)).ConfigureAwait(false);
         var conversation = await handle.GetResultAsync().ConfigureAwait(false);
-        return ToRunResponse(conversation);
+
+        // Everything past the carried prefix (system prompt + replayed history) is new this turn,
+        // starting with the live user message — the same slice RunAsync appends inline, so a durable
+        // turn leaves the thread in the state an in-process turn would have.
+        var newThisTurn = conversation.Messages
+            .Skip(input.CarriedCount)
+            .Select(m => m.ToChatMessage())
+            .ToList();
+        thread?.AddRange(newThisTurn);
+        return ToRunResponse(newThisTurn);
     }
 
     /// <inheritdoc />
@@ -83,7 +97,7 @@ public sealed class TemporalExecutor : IAgentExecutor
         yield return new ChatResponseUpdate(ChatRole.Assistant, response.Text);
     }
 
-    private AgentTurnInput BuildInput(SmoothAgent agent, string message)
+    private AgentTurnInput BuildInput(SmoothAgent agent, string message, SmoothAgentThread? thread)
     {
         var tools = agent.Tools.Select(ToolSchemaDto.From).ToList();
         return new AgentTurnInput(
@@ -92,14 +106,12 @@ public sealed class TemporalExecutor : IAgentExecutor
             Tools: tools,
             MaxIterations: agent.MaxIterations,
             ApprovalRequiredTools: ApprovalRequiredTools,
-            WaitTool: WaitTool);
+            WaitTool: WaitTool,
+            History: thread?.Messages.Select(ChatMessageDto.From).ToList());
     }
 
-    private static AgentRunResponse ToRunResponse(TurnConversation conversation)
+    private static AgentRunResponse ToRunResponse(IReadOnlyList<ChatMessage> messages)
     {
-        var messages = conversation.Messages
-            .Select(m => new ChatMessage(new ChatRole(m.Role), m.Content) { AuthorName = m.AuthorName })
-            .ToList();
         // Iterations ≈ assistant turns; token/cost accounting is per-activity in workflow history and
         // is not surfaced on the workflow result today (usage carriage is a later phase).
         var iterations = messages.Count(m => m.Role == ChatRole.Assistant);

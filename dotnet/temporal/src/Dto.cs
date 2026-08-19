@@ -187,26 +187,17 @@ public sealed record ToolInvokeOutput(string CallId, string Content, bool IsErro
     public FunctionResultContent ToContent() => new(CallId, Content);
 }
 
-/// <summary>One message of the workflow's returned conversation, flattened for the workflow-result
-/// boundary. Mirrors the Rust reference returning the full <c>Conversation</c>.</summary>
-public sealed record TurnMessage(string Role, string Content, string? AuthorName)
-{
-    public static TurnMessage From(ChatMessage message)
-    {
-        var text = message.Text;
-        if (string.IsNullOrEmpty(text))
-        {
-            var result = message.Contents.OfType<FunctionResultContent>().FirstOrDefault();
-            text = result?.Result?.ToString() ?? string.Empty;
-        }
-        return new TurnMessage(message.Role.Value, text, message.AuthorName);
-    }
-}
-
-/// <summary>The conversation an <see cref="AgentTurnWorkflow"/> returns.</summary>
-public sealed record TurnConversation(IReadOnlyList<TurnMessage> Messages)
+/// <summary>The conversation an <see cref="AgentTurnWorkflow"/> returns: the whole message list —
+/// system prompt, any history the turn was seeded with, and everything the turn produced. Mirrors the
+/// Rust reference returning the full <c>Conversation</c>.
+///
+/// <para>Carried as <see cref="ChatMessageDto"/> rather than a flattened role+text pair because the
+/// caller appends this turn's new messages back onto its <c>SmoothAgentThread</c>: an
+/// assistant turn that requested tools, and the tool results paired to it by call id, have to survive
+/// the boundary intact or the <i>next</i> turn replays a conversation the model will reject.</para></summary>
+public sealed record TurnConversation(IReadOnlyList<ChatMessageDto> Messages)
 {
     /// <summary>The final assistant message text — the answer the user sees.</summary>
     public string? LastAssistantContent =>
-        Messages.LastOrDefault(m => m.Role == ChatRole.Assistant.Value)?.Content;
+        Messages.LastOrDefault(m => m.Role == ChatRole.Assistant.Value)?.Text;
 }

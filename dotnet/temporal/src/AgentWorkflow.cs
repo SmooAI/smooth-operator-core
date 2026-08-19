@@ -18,19 +18,43 @@ namespace SmooAI.SmoothOperator.Temporal;
 /// </summary>
 public sealed class EngineHandles
 {
+    /// <summary>The agent the activities run against: its model client backs <c>model_call</c>, and
+    /// its gated dispatch (<see cref="SmoothAgent.DispatchToolAsync"/>) backs <c>tool_invoke</c> — so
+    /// the durable turn is gated by the same permission mode, deny policy, human gate and tool hooks
+    /// the agent would enforce inline.</summary>
+    public SmoothAgent Agent { get; }
+
     /// <summary>Model client backing the <c>model_call</c> activity.</summary>
-    public IChatClient ChatClient { get; }
+    public IChatClient ChatClient => Agent.ChatClient;
 
     /// <summary>Tools backing the <c>tool_invoke</c> activity, indexed by name (the wire carries only
     /// a tool's <i>schema</i>, so the worker resolves the live delegate here).</summary>
     public IReadOnlyDictionary<string, AIFunction> ToolsByName { get; }
 
-    public EngineHandles(IChatClient chatClient, IEnumerable<AITool>? tools = null)
+    /// <summary>Run the activities against <paramref name="agent"/> — the shape a consumer with a
+    /// configured agent (permission mode, deny policy, human gate, hooks) should use, so the durable
+    /// path enforces what the inline path does.</summary>
+    public EngineHandles(SmoothAgent agent)
     {
-        ChatClient = chatClient ?? throw new ArgumentNullException(nameof(chatClient));
-        ToolsByName = (tools ?? Enumerable.Empty<AITool>())
-            .OfType<AIFunction>()
-            .ToDictionary(f => f.Name, StringComparer.Ordinal);
+        Agent = agent ?? throw new ArgumentNullException(nameof(agent));
+        ToolsByName = agent.Tools.OfType<AIFunction>().ToDictionary(f => f.Name, StringComparer.Ordinal);
+    }
+
+    /// <summary>Run the activities against a bare model client and tool set — equivalent to an agent
+    /// configured with those tools and nothing else, so nothing is gated.</summary>
+    public EngineHandles(IChatClient chatClient, IEnumerable<AITool>? tools = null)
+        : this(AgentFor(chatClient, tools))
+    {
+    }
+
+    private static SmoothAgent AgentFor(IChatClient chatClient, IEnumerable<AITool>? tools)
+    {
+        var options = new AgentOptions();
+        foreach (var tool in tools ?? Enumerable.Empty<AITool>())
+        {
+            options.Tools.Add(tool);
+        }
+        return new SmoothAgent(chatClient ?? throw new ArgumentNullException(nameof(chatClient)), options);
     }
 }
 
@@ -69,37 +93,51 @@ public sealed class AgentTurnActivities
 
     /// <summary>A single tool invocation — the <c>Act</c> step, run as a durable activity. Tool
     /// <b>business</b> failures come back on <see cref="ToolInvokeOutput.IsError"/> (not as a thrown
-    /// activity error), matching the engine's <c>InProcessActivities.ToolInvokeAsync</c>.</summary>
+    /// activity error), matching the engine's <c>InProcessActivities.ToolInvokeAsync</c>.
+    ///
+    /// <para>Dispatch goes through <see cref="SmoothAgent.DispatchToolAsync"/> — the same gate chain
+    /// the inline loop uses (permission engine, deny policy, human gate, tool hooks, extension fold)
+    /// — so swapping <c>InProcessExecutor</c> for <see cref="TemporalExecutor"/> cannot widen what the
+    /// agent is allowed to run. Invoking the resolved <see cref="AIFunction"/> directly here is the
+    /// bug this activity exists <i>not</i> to have.</para></summary>
     [Activity]
     public async Task<ToolInvokeOutput> ToolInvoke(ToolInvokeInput input)
     {
         var call = input.Call.ToContent();
-        if (!_engine.ToolsByName.TryGetValue(call.Name, out var function))
-        {
-            return new ToolInvokeOutput(call.CallId, $"Error: unknown tool '{call.Name}'", true);
-        }
-
         try
         {
-            var result = await function.InvokeAsync(new AIFunctionArguments(call.Arguments)).ConfigureAwait(false);
+            var result = await _engine.Agent.DispatchToolAsync(call).ConfigureAwait(false);
             // AIFunctionFactory returns the tool result as a JsonElement; render it the way the
             // in-process path's FunctionResultContent.ToString() would — a bare string unquoted, a
             // structured value as its raw JSON — rather than re-serializing (which double-quotes strings).
-            var content = result switch
+            var content = result.Result switch
             {
                 null => string.Empty,
                 string s => s,
                 JsonElement je => je.ValueKind == JsonValueKind.String ? je.GetString() ?? string.Empty : je.GetRawText(),
-                _ => JsonSerializer.Serialize(result, DtoJson.Options),
+                var other => JsonSerializer.Serialize(other, DtoJson.Options),
             };
-            return new ToolInvokeOutput(call.CallId, content, false);
+            return new ToolInvokeOutput(call.CallId, content, IsFailure(content));
         }
         catch (Exception ex)
         {
-            // Business failure, not a dispatch failure: reported on the result so the model can recover.
+            // The gate chain reports business failures on the result rather than throwing, so reaching
+            // here means a genuine dispatch fault. Still surfaced as a tool error so one broken tool
+            // can't fail the whole durable turn.
             return new ToolInvokeOutput(call.CallId, $"Error: {ex.Message}", true);
         }
     }
+
+    /// <summary>Whether a dispatched result is a failure the model should read as one.
+    /// ponytail: prefix sniffing, because the engine encodes tool failures into the result string —
+    /// there is no is-error channel on <see cref="FunctionResultContent"/>. If the engine ever grows a
+    /// structured tool result (Rust's <c>ToolResult::is_error</c>), read that instead. Nothing in the
+    /// loop branches on this today; it is carried for the consumer reading activity output.</summary>
+    private static bool IsFailure(string content) =>
+        content.StartsWith("Error:", StringComparison.Ordinal)
+        || content.StartsWith("error:", StringComparison.Ordinal)
+        || content.StartsWith("Denied by human:", StringComparison.Ordinal)
+        || content.StartsWith("Blocked by hook:", StringComparison.Ordinal);
 }
 
 /// <summary>
@@ -115,13 +153,39 @@ public sealed class AgentTurnActivities
 /// signal before they run — the durable human-in-the-loop unlock.</param>
 /// <param name="WaitTool">The built-in durable-wait tool, if any: a model call to it with an integer
 /// <c>seconds</c> argument sleeps the workflow on a Temporal timer instead of dispatching an activity.</param>
+/// <param name="History">Prior conversation, oldest first, replayed between the system prompt and the
+/// user message — the durable equivalent of the thread history <c>SmoothAgent.RunAsync</c> seeds from
+/// a <see cref="SmoothAgentThread"/>. Null/empty starts a fresh conversation.</param>
 public sealed record AgentTurnInput(
     string SystemPrompt,
     string UserMessage,
     IReadOnlyList<ToolSchemaDto>? Tools = null,
     int MaxIterations = 0,
     IReadOnlyList<string>? ApprovalRequiredTools = null,
-    string? WaitTool = null);
+    string? WaitTool = null,
+    IReadOnlyList<ChatMessageDto>? History = null)
+{
+    /// <summary>The conversation this input opens with: system prompt, prior history, then the live
+    /// user message — the same order <c>SmoothAgent.SeedConversationAsync</c> uses inline.
+    /// Deterministic and I/O-free, so the workflow may call it directly (and a test may check the
+    /// seeding without a Temporal server).</summary>
+    public List<ChatMessage> SeedConversation()
+    {
+        var messages = new List<ChatMessage> { new(ChatRole.System, SystemPrompt) };
+        if (History is not null)
+        {
+            messages.AddRange(History.Select(m => m.ToChatMessage()));
+        }
+        messages.Add(new ChatMessage(ChatRole.User, UserMessage));
+        return messages;
+    }
+
+    /// <summary>Count of leading messages a returned <see cref="TurnConversation"/> carries over from
+    /// before the turn — the system prompt plus any replayed history. Everything after them is new
+    /// this turn (starting with the live user message), which is exactly what a caller appends back
+    /// onto its thread, matching what the inline loop appends.</summary>
+    public int CarriedCount => 1 + (History?.Count ?? 0);
+}
 
 /// <summary>
 /// An agent turn as a Temporal workflow. Seeds the conversation, then drives the engine's
@@ -142,11 +206,7 @@ public sealed class AgentTurnWorkflow
     [WorkflowRun]
     public async Task<TurnConversation> RunAsync(AgentTurnInput input)
     {
-        var messages = new List<ChatMessage>
-        {
-            new(ChatRole.System, input.SystemPrompt),
-            new(ChatRole.User, input.UserMessage),
-        };
+        var messages = input.SeedConversation();
 
         var policy = input.MaxIterations <= 0
             ? new TurnPolicy()
@@ -164,7 +224,7 @@ public sealed class AgentTurnWorkflow
         // activity / timer / signal-wait.
         await AgentTurn.DriveTurnAsync(adapter, messages, Array.Empty<AITool>(), policy);
 
-        return new TurnConversation(messages.Select(TurnMessage.From).ToList());
+        return new TurnConversation(messages.Select(ChatMessageDto.From).ToList());
     }
 
     /// <summary>Signal: a human approves the tool call with this id, unblocking the gate.</summary>

@@ -20,6 +20,12 @@ What durable execution buys you over the in-process `InProcessExecutor`:
 - **Durable timers** — a `wait` tool sleeps the workflow on a Temporal timer that can span days,
   letting an agent schedule its own follow-up.
 
+What it does **not** buy you is a weaker gate. The `tool_invoke` activity dispatches through
+`SmoothAgent.DispatchToolAsync`, so the worker's agent enforces the same permission mode, deny
+policy, human gate and tool hooks it would enforce inline — swapping executors cannot widen what the
+agent may run. Give `EngineHandles` your **configured agent**, not a bare client and tool list, or
+there is no configuration for it to enforce.
+
 ## Why a separate package
 
 The `Temporalio` dependency lives here, not in the core engine, so the published core stays
@@ -30,17 +36,20 @@ feature.
 ## Wiring
 
 ```csharp
-// Worker side: register the workflows + activities, backed by your model client and tools.
-var engine = new EngineHandles(chatClient, tools);
+// Worker side: register the workflows + activities, backed by the SAME agent you would run inline.
+// Its model client backs `model_call`; its gated dispatch backs `tool_invoke`.
+var engine = new EngineHandles(agent);
 using var worker = new TemporalWorker(temporalClient, new TemporalWorkerOptions("smooth-operator-agent-turn")
     .AddWorkflow<AgentTurnWorkflow>()
     .AddWorkflow<HealthWorkflow>()
     .AddAllActivities(new AgentTurnActivities(engine)));
 _ = worker.ExecuteAsync(workerStopToken);
 
-// Consumer side: swap the executor — the agent is unaware.
+// Consumer side: swap the executor — the agent is unaware. Pass a thread for multi-turn memory; the
+// turn is seeded with its history and the new messages are appended back, as RunAsync would.
 IAgentExecutor executor = new TemporalExecutor(temporalClient);
-var result = await executor.ExecuteAsync(agent, "what is the answer?");
+var thread = agent.GetNewThread();
+var result = await executor.ExecuteAsync(agent, "what is the answer?", thread);
 ```
 
 The **serde DTO boundary** (`Dto.cs`) is pure `System.Text.Json` over flat projections and carries no
