@@ -138,7 +138,7 @@ func (m *MockLlmProvider) Chat(_ context.Context, req ChatRequest) (ChatResponse
 // name + first half of arguments) and a second chunk with the rest of the arguments
 // (exercising the agent's index-keyed accumulator); a final chunk carries usage. A
 // scripted error is returned synchronously (connect-time), mirroring a failed open.
-func (m *MockLlmProvider) ChatStream(_ context.Context, req ChatRequest) (<-chan ChatChunk, error) {
+func (m *MockLlmProvider) ChatStream(ctx context.Context, req ChatRequest) (<-chan ChatChunk, error) {
 	m.calls = append(m.calls, req)
 	next, ok := m.pop()
 	if !ok {
@@ -151,19 +151,35 @@ func (m *MockLlmProvider) ChatStream(_ context.Context, req ChatRequest) (<-chan
 	resp := next.resp
 	go func() {
 		defer close(ch)
+		// Honour ctx like the real GatewayClient does, so the mock cannot wedge a
+		// test's goroutine (or hide a leak the production client would have).
+		send := func(c ChatChunk) bool {
+			select {
+			case ch <- c:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
 		for _, piece := range splitIntoChunks(resp.Content, 3) {
-			ch <- ChatChunk{ContentDelta: piece}
+			if !send(ChatChunk{ContentDelta: piece}) {
+				return
+			}
 		}
 		for i, tc := range resp.ToolCalls {
 			// Rune split, same reason as splitIntoChunks: arguments are JSON and a
 			// value like {"city":"München"} splits mid-rune on a byte midpoint.
 			args := []rune(tc.Arguments)
 			mid := len(args) / 2
-			ch <- ChatChunk{ToolCallDeltas: []ToolCallDelta{{Index: i, ID: tc.ID, Name: tc.Name, ArgsFragment: string(args[:mid])}}}
-			ch <- ChatChunk{ToolCallDeltas: []ToolCallDelta{{Index: i, ArgsFragment: string(args[mid:])}}}
+			if !send(ChatChunk{ToolCallDeltas: []ToolCallDelta{{Index: i, ID: tc.ID, Name: tc.Name, ArgsFragment: string(args[:mid])}}}) {
+				return
+			}
+			if !send(ChatChunk{ToolCallDeltas: []ToolCallDelta{{Index: i, ArgsFragment: string(args[mid:])}}}) {
+				return
+			}
 		}
 		u := resp.Usage
-		ch <- ChatChunk{Usage: &u}
+		send(ChatChunk{Usage: &u})
 	}()
 	return ch, nil
 }

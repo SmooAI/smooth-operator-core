@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,14 +24,42 @@ type GatewayClient struct {
 	BaseURL    string // e.g. https://llm.smoo.ai/v1
 	APIKey     string
 	HTTPClient *http.Client
+
+	// idleTimeout overrides chunkIdleTimeout on the streaming path. Unexported and
+	// zero by default — it exists so tests can exercise the watchdog without
+	// waiting a minute, not as a knob to tune per call site.
+	idleTimeout time.Duration
 }
+
+// requestTimeout is the OVERALL deadline for one model call, mirroring the Rust
+// reference's `.timeout(600s)` on its reqwest client (llm.rs). It is deliberately
+// generous: Go's http.Client.Timeout covers reading the response BODY, so on the
+// streaming path it is a total-duration ceiling on the whole SSE stream, not a
+// "server went silent" detector. The 60s value this replaced silently guillotined
+// any reasoning/multi-tool turn that ran longer.
+//
+// Liveness is enforced separately by chunkIdleTimeout in ChatStream — that is the
+// timeout that should normally fire, and it fires as an ERROR.
+//
+// Connect time is bounded by http.DefaultTransport's 30s dialer, matching the
+// reference's `.connect_timeout(30s)`.
+const requestTimeout = 600 * time.Second
+
+// chunkIdleTimeout aborts a stream that has gone silent — no bytes for this long.
+// Mirrors the Rust reference's CHUNK_IDLE_TIMEOUT (llm.rs). It measures the gap
+// between reads, so a legitimately slow-but-progressing stream never trips it.
+const chunkIdleTimeout = 60 * time.Second
+
+// errStreamIdle is the cancellation cause the idle watchdog stamps on the stream
+// context, so the read error it provokes can be reported as what it actually is.
+var errStreamIdle = errors.New("stream idle timeout")
 
 // NewGatewayClient builds a client for the given base URL + key.
 func NewGatewayClient(baseURL, apiKey string) *GatewayClient {
 	return &GatewayClient{
 		BaseURL:    strings.TrimRight(baseURL, "/"),
 		APIKey:     apiKey,
-		HTTPClient: &http.Client{Timeout: 60 * time.Second},
+		HTTPClient: &http.Client{Timeout: requestTimeout},
 	}
 }
 
@@ -423,13 +452,36 @@ func (g *GatewayClient) Chat(ctx context.Context, req ChatRequest) (ChatResponse
 // and translates each `data: {...}` line into a ChatChunk on the returned channel.
 // Connect-time failures (request build / HTTP / non-2xx) come back as the error;
 // the channel is closed when the SSE stream ends (`data: [DONE]` or EOF).
+//
+// A stream that ends any way OTHER than cleanly — idle timeout, the overall
+// requestTimeout expiring, a mid-stream connection reset, an over-long SSE line —
+// delivers a final ChatChunk carrying Err before the channel closes. It NEVER
+// closes as if the model had finished: a truncated stream is an error, because a
+// half-sentence that looks like a clean completion gets appended to history and
+// checkpointed as the assistant turn with nothing recording the loss.
+//
+// Cancelling ctx tears down the request and releases the socket; the goroutine
+// always exits, so an abandoning consumer leaks neither it nor the connection.
 func (g *GatewayClient) ChatStream(ctx context.Context, req ChatRequest) (<-chan ChatChunk, error) {
 	wreq := buildWireRequest(req, true, g.BaseURL)
 	body, err := json.Marshal(wreq)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, g.BaseURL+"/chat/completions", bytes.NewReader(body))
+	// The idle watchdog needs to be able to abort the in-flight body read, which
+	// means cancelling the request's OWN context. WithCancelCause lets the
+	// resulting read error be reported as the idle timeout it really is rather
+	// than a bare "context canceled".
+	streamCtx, cancelStream := context.WithCancelCause(ctx)
+	streaming := false
+	defer func() {
+		// Every early return below abandons the request; only the goroutine path
+		// takes ownership of cancelStream.
+		if !streaming {
+			cancelStream(context.Canceled)
+		}
+	}()
+	httpReq, err := http.NewRequestWithContext(streamCtx, http.MethodPost, g.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("new request: %w", err)
 	}
@@ -457,17 +509,53 @@ func (g *GatewayClient) ChatStream(ctx context.Context, req ChatRequest) (<-chan
 	streamCost := parseGatewayCost(resp.Header)
 
 	ch := make(chan ChatChunk)
+	streaming = true
 	go func() {
 		defer close(ch)
+		defer cancelStream(context.Canceled)
 		defer resp.Body.Close()
+
+		// send blocks until the consumer takes the chunk OR the stream context is
+		// done. The bare `ch <-` this replaced wedged the goroutine forever (still
+		// holding the socket) whenever a consumer broke out of the range early.
+		// Mirrors the reference's `tx.send(..).is_err() -> return`.
+		send := func(c ChatChunk) bool {
+			select {
+			case ch <- c:
+				return true
+			case <-streamCtx.Done():
+				return false
+			}
+		}
+
 		// Cost rides the first chunk so the consumer folds it even if the stream
 		// errors before any usage arrives.
-		if streamCost != nil {
-			ch <- ChatChunk{CostUSD: streamCost}
+		if streamCost != nil && !send(ChatChunk{CostUSD: streamCost}) {
+			return
 		}
 		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for scanner.Scan() {
+		// 8MB line ceiling: a single SSE `data:` line carrying a large structured
+		// output or tool-call argument blob can exceed the old 1MB. Overrunning it
+		// is now at least loud (bufio.ErrTooLong via scanner.Err) instead of a
+		// silent truncation, but the ceiling should not be hit in normal use.
+		scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+
+		// Idle watchdog: cancelling streamCtx aborts the blocked body read, which
+		// surfaces below as scanner.Err. Reset immediately before each Scan so the
+		// deadline covers only time spent waiting on the SERVER — a consumer that
+		// is slow to take chunks must not be mistaken for a stalled stream.
+		idleAfter := g.idleTimeout
+		if idleAfter <= 0 {
+			idleAfter = chunkIdleTimeout
+		}
+		idle := time.AfterFunc(idleAfter, func() { cancelStream(errStreamIdle) })
+		defer idle.Stop()
+
+		for {
+			idle.Reset(idleAfter)
+			if !scanner.Scan() {
+				break
+			}
 			line := strings.TrimSpace(scanner.Text())
 			if !strings.HasPrefix(line, "data:") {
 				continue
@@ -493,10 +581,27 @@ func (g *GatewayClient) ChatStream(ctx context.Context, req ChatRequest) (<-chan
 			if wc.Usage != nil {
 				chunk.Usage = &Usage{PromptTokens: wc.Usage.PromptTokens, CompletionTokens: wc.Usage.CompletionTokens}
 			}
-			select {
-			case ch <- chunk:
-			case <-ctx.Done():
+			if !send(chunk) {
 				return
+			}
+		}
+
+		// THE bug this whole path exists to prevent: the scan loop also ends on
+		// error — a torn body, a reset connection, the overall requestTimeout, the
+		// idle watchdog, an over-long line. Never checking scanner.Err here is what
+		// made every one of those look like a clean finish.
+		if err := scanner.Err(); err != nil {
+			if cause := context.Cause(streamCtx); errors.Is(cause, errStreamIdle) {
+				err = fmt.Errorf("stream idle timeout: no data for %s", idleAfter)
+			}
+			// Deliberately NOT `send`: the watchdog reports a failure by cancelling
+			// streamCtx, so selecting on it here would race the error away and hand
+			// the consumer a clean close — the exact silent truncation this fixes.
+			// The CALLER's ctx is the honest liveness signal: if that is done, the
+			// consumer is gone and nobody is left to tell.
+			select {
+			case ch <- ChatChunk{Err: fmt.Errorf("stream read error: %w", err)}:
+			case <-ctx.Done():
 			}
 		}
 	}()
