@@ -189,13 +189,17 @@ export class MockLlmProvider implements ChatClientLike {
                     // second chunk with the rest of the arguments. Exercises the
                     // index-keyed accumulator on the agent side.
                     for (const [index, tc] of (message.tool_calls ?? []).entries()) {
-                        const args = tc.function.arguments ?? '';
+                        // Code-point split, same reason as splitIntoChunks: arguments are
+                        // JSON and a value like {"reaction":"🙂"} splits mid-surrogate.
+                        const args = Array.from(tc.function.arguments ?? '');
                         const mid = Math.floor(args.length / 2);
                         yield {
-                            choices: [{ delta: { tool_calls: [{ index, id: tc.id, function: { name: tc.function.name, arguments: args.slice(0, mid) } }] } }],
+                            choices: [
+                                { delta: { tool_calls: [{ index, id: tc.id, function: { name: tc.function.name, arguments: args.slice(0, mid).join('') } }] } },
+                            ],
                         };
                         yield {
-                            choices: [{ delta: { tool_calls: [{ index, function: { arguments: args.slice(mid) } }] } }],
+                            choices: [{ delta: { tool_calls: [{ index, function: { arguments: args.slice(mid).join('') } }] } }],
                         };
                     }
                     // Final chunk carries usage (gateways send it on the last chunk).
@@ -207,12 +211,20 @@ export class MockLlmProvider implements ChatClientLike {
     };
 }
 
-/** Split `s` into up to `n` roughly-equal non-empty pieces (≥2 when long enough). */
+/**
+ * Split `s` into up to `n` roughly-equal non-empty pieces (≥2 when long enough).
+ *
+ * Splits on CODE POINTS (`Array.from`), not UTF-16 code units: `.slice()` can cut an
+ * astral character (emoji) between its surrogate pair, and a lone surrogate becomes
+ * U+FFFD the moment that chunk is UTF-8 encoded onto the wire — unrecoverable, so
+ * reassembling no longer yields the original text.
+ */
 function splitIntoChunks(s: string, n: number): string[] {
-    if (s.length === 0) return [];
-    const parts = Math.min(n, Math.max(1, s.length));
-    const size = Math.ceil(s.length / parts);
+    const chars = Array.from(s);
+    if (chars.length === 0) return [];
+    const parts = Math.min(n, Math.max(1, chars.length));
+    const size = Math.ceil(chars.length / parts);
     const out: string[] = [];
-    for (let i = 0; i < s.length; i += size) out.push(s.slice(i, i + size));
+    for (let i = 0; i < chars.length; i += size) out.push(chars.slice(i, i + size).join(''));
     return out;
 }
