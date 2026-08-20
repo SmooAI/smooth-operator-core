@@ -112,4 +112,49 @@ describe('MockLlmProvider', () => {
         // The tool spec was advertised on every call.
         expect((mock.calls[0].tools![0] as Record<string, Record<string, unknown>>).function.name).toBe('echo');
     });
+
+    // A multibyte character landing on a chunk boundary must not be split.
+    //
+    // Regression for th-6fdd1c. The sibling Go mock sliced by BYTES and mangled an
+    // em-dash; this mock slices a JS string, which is UTF-16 — safe for the BMP
+    // (em-dash, accents, CJK) but NOT for astral characters, where `.slice()` can cut
+    // an emoji between its surrogate pair.
+    //
+    // Each chunk is checked INDIVIDUALLY, and by round-tripping through UTF-8 rather
+    // than by regex: concatenating the pieces heals a lone surrogate in memory, but
+    // encoding one chunk on its own — which is what the wire does — turns it into
+    // U+FFFD irreversibly.
+    it.each([
+        ['em-dash', 'Pro it is \u2014 pulling that quote up.'],
+        ['emoji (surrogate pair)', 'ok \u{1F642} done'],
+        ['accents + CJK', 'caf\u00e9 m\u00fcnchen \u6771\u4eac'],
+    ])('streams %s without splitting a code point', async (_label, text) => {
+        const mock = new MockLlmProvider();
+        mock.pushText(text);
+
+        let reassembled = '';
+        for await (const chunk of mock.chat.completions.createStream({ messages: [] })) {
+            const piece = chunk.choices[0]?.delta?.content;
+            if (!piece) continue;
+            expect(Buffer.from(piece, 'utf8').toString('utf8')).toBe(piece);
+            reassembled += piece;
+        }
+        expect(reassembled).toBe(text);
+    });
+
+    // The same hazard on tool-call arguments, which are JSON and can carry non-ASCII.
+    it('streams multibyte tool-call arguments without splitting a code point', async () => {
+        const args = JSON.stringify({ city: 'M\u00fcnchen', reaction: '\u{1F642}' });
+        const mock = new MockLlmProvider();
+        mock.pushToolCall('call-1', 'lookup', args);
+
+        let reassembled = '';
+        for await (const chunk of mock.chat.completions.createStream({ messages: [] })) {
+            const piece = chunk.choices[0]?.delta?.tool_calls?.[0]?.function?.arguments;
+            if (!piece) continue;
+            expect(Buffer.from(piece, 'utf8').toString('utf8')).toBe(piece);
+            reassembled += piece;
+        }
+        expect(reassembled).toBe(args);
+    });
 });

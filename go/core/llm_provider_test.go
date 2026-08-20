@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestMockReplaysTextInFIFOOrder(t *testing.T) {
@@ -151,5 +152,71 @@ func TestMockDrivesAFullAgentTurnAndRecordsTheRequest(t *testing.T) {
 	// The tool spec was advertised on every call.
 	if first := mock.Calls()[0].Tools; len(first) != 1 || first[0].Name != "echo" {
 		t.Fatalf("tool spec not advertised: %+v", first)
+	}
+}
+
+// A multibyte character landing exactly on a chunk boundary must not be split.
+//
+// Regression for th-6fdd1c: splitIntoChunks sliced by BYTES, so the em-dash in
+// "Pro it is — pulling that quote up." (36 bytes, 3 parts ⇒ a boundary at byte 12,
+// mid-em-dash) arrived as three U+FFFD. It survived for so long because it is
+// invisible with ASCII-only fixtures, and because the sibling scenario's 33-byte
+// reply happens to miss every rune boundary.
+//
+// Each chunk is checked INDIVIDUALLY: concatenating the pieces back together hides
+// the corruption in memory, but the wire encodes each chunk on its own.
+func TestMockStreamsMultibyteTextWithoutSplittingRunes(t *testing.T) {
+	for _, text := range []string{
+		"Pro it is — pulling that quote up.", // em-dash, 3 bytes — the original failure
+		"ok 🙂 done",                          // emoji, 4 bytes (astral)
+		"café münchen 東京",                    // accents + CJK
+	} {
+		mock := NewMockLlmProvider()
+		mock.PushText(text)
+
+		ch, err := mock.ChatStream(context.Background(), ChatRequest{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got strings.Builder
+		for chunk := range ch {
+			if chunk.ContentDelta == "" {
+				continue
+			}
+			if !utf8.ValidString(chunk.ContentDelta) {
+				t.Errorf("%q: chunk %q is not valid UTF-8 (a rune was split)", text, chunk.ContentDelta)
+			}
+			got.WriteString(chunk.ContentDelta)
+		}
+		if got.String() != text {
+			t.Errorf("reassembled %q, want %q", got.String(), text)
+		}
+	}
+}
+
+// The same hazard on the tool-call arguments, which are JSON and can carry non-ASCII.
+func TestMockStreamsMultibyteToolArgumentsWithoutSplittingRunes(t *testing.T) {
+	args := `{"city":"München","reaction":"🙂"}`
+	mock := NewMockLlmProvider()
+	mock.PushToolCall("call-1", "lookup", args)
+
+	ch, err := mock.ChatStream(context.Background(), ChatRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got strings.Builder
+	for chunk := range ch {
+		for _, d := range chunk.ToolCallDeltas {
+			if d.ArgsFragment == "" {
+				continue
+			}
+			if !utf8.ValidString(d.ArgsFragment) {
+				t.Errorf("args fragment %q is not valid UTF-8 (a rune was split)", d.ArgsFragment)
+			}
+			got.WriteString(d.ArgsFragment)
+		}
+	}
+	if got.String() != args {
+		t.Errorf("reassembled %q, want %q", got.String(), args)
 	}
 }

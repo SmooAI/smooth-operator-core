@@ -155,9 +155,12 @@ func (m *MockLlmProvider) ChatStream(_ context.Context, req ChatRequest) (<-chan
 			ch <- ChatChunk{ContentDelta: piece}
 		}
 		for i, tc := range resp.ToolCalls {
-			mid := len(tc.Arguments) / 2
-			ch <- ChatChunk{ToolCallDeltas: []ToolCallDelta{{Index: i, ID: tc.ID, Name: tc.Name, ArgsFragment: tc.Arguments[:mid]}}}
-			ch <- ChatChunk{ToolCallDeltas: []ToolCallDelta{{Index: i, ArgsFragment: tc.Arguments[mid:]}}}
+			// Rune split, same reason as splitIntoChunks: arguments are JSON and a
+			// value like {"city":"München"} splits mid-rune on a byte midpoint.
+			args := []rune(tc.Arguments)
+			mid := len(args) / 2
+			ch <- ChatChunk{ToolCallDeltas: []ToolCallDelta{{Index: i, ID: tc.ID, Name: tc.Name, ArgsFragment: string(args[:mid])}}}
+			ch <- ChatChunk{ToolCallDeltas: []ToolCallDelta{{Index: i, ArgsFragment: string(args[mid:])}}}
 		}
 		u := resp.Usage
 		ch <- ChatChunk{Usage: &u}
@@ -176,25 +179,31 @@ func (m *MockLlmProvider) pop() (scriptedOutcome, bool) {
 }
 
 // splitIntoChunks splits s into up to n roughly-equal non-empty pieces.
+//
+// Splits on RUNE boundaries, not bytes: a byte split lands mid-rune on any
+// multi-byte character (an em-dash is 3 bytes, an emoji 4) and each fragment is
+// then invalid UTF-8, which json.Marshal replaces with U+FFFD — permanently, so
+// reassembling the chunks no longer recovers the text.
 func splitIntoChunks(s string, n int) []string {
-	if s == "" {
+	r := []rune(s)
+	if len(r) == 0 {
 		return nil
 	}
 	parts := n
-	if len(s) < parts {
-		parts = len(s)
+	if len(r) < parts {
+		parts = len(r)
 	}
 	if parts < 1 {
 		parts = 1
 	}
-	size := (len(s) + parts - 1) / parts // ceil
+	size := (len(r) + parts - 1) / parts // ceil
 	var out []string
-	for i := 0; i < len(s); i += size {
+	for i := 0; i < len(r); i += size {
 		end := i + size
-		if end > len(s) {
-			end = len(s)
+		if end > len(r) {
+			end = len(r)
 		}
-		out = append(out, s[i:end])
+		out = append(out, string(r[i:end]))
 	}
 	return out
 }
