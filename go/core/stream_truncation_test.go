@@ -456,3 +456,48 @@ func TestGatewayChatStreamGoroutineExitsOnAbandon(t *testing.T) {
 
 	noGoroutineMatching(t, "core.(*GatewayClient).ChatStream")
 }
+
+// TestSlowConsumerIsNotMistakenForAStalledStream: the idle deadline measures time
+// waiting on the SERVER. A consumer that pauses longer than the window between
+// reads is not a stalled stream, and aborting its turn would be a fresh way to lose
+// a complete answer.
+func TestSlowConsumerIsNotMistakenForAStalledStream(t *testing.T) {
+	srv := httptest.NewServer(sseHandler(func(w http.ResponseWriter, r *http.Request, flush func()) {
+		for i := 0; i < 3; i++ {
+			fmt.Fprint(w, sseDelta("x"))
+			flush()
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flush()
+	}))
+	defer srv.Close()
+
+	client := NewGatewayClient(srv.URL, "k")
+	client.idleTimeout = 100 * time.Millisecond
+	agent := NewSmoothAgent(client, AgentOptions{})
+
+	stream, err := agent.RunStream(context.Background(), "hi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var text string
+	var done *StreamEvent
+	for e := range stream.Events() {
+		time.Sleep(150 * time.Millisecond) // dawdle past the idle window on every event
+		switch e.Kind {
+		case StreamText:
+			text += e.Text
+		case StreamDone:
+			done = &e
+		}
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("slow consumer aborted a healthy stream: %v", err)
+	}
+	if done == nil {
+		t.Fatal("no StreamDone for a healthy stream read slowly")
+	}
+	if text != "xxx" {
+		t.Fatalf("text lost: %q", text)
+	}
+}

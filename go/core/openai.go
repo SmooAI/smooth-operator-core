@@ -552,8 +552,13 @@ func (g *GatewayClient) ChatStream(ctx context.Context, req ChatRequest) (<-chan
 		defer idle.Stop()
 
 		for {
+			// Arm around the Scan ONLY. Leaving it armed through the send below
+			// would put a slow CONSUMER on the same clock as a stalled server and
+			// abort a perfectly healthy stream.
 			idle.Reset(idleAfter)
-			if !scanner.Scan() {
+			ok := scanner.Scan()
+			idle.Stop()
+			if !ok {
 				break
 			}
 			line := strings.TrimSpace(scanner.Text())
@@ -582,23 +587,28 @@ func (g *GatewayClient) ChatStream(ctx context.Context, req ChatRequest) (<-chan
 				chunk.Usage = &Usage{PromptTokens: wc.Usage.PromptTokens, CompletionTokens: wc.Usage.CompletionTokens}
 			}
 			if !send(chunk) {
-				return
+				break // abandoned, or the watchdog fired — classified below
 			}
 		}
 
-		// THE bug this whole path exists to prevent: the scan loop also ends on
-		// error — a torn body, a reset connection, the overall requestTimeout, the
-		// idle watchdog, an over-long line. Never checking scanner.Err here is what
-		// made every one of those look like a clean finish.
-		if err := scanner.Err(); err != nil {
-			if cause := context.Cause(streamCtx); errors.Is(cause, errStreamIdle) {
-				err = fmt.Errorf("stream idle timeout: no data for %s", idleAfter)
-			}
-			// Deliberately NOT `send`: the watchdog reports a failure by cancelling
-			// streamCtx, so selecting on it here would race the error away and hand
-			// the consumer a clean close — the exact silent truncation this fixes.
-			// The CALLER's ctx is the honest liveness signal: if that is done, the
-			// consumer is gone and nobody is left to tell.
+		// ONE terminal check covering every way out of the loop except the clean
+		// `[DONE]` above, which returns before reaching here. Not checking
+		// scanner.Err is what made a torn body, a reset connection, an expired
+		// requestTimeout and an over-long line all look like a clean finish.
+		err := scanner.Err()
+		// The watchdog reports a stall by cancelling streamCtx, so it can surface
+		// either as a read error OR as a failed send (when it fires in the window
+		// between a successful Scan and its send). Both are the same stall, and
+		// classifying by cause catches both — an early version returned on the
+		// failed send and silently truncated in exactly that race.
+		if cause := context.Cause(streamCtx); errors.Is(cause, errStreamIdle) {
+			err = fmt.Errorf("stream idle timeout: no data for %s", idleAfter)
+		}
+		if err != nil {
+			// Deliberately NOT `send`: selecting on streamCtx here would race the
+			// error away, since the watchdog signals by cancelling it. The CALLER's
+			// ctx is the honest liveness signal — if that is done the consumer is
+			// gone and there is nobody left to tell.
 			select {
 			case ch <- ChatChunk{Err: fmt.Errorf("stream read error: %w", err)}:
 			case <-ctx.Done():
