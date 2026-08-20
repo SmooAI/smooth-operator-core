@@ -103,6 +103,13 @@ type ChatChunk struct {
 	// request, read from the response headers before the body was consumed. It
 	// arrives on the FIRST chunk, not the last.
 	CostUSD *float64
+	// Err, when non-nil, reports that the stream FAILED mid-flight (torn body,
+	// idle/overall timeout, malformed frame). It is the Go analogue of the
+	// reference engine's `Result<StreamEvent>` channel item: a stream that ends
+	// this way is truncated, not finished. The chunk carries no other payload and
+	// is the last one; the agent aborts the turn rather than emitting StreamDone,
+	// so a partial answer can never be checkpointed as a complete one.
+	Err error
 }
 
 // ToolCallDelta is one tool-call fragment within a streamed chunk.
@@ -116,10 +123,12 @@ type ToolCallDelta struct {
 // StreamingChatClient is the OPTIONAL streaming surface. A ChatClient that also
 // implements it can drive RunStream; the GatewayClient and MockLlmProvider both do.
 // ChatStream opens a streaming model call and returns a receive-only channel of
-// chunks. The channel is closed when the stream ends; any error is delivered via
-// the returned error (for connect-time failures) or — for a mid-stream failure —
-// stored and reported as documented by the implementation. Production wires this to
-// the OpenAI `create(..., stream=True)` surface.
+// chunks. The channel is closed when the stream ends; a connect-time failure comes
+// back as the returned error, and a MID-STREAM failure MUST arrive as a final
+// chunk with Err set (see ChatChunk.Err) — closing the channel silently on a torn
+// stream reports truncation as success. Implementations must also stop sending and
+// release their transport once ctx is done. Production wires this to the OpenAI
+// `create(..., stream=True)` surface.
 type StreamingChatClient interface {
 	ChatClient
 	ChatStream(ctx context.Context, req ChatRequest) (<-chan ChatChunk, error)
@@ -708,6 +717,19 @@ func (a *SmoothAgent) run(ctx context.Context, message string, history []ChatMes
 // returned *Stream's Err() after the channel drains. So a caller ranges the channel
 // to completion, then checks Err(); a clean turn ends with a StreamDone and Err()==nil.
 //
+// That includes a stream that is TRUNCATED rather than finished — an idle or overall
+// timeout, a torn connection (see ChatChunk.Err). Those abort the turn too: no
+// StreamDone, non-nil Err(), and the partial assistant text is neither appended to
+// the thread nor checkpointed. A half-answer must never be indistinguishable from a
+// whole one.
+//
+// SEP extension hooks run on this path exactly as they do on Run: `turn_start` at
+// the top, the `tool_call` veto/rewrite fold before every dispatch, and
+// `message_end`/`turn_end` before the terminal StreamDone.
+//
+// A caller that stops consuming early must call Stream.Close (or cancel ctx) to
+// release the turn goroutine and its model connection.
+//
 // NOTE: retry-with-backoff (MaxRetries/RetryBackoff) is intentionally NOT applied to
 // the streaming model call — re-running it after a mid-stream failure would re-emit
 // already-yielded chunks. Retry stays scoped to non-streaming Run (see callModel);
@@ -718,10 +740,17 @@ func (a *SmoothAgent) RunStream(ctx context.Context, message string, thread *Smo
 		return nil, fmt.Errorf("core: client does not implement StreamingChatClient (no ChatStream)")
 	}
 
+	// The turn runs under a context the Stream owns, so abandoning it (Close, or
+	// cancelling the caller's ctx) unblocks every send in the loop AND tears down
+	// the underlying model request. Without this the turn goroutine parks forever
+	// on an unbuffered send the moment a consumer stops ranging, holding its socket.
+	ctx, cancel := context.WithCancel(ctx)
 	events := make(chan StreamEvent)
-	stream := &Stream{events: events}
+	stream := &Stream{events: events, cancel: cancel}
 	go func() {
+		// LIFO: cancel first so the model-stream producer unblocks, then close.
 		defer close(events)
+		defer cancel()
 		if err := a.runStream(ctx, sc, message, thread, events); err != nil {
 			stream.mu.Lock()
 			stream.err = err
@@ -736,12 +765,23 @@ func (a *SmoothAgent) RunStream(ctx context.Context, message string, thread *Smo
 // aborted with a model error.
 type Stream struct {
 	events <-chan StreamEvent
+	cancel context.CancelFunc
 	mu     sync.Mutex
 	err    error
 }
 
 // Events returns the channel of streamed events. It is closed when the turn ends.
 func (s *Stream) Events() <-chan StreamEvent { return s.events }
+
+// Close abandons the turn: the loop stops, the in-flight model request is torn
+// down, and the events channel closes. It is safe to call more than once, and from
+// a different goroutine than the consumer.
+//
+// A consumer that drains Events() to completion need not call it. A consumer that
+// stops early MUST — Go channels give the sender no way to notice a receiver has
+// walked away (unlike the reference's `tx.send().is_err()`), so this is that
+// signal. `defer stream.Close()` is the safe habit.
+func (s *Stream) Close() { s.cancel() }
 
 // Err returns the error that aborted the turn, or nil if it completed cleanly.
 // Call it only after Events() has been fully drained (the channel closed).
@@ -751,7 +791,22 @@ func (s *Stream) Err() error {
 	return s.err
 }
 
+// emitStream delivers one event, or gives up if the turn's context is done —
+// which is what happens when the consumer abandons the stream (Stream.Close or a
+// cancelled ctx). A bare `out <-` parks forever instead, since the events channel
+// is unbuffered and nothing will ever receive.
+func emitStream(ctx context.Context, out chan<- StreamEvent, ev StreamEvent) error {
+	select {
+	case out <- ev:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (a *SmoothAgent) runStream(ctx context.Context, sc StreamingChatClient, message string, thread *SmoothAgentThread, out chan<- StreamEvent) error {
+	a.sepDispatch(sepTurnStart, map[string]any{"agent_id": a.options.Model})
+
 	messages := make([]ChatMessage, 0, 2)
 	if system := a.buildSystem(message); system != "" {
 		messages = append(messages, ChatMessage{Role: "system", Content: system})
@@ -835,6 +890,12 @@ func (a *SmoothAgent) runStream(ctx context.Context, sc StreamingChatClient, mes
 		var usage Usage
 		var gatewayCost *float64
 		for chunk := range chunks {
+			// A mid-stream failure aborts the turn. Falling through would append a
+			// TRUNCATED assistant message to history and emit StreamDone with
+			// Err()==nil — the silent data loss this contract exists to prevent.
+			if chunk.Err != nil {
+				return fmt.Errorf("model stream: %w", chunk.Err)
+			}
 			if chunk.Usage != nil {
 				usage = *chunk.Usage
 			}
@@ -843,7 +904,9 @@ func (a *SmoothAgent) runStream(ctx context.Context, sc StreamingChatClient, mes
 			}
 			if chunk.ContentDelta != "" {
 				content.WriteString(chunk.ContentDelta)
-				out <- StreamEvent{Kind: StreamText, Text: chunk.ContentDelta}
+				if err := emitStream(ctx, out, StreamEvent{Kind: StreamText, Text: chunk.ContentDelta}); err != nil {
+					return err
+				}
 			}
 			for _, d := range chunk.ToolCallDeltas {
 				cur, seen := partials[d.Index]
@@ -875,27 +938,41 @@ func (a *SmoothAgent) runStream(ctx context.Context, sc StreamingChatClient, mes
 		turnMessages = append(turnMessages, assistantMsg)
 
 		if tracker.Exceeds(a.options.Budget) {
-			out <- StreamEvent{Kind: StreamDone, Response: AgentRunResponse{Text: lastText, Iterations: iteration, ToolCalls: toolCalls, Usage: tracker.Usage, CostUSD: tracker.CostUSD, BudgetExceeded: true}}
-			return nil
+			a.sepTurnComplete(iteration, lastText)
+			return emitStream(ctx, out, StreamEvent{Kind: StreamDone, Response: AgentRunResponse{Text: lastText, Iterations: iteration, ToolCalls: toolCalls, Usage: tracker.Usage, CostUSD: tracker.CostUSD, BudgetExceeded: true}})
 		}
 
 		if len(assembled) == 0 {
-			out <- StreamEvent{Kind: StreamDone, Response: AgentRunResponse{Text: lastText, Iterations: iteration, ToolCalls: toolCalls, Usage: tracker.Usage, CostUSD: tracker.CostUSD}}
-			return nil
+			a.sepTurnComplete(iteration, lastText)
+			return emitStream(ctx, out, StreamEvent{Kind: StreamDone, Response: AgentRunResponse{Text: lastText, Iterations: iteration, ToolCalls: toolCalls, Usage: tracker.Usage, CostUSD: tracker.CostUSD}})
 		}
 
 		toolCalls += len(assembled)
-		// Emit a tool_call event per requested call (original order) BEFORE dispatch.
-		for _, tc := range assembled {
-			out <- StreamEvent{Kind: StreamToolCall, Name: tc.Name, Arguments: tc.Arguments}
+		// SEP `tool_call` hook — the SAME veto/rewrite fold Run does, for the same
+		// reason: an extension that can block a write tool on the non-streaming
+		// path but not the streaming one enforces nothing at all.
+		planned, sepBlocks := a.sepToolCallPlan(ctx, assembled)
+
+		// Emit a tool_call event per call (original order) BEFORE dispatch, with the
+		// POST-hook arguments, so the UI shows what will actually run. A vetoed call
+		// is still announced and still gets its StreamToolResult (carrying the veto
+		// reason), keeping the call/result pairing intact.
+		for _, tc := range planned {
+			if err := emitStream(ctx, out, StreamEvent{Kind: StreamToolCall, Name: tc.Name, Arguments: tc.Arguments}); err != nil {
+				return err
+			}
 		}
 		// Reuse the SAME dispatch path as Run (clearance, human-gate, tool_search,
 		// JSON parsing, error-to-string, ParallelToolCalls). Results surface in
 		// original call order so the event stream stays deterministic.
-		results := make([]ToolResult, len(assembled))
-		if a.options.ParallelToolCalls && len(assembled) > 1 {
+		results := make([]ToolResult, len(planned))
+		if a.options.ParallelToolCalls && len(planned) > 1 {
 			var wg sync.WaitGroup
-			for i, tc := range assembled {
+			for i, tc := range planned {
+				if reason, blocked := sepBlocks[tc.ID]; blocked {
+					results[i] = ToolResult{ToolCallID: tc.ID, Content: sepBlockedResult(reason), IsError: true}
+					continue
+				}
 				wg.Add(1)
 				go func(i int, tc ToolCall) {
 					defer wg.Done()
@@ -904,20 +981,26 @@ func (a *SmoothAgent) runStream(ctx context.Context, sc StreamingChatClient, mes
 			}
 			wg.Wait()
 		} else {
-			for i, tc := range assembled {
+			for i, tc := range planned {
+				if reason, blocked := sepBlocks[tc.ID]; blocked {
+					results[i] = ToolResult{ToolCallID: tc.ID, Content: sepBlockedResult(reason), IsError: true}
+					continue
+				}
 				results[i] = a.dispatchToolResult(ctx, tc, search)
 			}
 		}
-		for i, tc := range assembled {
+		for i, tc := range planned {
 			toolMsg := ChatMessage{Role: "tool", ToolCallID: tc.ID, Content: results[i].Content}
 			messages = append(messages, toolMsg)
 			turnMessages = append(turnMessages, toolMsg)
-			out <- StreamEvent{Kind: StreamToolResult, Name: tc.Name, Result: results[i].Content, Details: results[i].Details}
+			if err := emitStream(ctx, out, StreamEvent{Kind: StreamToolResult, Name: tc.Name, Result: results[i].Content, Details: results[i].Details}); err != nil {
+				return err
+			}
 		}
 	}
 
-	out <- StreamEvent{Kind: StreamDone, Response: AgentRunResponse{Text: lastText, Iterations: maxIter, ToolCalls: toolCalls, Usage: tracker.Usage, CostUSD: tracker.CostUSD}}
-	return nil
+	a.sepTurnComplete(maxIter, lastText)
+	return emitStream(ctx, out, StreamEvent{Kind: StreamDone, Response: AgentRunResponse{Text: lastText, Iterations: maxIter, ToolCalls: toolCalls, Usage: tracker.Usage, CostUSD: tracker.CostUSD}})
 }
 
 // callModel invokes the model with bounded retry-with-exponential-backoff.
