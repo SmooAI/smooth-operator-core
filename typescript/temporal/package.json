@@ -1,6 +1,6 @@
 {
 	"name": "@smooai/smooth-operator-temporal",
-	"version": "1.9.7",
+	"version": "1.9.8",
 	"description": "Optional Temporal-backed durable execution backend for the smooth-operator agent engine (ADR-030). The TypeScript sibling of the Rust `smooth-operator-temporal` crate — an agent turn runs as a Temporal workflow whose model call and tool invocations are activities, driving the same `driveTurn` loop as the in-process executor.",
 	"type": "module",
 	"license": "MIT",
