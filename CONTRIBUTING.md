@@ -4,11 +4,11 @@ Thanks for being here. This file is the short version of how this repo actually 
 that will get a PR sent back if you skip them. It is deliberately specific to
 smooth-operator-core rather than generic advice.
 
-Questions, ideas, and "am I holding this right?" belong in
-[Discussions](https://github.com/SmooAI/smooth-operator-core/discussions). Bugs and concrete feature
-requests belong in [Issues](https://github.com/SmooAI/smooth-operator-core/issues). Suspected
-vulnerabilities go to [security@smoo.ai](mailto:security@smoo.ai) and nowhere public — see
-[SECURITY.md](./SECURITY.md).
+**Where things go** — the last one is the rule people get wrong, and getting it wrong publishes a zero-day:
+
+- **Bug or concrete task** → [an Issue](https://github.com/SmooAI/smooth-operator-core/issues)
+- **Question, idea, or "how do I…"** → [a Discussion](https://github.com/SmooAI/smooth-operator-core/discussions), where it stays searchable for the next person who asks
+- **Security vulnerability** → the private channel in [SECURITY.md](./SECURITY.md) ([security@smoo.ai](mailto:security@smoo.ai)), **never** either of the public two
 
 ## The four things that matter
 
