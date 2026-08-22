@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -751,10 +753,21 @@ func (a *SmoothAgent) RunStream(ctx context.Context, message string, thread *Smo
 		// LIFO: cancel first so the model-stream producer unblocks, then close.
 		defer close(events)
 		defer cancel()
+		// Backstop: the turn owns this goroutine, so a panic anywhere in it (a hook,
+		// a checkpoint store, the streaming client) would crash the whole process
+		// rather than the turn. Report it through the documented Stream error contract
+		// instead — channel closed without a StreamDone, reason in Err() — which is
+		// what Rust gets for free by confining a turn to its JoinHandle. Registered
+		// LAST so it runs FIRST: Err() is set before cancel and before the close a
+		// draining consumer is waiting on.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("core: streaming turn panicked: %v\n%s", r, debug.Stack())
+				stream.setErr(fmt.Errorf("core: streaming turn panicked: %v", r))
+			}
+		}()
 		if err := a.runStream(ctx, sc, message, thread, events); err != nil {
-			stream.mu.Lock()
-			stream.err = err
-			stream.mu.Unlock()
+			stream.setErr(err)
 		}
 	}()
 	return stream, nil
@@ -782,6 +795,12 @@ func (s *Stream) Events() <-chan StreamEvent { return s.events }
 // walked away (unlike the reference's `tx.send().is_err()`), so this is that
 // signal. `defer stream.Close()` is the safe habit.
 func (s *Stream) Close() { s.cancel() }
+
+func (s *Stream) setErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.err = err
+}
 
 // Err returns the error that aborted the turn, or nil if it completed cleanly.
 // Call it only after Events() has been fully drained (the channel closed).
@@ -1032,6 +1051,26 @@ func (a *SmoothAgent) callModel(ctx context.Context, req ChatRequest) (ChatRespo
 	}
 }
 
+// safeExecute runs a host tool, turning a panic into an ordinary tool error so a
+// buggy tool fails ITS call instead of unwinding the goroutine — Go escalates an
+// unrecovered panic to a process-wide crash, killing every other live turn on the
+// pod. The recover has to live HERE, in the frame that calls Execute: under
+// ParallelToolCalls each dispatch runs on its own goroutine, and recover() only
+// catches panics on the goroutine that deferred it, so no caller-side guard can
+// reach these. Mirrors TypeScript/Python core, whose catch around execute() already
+// converts a throwing tool into an IsError result the model can react to.
+func safeExecute(ctx context.Context, tool Tool, args map[string]any) (out string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Stack goes to the process log, never into Content — the model sees the
+			// same shape as any other tool failure, operators get the diagnostic.
+			log.Printf("core: tool %q panicked: %v\n%s", tool.Name(), r, debug.Stack())
+			out, err = "", fmt.Errorf("panicked: %v", r)
+		}
+	}()
+	return tool.Execute(ctx, args)
+}
+
 func (a *SmoothAgent) dispatchTool(ctx context.Context, tc ToolCall, search *ToolSearch) string {
 	return a.dispatchToolResult(ctx, tc, search).Content
 }
@@ -1106,7 +1145,7 @@ func (a *SmoothAgent) dispatchToolResult(ctx context.Context, tc ToolCall, searc
 		}
 	}
 
-	out, err := tool.Execute(ctx, args)
+	out, err := safeExecute(ctx, tool, args)
 	// Wrap the outcome so PostCall hooks can redact Content in place before it
 	// reaches the model. A tool error becomes an IsError result the hooks still see.
 	result := ToolResult{ToolCallID: tc.ID, Content: out}
