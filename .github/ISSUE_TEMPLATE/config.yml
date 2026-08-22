@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+    - name: Question, idea, or "am I holding this right?"
+      url: https://github.com/SmooAI/smooth-operator-core/discussions
+      about: Usage questions, design discussion, and half-formed ideas belong in Discussions, where they're easier to shape than in an issue thread.
+    - name: Report a security vulnerability
+      url: https://github.com/SmooAI/smooth-operator-core/blob/main/SECURITY.md
+      about: Do not open a public issue. Email security@smoo.ai — see SECURITY.md for what to include.
+    - name: Contributing guide
+      url: https://github.com/SmooAI/smooth-operator-core/blob/main/CONTRIBUTING.md
+      about: How this repo works — the changeset anchor, Rust as the reference implementation, spec/ codegen, and the test expectations.

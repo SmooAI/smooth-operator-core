@@ -1,0 +1,50 @@
+name: Feature request
+description: Propose a capability or a change in behavior.
+labels: ['enhancement']
+body:
+    - type: markdown
+      attributes:
+          value: |
+              If you're exploring an idea rather than proposing a specific change, [Discussions](https://github.com/SmooAI/smooth-operator-core/discussions) is the better place to start — it's easier to shape something there than in an issue thread.
+
+    - type: textarea
+      id: problem
+      attributes:
+          label: The problem
+          description: What are you trying to do that you can't do today? Describe the situation, not the solution — the best fix is often not the one the reporter had in mind.
+      validations:
+          required: true
+
+    - type: textarea
+      id: proposal
+      attributes:
+          label: What you have in mind
+          description: The shape of the change, if you have one. API sketches and protocol frames welcome.
+
+    - type: dropdown
+      id: languages
+      attributes:
+          label: Which languages does this need to reach?
+          description: Behavior changes start in the Rust reference and the ports follow, so a feature is rarely one language's problem. Tick everything you'd need.
+          multiple: true
+          options:
+              - Rust
+              - TypeScript / JavaScript
+              - Python
+              - Go
+              - .NET / C#
+              - The wire protocol (spec/) — this changes what goes over the socket
+
+    - type: textarea
+      id: alternatives
+      attributes:
+          label: What you tried or considered instead
+          description: Including "I worked around it by…" — the workaround tells us how much this hurts.
+
+    - type: checkboxes
+      id: contribute
+      attributes:
+          label: Would you be up for implementing it?
+          options:
+              - label: I'd be willing to open a PR for this (we'll help — see CONTRIBUTING.md)
+                required: false
