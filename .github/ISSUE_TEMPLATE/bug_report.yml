@@ -1,0 +1,80 @@
+name: Bug report
+description: Something behaves differently than documented, or differently than the Rust reference.
+labels: ['bug']
+body:
+    - type: markdown
+      attributes:
+          value: |
+              Thanks for the report.
+
+              **If this is a security vulnerability, stop and email [security@smoo.ai](mailto:security@smoo.ai) instead.**
+              Please do not describe it here — see [SECURITY.md](https://github.com/SmooAI/smooth-operator-core/blob/main/SECURITY.md).
+
+              Not sure it's a bug? [Discussions](https://github.com/SmooAI/smooth-operator-core/discussions) is a better first stop.
+
+    - type: dropdown
+      id: language
+      attributes:
+          label: Language / port
+          description: Which implementation are you using? Rust is the reference; a bug in one port is often absent in the others, and knowing which one narrows it fast.
+          multiple: true
+          options:
+              - Rust
+              - TypeScript / JavaScript
+              - Python
+              - Go
+              - .NET / C#
+              - The wire protocol (spec/) itself
+              - Not sure
+      validations:
+          required: true
+
+    - type: input
+      id: version
+      attributes:
+          label: Version
+          description: The published version you are on. Every artifact ships at one lockstep version, so this is the same number in every language.
+          placeholder: e.g. 1.13.2
+      validations:
+          required: true
+
+    - type: dropdown
+      id: usage
+      attributes:
+          label: How are you using the engine?
+          options:
+              - Embedded as a library in my own app
+              - With the Temporal durable-execution backend
+              - Through smooth-operator (the agent service built on this engine)
+              - Through the Smoo AI platform
+              - Other
+      validations:
+          required: true
+
+    - type: textarea
+      id: what-happened
+      attributes:
+          label: What happened
+          description: What you saw, and what you expected instead. If the Rust reference behaves differently from the port you are using, say so — that comparison is often the whole diagnosis.
+      validations:
+          required: true
+
+    - type: textarea
+      id: repro
+      attributes:
+          label: Reproduction
+          description: The smallest thing that shows it. Code, a protocol frame, or a failing test is ideal.
+          render: shell
+
+    - type: textarea
+      id: logs
+      attributes:
+          label: Logs or error output
+          description: Redact anything sensitive — tokens, customer data, conversation content.
+          render: shell
+
+    - type: textarea
+      id: context
+      attributes:
+          label: Anything else
+          description: Model and provider in play, checkpointer/memory backend, tools registered, whether a deny policy is involved — whatever seems relevant.

@@ -6,6 +6,7 @@
   <a href="https://smoo.ai/th"><img src="https://img.shields.io/badge/Smoo_AI-platform-00A6A6?style=for-the-badge&labelColor=020618" alt="Smoo AI"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-F49F0A?style=for-the-badge&labelColor=020618" alt="license"></a>
   <a href="https://github.com/SmooAI/smooth-operator"><img src="https://img.shields.io/badge/5_languages_·_one_engine-FF6B6C?style=for-the-badge&labelColor=020618" alt="5 languages · one engine"></a>
+  <a href="https://github.com/SmooAI/smooth-operator-core/discussions"><img src="https://img.shields.io/badge/community-Discussions-00A6A6?style=for-the-badge&labelColor=020618" alt="GitHub Discussions"></a>
 </p>
 
 <p align="center">
@@ -551,7 +552,15 @@ The ports follow a **protocol-first** strategy: a stable wire spec each language
 
 ## Contributing
 
-Issues and PRs welcome. Keep the engine test-first: every change ships with the offline `MockLlmClient` coverage that proves the loop still holds.
+Issues and PRs welcome — start with [**CONTRIBUTING.md**](CONTRIBUTING.md), which covers the lockstep changeset anchor, Rust as the reference implementation, `spec/` codegen, and how to run each language's tests. Keep the engine test-first: every change ships with the offline `MockLlmClient` coverage that proves the loop still holds.
+
+Where things go:
+
+- **Bug or concrete task** → [an Issue](https://github.com/SmooAI/smooth-operator-core/issues)
+- **Question, idea, or "how do I…"** → [a Discussion](https://github.com/SmooAI/smooth-operator-core/discussions)
+- **Security vulnerability** → the private channel in [SECURITY.md](SECURITY.md), never either of the public two
+
+By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
