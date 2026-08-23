@@ -8,7 +8,7 @@ smooth-operator-core rather than generic advice.
 
 - **Bug or concrete task** → [an Issue](https://github.com/SmooAI/smooth-operator-core/issues)
 - **Question, idea, or "how do I…"** → [a Discussion](https://github.com/SmooAI/smooth-operator-core/discussions), where it stays searchable for the next person who asks
-- **Security vulnerability** → the private channel in [SECURITY.md](./SECURITY.md) ([security@smoo.ai](mailto:security@smoo.ai)), **never** either of the public two
+- **Security vulnerability** → the private channel in [SECURITY.md](./SECURITY.md) ([dev@smoo.ai](mailto:dev@smoo.ai)), **never** either of the public two
 
 ## The four things that matter
 

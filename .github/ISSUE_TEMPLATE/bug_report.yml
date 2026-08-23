@@ -7,7 +7,7 @@ body:
           value: |
               Thanks for the report.
 
-              **If this is a security vulnerability, stop and email [security@smoo.ai](mailto:security@smoo.ai) instead.**
+              **If this is a security vulnerability, stop and email [dev@smoo.ai](mailto:dev@smoo.ai) instead.**
               Please do not describe it here — see [SECURITY.md](https://github.com/SmooAI/smooth-operator-core/blob/main/SECURITY.md).
 
               Not sure it's a bug? [Discussions](https://github.com/SmooAI/smooth-operator-core/discussions) is a better first stop.

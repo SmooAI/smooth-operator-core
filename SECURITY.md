@@ -7,18 +7,12 @@ repository. Please report suspected vulnerabilities privately.
 
 ## Reporting a vulnerability
 
-**Email [security@smoo.ai](mailto:security@smoo.ai).**
+**Use [GitHub private vulnerability reporting](https://github.com/SmooAI/smooth-operator-core/security/advisories/new)** —
+it gives you a tracked, private thread with the maintainers and a path to a CVE. If you would
+rather not use GitHub, email [dev@smoo.ai](mailto:dev@smoo.ai) instead.
 
 Please do **not** open a public issue, a Discussion, or a pull request for a suspected
 vulnerability. A public report is a public exploit for everyone running the affected version.
-
-<!--
-TODO(maintainers): GitHub private vulnerability reporting is DISABLED on this repo
-(checked 2026-08-22: `gh api repos/SmooAI/smooth-operator-core/private-vulnerability-reporting`
-returned {"enabled":false}). Enable it under Settings → Security → "Private vulnerability
-reporting", then list https://github.com/SmooAI/smooth-operator-core/security/advisories/new above
-as the preferred channel — it gives reporters a tracked thread and a CVE path that email does not.
--->
 
 Include whatever you have; a partial report is better than a silent one:
 
@@ -43,7 +37,7 @@ We ask that you give us a reasonable window to ship a fix before disclosing publ
 credit you in the advisory unless you would rather stay anonymous.
 
 <!--
-TODO(maintainers): if someone takes ownership of the security@smoo.ai rota and can commit to a
+TODO(maintainers): if someone takes ownership of the dev@smoo.ai rota and can commit to a
 concrete acknowledgement window (e.g. "within N business days"), replace the paragraph above with
 that number. It was left unquantified deliberately rather than promising a response time nobody
 had agreed to.
@@ -71,4 +65,4 @@ agent run.
 Out of scope: findings that require an already-compromised host or an already-leaked credential,
 missing hardening with no demonstrated impact, and results from automated scanners submitted without
 a working proof of concept. Vulnerabilities in the hosted Smoo AI platform (rather than this code)
-also go to security@smoo.ai — same address, we will route it.
+also go to dev@smoo.ai — same address, we will route it.
