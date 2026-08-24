@@ -12,4 +12,4 @@
 [tools]
 node = "24.14.0"  # ships npm 11.9.0 — required (>=11.5.1) for npm OIDC trusted publishing
 go = "1.26"
-uv = "latest"
+uv = "0.12.2"   # matches the pin py-checks/release/publish-pypi used; uv.lock was resolved with it
