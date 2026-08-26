@@ -6,10 +6,13 @@
  * Publishes the ONE lockstep version to every polyglot registry:
  *
  *   • npm      — @smooai/smooth-operator-core          (typescript/core)
+ *   • npm      — @smooai/smooth-operator-temporal      (typescript/temporal)
  *   • crates.io— smooai-smooth-operator-core           (rust/smooth-operator-core)
  *   • crates.io— smooai-smooth-operator-temporal       (rust/smooth-operator-temporal)
  *   • NuGet    — SmooAI.SmoothOperator.Core            (dotnet/core)
+ *   • NuGet    — SmooAI.SmoothOperator.Temporal        (dotnet/temporal)
  *   • PyPI     — smooai-smooth-operator-core           (python/core)
+ *   • PyPI     — smooai-smooth-operator-temporal       (python/temporal)
  *   • Go       — git tag go/vX.Y.Z                     (go/  — "publish" == tag)
  *
  * ── SAFETY (these are IRREVERSIBLE registries — a NuGet/PyPI/crates version can
@@ -155,6 +158,30 @@ const registries = [
         },
     },
     {
+        // MUST come after npm core: pnpm rewrites the `workspace:*` dependency
+        // to the concrete core version at pack time, and that version has to be
+        // resolvable on npm. th-8a0b45: this row (and its NuGet/PyPI siblings
+        // below) simply did not exist, so the packages shipped in core
+        // #168/#169/#173 were never published anywhere while every release run
+        // reported success.
+        name: "npm (temporal)",
+        artifact: `@smooai/smooth-operator-temporal@${version}`,
+        exists: () => npmHasVersion("@smooai/smooth-operator-temporal", version),
+        tool: "pnpm",
+        publish(dry) {
+            // Dep-inclusive filter: builds core first even when the core row
+            // was skipped as already-published (rows are independent).
+            run("pnpm", ["--filter", "@smooai/smooth-operator-temporal...", "build"]);
+            const flags = ["--filter", "@smooai/smooth-operator-temporal", "publish", "--no-git-checks", "--access", "public"];
+            if (dry) {
+                run("pnpm", [...flags, "--dry-run"]);
+                return;
+            }
+            requireEnv("NODE_AUTH_TOKEN");
+            run("pnpm", flags, { env: { ...process.env, NPM_CONFIG_PROVENANCE: "true" } });
+        },
+    },
+    {
         name: "crates.io",
         artifact: `smooai-smooth-operator-core@${version}`,
         exists: () => cratesHasVersion("smooai-smooth-operator-core", version),
@@ -202,6 +229,22 @@ const registries = [
         },
     },
     {
+        // After NuGet core: the ProjectReference packs as a dependency on the
+        // Core package at this same version. Own out dir so a skipped core row
+        // leaves nothing stale to re-push.
+        name: "NuGet (temporal)",
+        artifact: `SmooAI.SmoothOperator.Temporal@${version}`,
+        exists: () => nugetHasVersion("SmooAI.SmoothOperator.Temporal", version),
+        tool: "dotnet",
+        publish(dry) {
+            run("dotnet", ["pack", "dotnet/temporal/src/SmooAI.SmoothOperator.Temporal.csproj", "-c", "Release", "-o", "dist-temporal"]);
+            if (!existsSync(resolve(root, "dist-temporal"))) throw new Error("dotnet pack produced no dist-temporal/ output");
+            if (dry) return;
+            const apiKey = requireEnv("NUGET_API_KEY");
+            run("dotnet", ["nuget", "push", "dist-temporal/*.nupkg", "--api-key", apiKey, "--source", "https://api.nuget.org/v3/index.json", "--skip-duplicate"]);
+        },
+    },
+    {
         name: "PyPI",
         artifact: `smooai-smooth-operator-core@${version}`,
         exists: () => pypiHasVersion("smooai-smooth-operator-core", version),
@@ -212,6 +255,21 @@ const registries = [
             if (dry) return;
             requireEnv("UV_PUBLISH_TOKEN");
             // --check-url makes a re-run of an already-published version a no-op.
+            run("uv", ["publish", "--check-url", "https://pypi.org/simple/"], { cwd });
+        },
+    },
+    {
+        // After PyPI core: the wheel depends on smooai-smooth-operator-core>=1.8,
+        // which resolves only once core is on the index.
+        name: "PyPI (temporal)",
+        artifact: `smooai-smooth-operator-temporal@${version}`,
+        exists: () => pypiHasVersion("smooai-smooth-operator-temporal", version),
+        tool: "uv",
+        publish(dry) {
+            const cwd = resolve(root, "python/temporal");
+            run("uv", ["build"], { cwd });
+            if (dry) return;
+            requireEnv("UV_PUBLISH_TOKEN");
             run("uv", ["publish", "--check-url", "https://pypi.org/simple/"], { cwd });
         },
     },

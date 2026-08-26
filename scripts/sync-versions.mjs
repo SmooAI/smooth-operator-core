@@ -66,6 +66,30 @@ const anchors = [
         pattern: /(name = "smooai-smooth-operator-temporal"\nversion = ")[^"]+(")/,
     },
     {
+        // The three non-Rust temporal siblings (core #168/#169/#173) were never
+        // anchored, so they drifted at their birth versions while every release
+        // moved past them — and ci-publish would have shipped the WRONG version
+        // had it known about them at all (th-8a0b45).
+        label: "TS temporal package (package.json version)",
+        path: "typescript/temporal/package.json",
+        pattern: /("name": "@smooai\/smooth-operator-temporal",\s*\n\s*"version": ")[^"]+(")/,
+    },
+    {
+        label: ".NET temporal package (csproj <Version>)",
+        path: "dotnet/temporal/src/SmooAI.SmoothOperator.Temporal.csproj",
+        pattern: /(<Version>)[^<]+(<\/Version>)/,
+    },
+    {
+        label: "Python temporal package (pyproject [project] version)",
+        path: "python/temporal/pyproject.toml",
+        pattern: /(name = "smooai-smooth-operator-temporal"\nversion = ")[^"]+(")/,
+    },
+    {
+        label: "Python temporal lockfile (uv.lock local package version)",
+        path: "python/temporal/uv.lock",
+        pattern: /(name = "smooai-smooth-operator-temporal"\nversion = ")[^"]+(")/,
+    },
+    {
         label: ".NET package (csproj <Version>)",
         path: "dotnet/core/src/SmooAI.SmoothOperator.Core.csproj",
         pattern: /(<Version>)[^<]+(<\/Version>)/,
