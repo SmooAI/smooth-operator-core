@@ -1,6 +1,6 @@
 [project]
 name = "smooai-smooth-operator-temporal"
-version = "1.13.4"
+version = "1.13.5"
 description = "Optional Temporal-backed durable execution backend for the smooth-operator Python agent engine (ADR-030). The Python sibling of the smooai-smooth-operator-temporal Rust crate."
 readme = "README.md"
 license = { text = "MIT" }
