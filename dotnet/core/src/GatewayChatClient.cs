@@ -263,6 +263,12 @@ public sealed class GatewayChatClient : IChatClient
         if (stream)
         {
             body["stream"] = true;
+            // Ask the gateway to emit a trailing usage chunk. Without it a streaming
+            // response carries NO token counts (the gateway only sends usage when
+            // stream_options.include_usage is set), so eventual_response.usage came back
+            // empty and per-turn cost read $0 (th-58db12). The JS SDK sets this
+            // implicitly; the raw HTTP clients (this one, Go, Python, Rust) must set it.
+            body["stream_options"] = new JsonObject { ["include_usage"] = true };
         }
         // Top-level OpenAI-compat `metadata` (LiteLLM records it on spend logs). Omitted
         // entirely when unset so the wire is byte-identical to a client without the field

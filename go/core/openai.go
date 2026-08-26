@@ -175,6 +175,12 @@ type wireRequest struct {
 	Temperature float64       `json:"temperature"`
 	MaxTokens   int           `json:"max_tokens"`
 	Stream      bool          `json:"stream,omitempty"`
+	// Ask the gateway to emit a trailing usage chunk on a streaming call. Without
+	// it a streaming response carries NO token counts (the gateway only sends usage
+	// when stream_options.include_usage is set), so eventual_response.usage came
+	// back empty and per-turn cost read $0 (th-58db12). Pointer + omitempty keeps
+	// the non-streaming request byte-identical.
+	StreamOptions *wireStreamOptions `json:"stream_options,omitempty"`
 	// Top-level OpenAI-compat `metadata` object — LiteLLM records it on spend
 	// logs. omitempty keeps the wire byte-identical when unset (Rust parity).
 	Metadata map[string]any `json:"metadata,omitempty"`
@@ -188,6 +194,13 @@ type wireRequest struct {
 type wireResponseFormat struct {
 	Type       string         `json:"type"`
 	JSONSchema wireJSONSchema `json:"json_schema"`
+}
+
+// wireStreamOptions is the OpenAI-compatible `stream_options` object. Only
+// `include_usage` is used: it makes the gateway append a final chunk carrying the
+// turn's token counts (see StreamOptions on wireRequest).
+type wireStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type wireJSONSchema struct {
@@ -326,6 +339,11 @@ func wrapWithCacheControl(existing any) any {
 // to what it was before caching existed.
 func buildWireRequest(req ChatRequest, stream bool, apiURL ...string) wireRequest {
 	wreq := wireRequest{Model: req.Model, Temperature: req.Temperature, MaxTokens: req.MaxTokens, Stream: stream, Metadata: normalizeMetadata(req.Metadata)}
+	// Streaming only: request the trailing usage chunk so token counts (and thus
+	// per-turn cost) aren't lost (th-58db12).
+	if stream {
+		wreq.StreamOptions = &wireStreamOptions{IncludeUsage: true}
+	}
 	for _, m := range req.Messages {
 		wm := wireMessage{Role: m.Role, Content: messageContent(m), ToolCallID: m.ToolCallID}
 		for _, tc := range m.ToolCalls {

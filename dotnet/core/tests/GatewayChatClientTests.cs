@@ -221,6 +221,23 @@ public class GatewayChatClientTests : IDisposable
         Assert.True(FirstRequest["stream"]!.GetValue<bool>());
     }
 
+    /// Regression for th-58db12: a streaming request must ask for the trailing usage
+    /// chunk (stream_options.include_usage), or the gateway sends no usage on a
+    /// streaming response and token counts (hence per-turn cost) are lost.
+    [Fact]
+    public async Task StreamingRequestAsksForUsage()
+    {
+        Serve(deltas: ["hi"], usage: (4, 1));
+        using var client = Client();
+
+        await foreach (var _ in client.GetStreamingResponseAsync([new ChatMessage(ChatRole.User, "hi")]))
+        {
+        }
+        await _serving!;
+
+        Assert.True(FirstRequest["stream_options"]!["include_usage"]!.GetValue<bool>());
+    }
+
     [Fact]
     public async Task ReadsTheCostHeaderBeforeTheSseBody()
     {

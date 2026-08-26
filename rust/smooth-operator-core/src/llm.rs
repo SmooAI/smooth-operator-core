@@ -1151,10 +1151,18 @@ impl LlmClient {
         let url = format!("{}/chat/completions", self.config.api_url);
 
         let mut request_body = serde_json::to_value(&request)?;
-        request_body
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("serialized request is not a JSON object"))?
-            .insert("stream".into(), serde_json::Value::Bool(true));
+        {
+            let obj = request_body
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("serialized request is not a JSON object"))?;
+            obj.insert("stream".into(), serde_json::Value::Bool(true));
+            // Ask the gateway to emit a trailing usage chunk. Without it, a streaming
+            // response carries NO token counts (the gateway only sends `usage` when
+            // `stream_options.include_usage` is set), so `eventual_response.usage` came
+            // back empty and per-turn cost read $0 (th-58db12). The JS SDK sets this
+            // implicitly; the raw HTTP clients (rust/go/python/dotnet) must set it.
+            obj.insert("stream_options".into(), serde_json::json!({ "include_usage": true }));
+        }
 
         // Retry BEFORE reading any stream bytes — idempotent, since no partial
         // response has been emitted yet. Mirrors the non-streaming `chat()` retry:
@@ -3830,6 +3838,47 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         // The stream still accumulates normally alongside the cost event.
         assert_eq!(response.content, "hi");
         assert_eq!(response.usage.total_tokens, 12);
+    }
+
+    /// Regression for th-58db12: a streaming request MUST ask for the trailing
+    /// usage chunk (`stream_options.include_usage`). Without it the gateway sends
+    /// no usage on a streaming response, so token counts (and per-turn cost) are
+    /// lost — every polyglot engine reported $0.
+    #[tokio::test]
+    async fn chat_stream_requests_include_usage() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\ndata: [DONE]\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+
+        let mut config = LlmConfig::openrouter("test-key");
+        config.api_url = format!("http://{addr}");
+        config.model = "test-model".into();
+        let client = LlmClient::new(config);
+        let user = Message::user("hello");
+        let msgs = vec![&user];
+        let stream = client.chat_stream(&msgs, &[]).await.expect("chat_stream should succeed");
+        let _ = accumulate_stream_events(stream).await.expect("accumulate should succeed");
+
+        let request = rx.await.expect("request captured");
+        assert!(
+            request.contains("\"stream_options\"") && request.contains("\"include_usage\":true"),
+            "streaming request must set stream_options.include_usage; body was:\n{request}"
+        );
     }
 
     /// The margin-bearing header wins over the raw upstream cost, matching the

@@ -791,6 +791,12 @@ class SmoothAgent:
             temperature=self._options.temperature,
             max_tokens=effective_max_tokens(self._options.max_tokens, self._options.model_max_output),
             stream=True,
+            # Ask the gateway to emit a trailing usage chunk. Without it a streaming
+            # response carries NO token counts (the gateway only sends usage when
+            # stream_options.include_usage is set), so eventual_response.usage came back
+            # empty and per-turn cost read $0 (th-58db12). The JS SDK sets this
+            # implicitly; the Python/raw clients must set it explicitly.
+            stream_options={"include_usage": True},
             # Empty/None metadata sends nothing — wire-identical to unset (Rust parity).
             **({"metadata": self._options.metadata} if self._options.metadata else {}),
         )
