@@ -282,6 +282,145 @@ impl AgentTurnWorkflow {
     }
 }
 
+/// Configuration for a [`TemporalExecutor`].
+///
+/// ## The engine-handle split (mirrors the TS/Go/Python/.NET executors)
+///
+/// A durable turn has two halves in two processes: the **worker** holds the
+/// model client + tool *implementations* (installed via [`init_engine`]); this
+/// **executor** (client side) holds the turn *configuration* — system prompt,
+/// tool *schemas*, approval/wait policy — supplied here. That is why
+/// [`TemporalExecutor::execute`] reads its prompt/tools from these options
+/// rather than off the passed [`Agent`] (whose config is private and lives,
+/// conceptually, in the worker process). The user message IS honored per call.
+#[derive(Debug, Clone, Default)]
+pub struct TemporalExecutorOptions {
+    /// The task queue the worker polls (must match the worker's).
+    pub task_queue: String,
+    /// System prompt for every turn this executor runs.
+    pub system_prompt: String,
+    /// Tool schemas offered to the model (implementations live in the worker).
+    pub tools: Vec<ToolSchema>,
+    /// Iteration bound; `0` uses the engine default.
+    pub max_iterations: u32,
+    /// Tool names gated behind durable human approval (the
+    /// [`AgentTurnWorkflow::approve_tool`] / [`AgentTurnWorkflow::deny_tool`]
+    /// signals, sent through an SDK workflow handle).
+    pub approval_required_tools: Vec<String>,
+    /// Name of the built-in durable wait tool, if any.
+    pub wait_tool: Option<String>,
+    /// Prefix for generated workflow ids (empty ⇒ `"agent-turn"`).
+    pub workflow_id_prefix: String,
+}
+
+/// The Temporal-backed [`AgentExecutor`] — the durable sibling of the engine's
+/// zero-infra `InProcessExecutor`, and the Rust parity of the TS/Go/Python/.NET
+/// `TemporalAgentExecutor`s (ADR-030, th-db0816).
+///
+/// It runs a turn by starting [`AgentTurnWorkflow`] on a Temporal cluster and
+/// awaiting its resulting [`Conversation`]. A consumer swaps
+/// `InProcessExecutor` for this with no other change — the turn now survives a
+/// worker crash, gets durable HITL via the workflow's `approve_tool` /
+/// `deny_tool` signals, and can pause on a durable timer.
+///
+/// Known ADR-030 gaps, shared deliberately with the four ports: the durable
+/// path yields only a terminal result (no token-delta stream — a workflow's
+/// progress is its history, not a live channel), and the turn seeds from these
+/// options only (no prior-thread history injection yet).
+pub struct TemporalExecutor {
+    client: temporalio_client::Client,
+    options: TemporalExecutorOptions,
+}
+
+impl TemporalExecutor {
+    /// Build an executor over a connected client.
+    #[must_use]
+    pub fn new(client: temporalio_client::Client, options: TemporalExecutorOptions) -> Self {
+        Self { client, options }
+    }
+
+    /// Start [`AgentTurnWorkflow`] for `user_message` and return its handle's
+    /// workflow id plus the awaited conversation.
+    async fn run_workflow(&self, user_message: String) -> anyhow::Result<Conversation> {
+        use temporalio_client::{WorkflowGetResultOptions, WorkflowStartOptions};
+
+        let input = AgentTurnInput {
+            system_prompt: self.options.system_prompt.clone(),
+            user_message,
+            tools: self.options.tools.clone(),
+            max_iterations: self.options.max_iterations,
+            approval_required_tools: self.options.approval_required_tools.clone(),
+            wait_tool: self.options.wait_tool.clone(),
+        };
+        let handle = self
+            .client
+            .start_workflow(
+                AgentTurnWorkflow::run,
+                input,
+                WorkflowStartOptions::new(self.options.task_queue.clone(), self.workflow_id()).build(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("start AgentTurnWorkflow: {e}"))?;
+        handle
+            .get_result(WorkflowGetResultOptions::default())
+            .await
+            .map_err(|e| anyhow::anyhow!("AgentTurnWorkflow result: {e}"))
+    }
+
+    /// A unique workflow id: `{prefix}-{nanos}-{seq}`. No uuid dependency — the
+    /// timestamp+counter pair is unique per process, and Temporal rejects a
+    /// collision loudly rather than corrupting anything.
+    fn workflow_id(&self) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let prefix = if self.options.workflow_id_prefix.is_empty() {
+            "agent-turn"
+        } else {
+            &self.options.workflow_id_prefix
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{prefix}-{nanos:x}-{:x}", SEQ.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+#[async_trait]
+impl smooth_operator_core::executor::AgentExecutor for TemporalExecutor {
+    async fn execute(&self, _agent: &smooth_operator_core::agent::Agent, user_message: String) -> anyhow::Result<Conversation> {
+        self.run_workflow(user_message).await
+    }
+
+    /// A workflow-backed turn has no token-delta stream (its history is the
+    /// checkpoint, not a live channel — ADR-030 blocker 3, mirrored by all four
+    /// ports), so this resolves the durable turn and emits one terminal
+    /// [`Completed`](smooth_operator_core::agent::AgentEvent::Completed).
+    async fn execute_streaming(
+        &self,
+        agent: &smooth_operator_core::agent::Agent,
+        user_message: String,
+        events: tokio::sync::mpsc::UnboundedSender<smooth_operator_core::agent::AgentEvent>,
+    ) -> anyhow::Result<Conversation> {
+        let conversation = self.run_workflow(user_message).await?;
+        // ponytail: iterations/usage/cost are zero — the workflow returns only
+        // the Conversation. Wire them through the AgentTurnResult DTO when
+        // durable-turn cost attribution lands (same gap as the ports).
+        let _ = events.send(smooth_operator_core::agent::AgentEvent::Completed {
+            agent_id: agent.id.clone(),
+            iterations: 0,
+            cost_usd: 0.0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cost_estimated: true,
+            usage_estimated: true,
+            response_id: None,
+        });
+        Ok(conversation)
+    }
+}
+
 /// Scaffold liveness workflow — proves the SDK integrates end to end and backs
 /// the ephemeral-server integration test.
 #[workflow]
