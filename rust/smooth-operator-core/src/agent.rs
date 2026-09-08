@@ -65,6 +65,12 @@ The test-runner output (exit code + summary line) is the authoritative completio
 /// How many retrieved knowledge hits are injected into the turn's context.
 pub const KNOWLEDGE_TOP_K: usize = 3;
 
+/// Memories auto-recalled into a turn's context when the caller does not set
+/// [`AgentConfig::memory_top_k`]. Named (not a literal at the call site) because
+/// every sibling core has to agree on it for the recall block to be identical —
+/// see `docs/Architecture/Memory-Recall.md`.
+pub const MEMORY_TOP_K: usize = 5;
+
 /// Configuration for an agent.
 #[allow(missing_debug_implementations)]
 pub struct AgentConfig {
@@ -77,6 +83,10 @@ pub struct AgentConfig {
     pub compaction_strategy: CompactionStrategy,
     pub parallel_tools: bool,
     pub memory: Option<Arc<dyn Memory>>,
+    /// How many memories to auto-recall per turn. `0` = [`MEMORY_TOP_K`]. This
+    /// used to be hardcoded at the call site, which made it the one recall knob
+    /// the sibling cores had and Rust did not.
+    pub memory_top_k: usize,
     pub knowledge: Option<Arc<dyn KnowledgeBase>>,
     /// Reranker applied to retrieved knowledge hits before injection. `None` =
     /// passthrough (the retriever's own order wins).
@@ -185,6 +195,7 @@ impl AgentConfig {
             memory: None,
             knowledge: None,
             reranker: None,
+            memory_top_k: 0,
             knowledge_candidate_k: 0,
             budget: None,
             human_tx: None,
@@ -307,6 +318,13 @@ impl AgentConfig {
 
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Auto-recall `top_k` memories per turn (`0` = [`MEMORY_TOP_K`]).
+    #[must_use]
+    pub fn with_memory_top_k(mut self, top_k: usize) -> Self {
+        self.memory_top_k = top_k;
         self
     }
 
@@ -1438,28 +1456,19 @@ impl Agent {
         let mut context_parts = Vec::new();
 
         if let Some(memory) = &self.config.memory {
-            match memory.recall(last_user_message, 5) {
+            let top_k = if self.config.memory_top_k == 0 {
+                MEMORY_TOP_K
+            } else {
+                self.config.memory_top_k
+            };
+            match memory.recall(last_user_message, top_k) {
                 Ok(entries) if !entries.is_empty() => {
-                    let needs_freshness = entries.iter().any(|e| e.memory_type.needs_freshness_check());
-                    let mut buf = String::from("[Recalled memories]\n");
-                    if needs_freshness {
-                        // D6: verify-before-recommend rule — a memory that names
-                        // a function/file/flag is a claim about the past, not a
-                        // fact about now. The agent should grep/read before
-                        // surfacing it, especially for Project and Reference
-                        // entries which are time-sensitive.
-                        buf.push_str(
-                            "Note: 'the memory says X exists' is not the same as 'X exists now'. \
-                            Before recommending or acting on any function path, file, flag, or external \
-                            pointer named below, verify it's current by reading the file or grepping the \
-                            codebase. Project and Reference memories are time-sensitive; User and Feedback \
-                            are durable.\n",
-                        );
+                    // Rendering lives in `memory::render_recall_block` because it is a
+                    // cross-language contract, not an agent detail — the four sibling
+                    // cores reproduce that exact text (th-ffaeae).
+                    if let Some(buf) = crate::memory::render_recall_block(&entries) {
+                        context_parts.push(buf);
                     }
-                    for entry in &entries {
-                        let _ = writeln!(buf, "- ({:?}, relevance={:.2}): {}", entry.memory_type, entry.relevance, entry.content);
-                    }
-                    context_parts.push(buf);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to recall memories");

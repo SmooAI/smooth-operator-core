@@ -15,7 +15,7 @@
 import type { Clearance } from './cast.js';
 import type { CheckpointStore } from './checkpoint.js';
 import type { SmoothAgentThread } from './thread.js';
-import type { Memory } from './memory.js';
+import { MEMORY_TOP_K, type Memory, renderRecallBlock } from './memory.js';
 import type { Reranker } from './rerank.js';
 import { compact } from './compaction.js';
 import { applyCacheControl, supportsAnthropicCacheControl } from './cacheControl.js';
@@ -565,10 +565,13 @@ export class SmoothAgent {
 
         const mem = this.options.memory;
         if (mem) {
-            const recalled = mem.recall(message, this.options.memoryTopK ?? 4);
-            if (recalled.length > 0) {
-                const block = recalled.map((e) => `- ${e.text}`).join('\n');
-                system = `${system}\n\nRelevant memory (things you remember about this user/context):\n${block}`.trim();
+            const recalled = mem.recall(message, this.options.memoryTopK ?? MEMORY_TOP_K);
+            // Rendering lives in memory.renderRecallBlock because it is a cross-language
+            // contract, not an agent detail — the Rust reference and the C#/Python/Go
+            // siblings emit this exact text (th-ffaeae).
+            const block = renderRecallBlock(recalled);
+            if (block) {
+                system = `${system}\n\n${block}`.trim();
             }
         }
 

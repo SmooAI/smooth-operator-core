@@ -434,17 +434,17 @@ public sealed class SmoothAgent
         if (_options.Memory is not null)
         {
             var memories = await _options.Memory.RecallAsync(query, _options.MemoryTopK, cancellationToken).ConfigureAwait(false);
-            if (memories.Count > 0)
+            // Rendering lives in MemoryRecall.RenderRecallBlock because it is a cross-language
+            // contract, not an agent detail — the Rust reference and the Python/Go/TS siblings
+            // emit this exact text (th-ffaeae).
+            var recallBlock = MemoryRecall.RenderRecallBlock(memories);
+            if (recallBlock is not null)
             {
                 if (builder.Length > 0)
                 {
                     builder.AppendLine();
                 }
-                builder.AppendLine("Relevant memory:");
-                foreach (var memory in memories)
-                {
-                    builder.AppendLine($"- {memory.Content}");
-                }
+                builder.Append(recallBlock);
             }
         }
 

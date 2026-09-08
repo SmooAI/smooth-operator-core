@@ -464,15 +464,14 @@ func (a *SmoothAgent) buildSystem(message string) string {
 	if a.options.Memory != nil {
 		topK := a.options.MemoryTopK
 		if topK <= 0 {
-			topK = defaultKnowledgeTopK
+			topK = MemoryTopK
 		}
 		recalled := a.options.Memory.Recall(message, topK)
-		if len(recalled) > 0 {
-			lines := make([]string, len(recalled))
-			for i, e := range recalled {
-				lines[i] = "- " + e.Text
-			}
-			system = strings.TrimSpace(system + "\n\nRelevant memory (things you remember about this user/context):\n" + strings.Join(lines, "\n"))
+		// Rendering lives in RenderRecallBlock because it is a cross-language contract,
+		// not an agent detail — the Rust reference and the C#/Python/TS siblings emit
+		// this exact text (th-ffaeae).
+		if block := RenderRecallBlock(recalled); block != "" {
+			system = strings.TrimSpace(system + "\n\n" + block)
 		}
 	}
 
