@@ -19,7 +19,7 @@
        in the Temporal SDK. ADR-030 / SMOODEV-1972. -->
   <PropertyGroup>
     <PackageId>SmooAI.SmoothOperator.Temporal</PackageId>
-    <Version>1.13.5</Version>
+    <Version>1.13.6</Version>
     <Authors>SmooAI</Authors>
     <Company>SmooAI</Company>
     <Description>Optional Temporal-backed durable execution backend for the SmooAI.SmoothOperator.Core agent engine (ADR-030). An agent turn runs as a Temporal workflow whose model call and each tool invocation are activities, giving crash-safe resume, durable human-in-the-loop via signals, and durable timers. The in-process executor runs the same drive_turn loop inline — one loop, two backends. The C# sibling of the Rust smooai-smooth-operator-temporal crate.</Description>
