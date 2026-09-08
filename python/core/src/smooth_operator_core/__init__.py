@@ -52,7 +52,17 @@ from .llm_provider import (
     tool_call_response,
     usage,
 )
-from .memory import InMemoryMemory, Memory, MemoryEntry
+from .memory import (
+    MEMORY_TOP_K,
+    RECALL_FRESHNESS_NOTE,
+    RECALL_HEADER,
+    InMemoryMemory,
+    Memory,
+    MemoryEntry,
+    MemoryType,
+    relevance_score,
+    render_recall_block,
+)
 from .multimodal import ImageContent, user_content
 from .narc import (
     NarcAlert,
@@ -178,6 +188,12 @@ __all__ = [
     "LlmProvider",
     "Memory",
     "MemoryEntry",
+    "MemoryType",
+    "MEMORY_TOP_K",
+    "RECALL_HEADER",
+    "RECALL_FRESHNESS_NOTE",
+    "relevance_score",
+    "render_recall_block",
     "NarcAlert",
     "NarcFinding",
     "NarcHook",

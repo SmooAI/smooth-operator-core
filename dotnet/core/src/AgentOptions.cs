@@ -150,7 +150,7 @@ public sealed class AgentOptions
     public IAgentMemory? Memory { get; set; }
 
     /// <summary>How many recalled memories to inject per turn.</summary>
-    public int MemoryTopK { get; set; } = 4;
+    public int MemoryTopK { get; set; } = MemoryRecall.MemoryTopK;
 
     /// <summary>
     /// Optional checkpoint store. When set (and a thread is in use), the agent snapshots the

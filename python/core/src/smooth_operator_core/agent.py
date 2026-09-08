@@ -28,7 +28,7 @@ from .deny_policy import DenyPolicy
 from .hooks import ToolCall, ToolHook, ToolResult
 from .human_gate import DEFAULT_APPROVAL_TIMEOUT_SECONDS, HumanApprovalRequest, HumanGate
 from .knowledge import Knowledge
-from .memory import Memory
+from .memory import MEMORY_TOP_K, Memory, render_recall_block
 from .multimodal import ImageContent, user_content
 from .permission import AutoMode, PermissionHook
 from .rerank import NoopReranker, Reranker
@@ -121,7 +121,7 @@ class AgentOptions:
     #: Optional long-term memory; relevant entries are recalled into context each turn.
     memory: Memory | None = None
     #: How many memory entries to recall per turn.
-    memory_top_k: int = 4
+    memory_top_k: int = MEMORY_TOP_K
     tools: list[Tool] = field(default_factory=list)
     #: Tool-call lifecycle hooks (parity with the Rust ``ToolHook`` trait). Every
     #: hook's ``pre_call`` runs before a tool executes (raise to block it) and its
@@ -406,10 +406,12 @@ class SmoothAgent:
         if mem is not None:
             recalled = mem.recall(message, self._options.memory_top_k)
             if recalled:
-                block = "\n".join(f"- {e.text}" for e in recalled)
-                system = (
-                    system + "\n\nRelevant memory (things you remember about this user/context):\n" + block
-                ).strip()
+                # Rendering lives in memory.render_recall_block because it is a
+                # cross-language contract, not an agent detail — the Rust reference
+                # and the C#/Go/TS siblings emit this exact text (th-ffaeae).
+                block = render_recall_block(recalled)
+                if block:
+                    system = (system + "\n\n" + block).strip()
 
         kb = self._options.knowledge
         if kb is not None:

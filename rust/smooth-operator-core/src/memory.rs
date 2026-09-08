@@ -119,6 +119,82 @@ impl MemoryType {
     }
 }
 
+/// Lowercased alphanumeric tokens. Punctuation is a separator, NOT part of a
+/// token — scoring used to split on whitespace alone, so a query ending
+/// "…my name?" never matched a memory containing "name" and the entry was
+/// silently not recalled.
+fn tokens(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Fraction of the QUERY's distinct tokens that appear in `content`.
+///
+/// Normalised to 0.0–1.0 deliberately: a raw overlap count is comparable neither
+/// between entries nor between languages, and it is rendered into the prompt.
+/// This is the **cross-language contract** — the C#, Python, TypeScript and Go
+/// cores compute the identical number (pearl th-ffaeae).
+#[must_use]
+pub fn relevance_score(query: &str, content: &str) -> f32 {
+    let query_tokens: std::collections::BTreeSet<String> = tokens(query).into_iter().collect();
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+    let content_tokens: std::collections::BTreeSet<String> = tokens(content).into_iter().collect();
+    let matching = query_tokens.iter().filter(|t| content_tokens.contains(*t)).count();
+    #[allow(clippy::cast_precision_loss)]
+    {
+        matching as f32 / query_tokens.len() as f32
+    }
+}
+
+/// Header that opens every auto-recall block, in every core.
+pub const RECALL_HEADER: &str = "[Recalled memories]";
+
+/// The verify-before-recommend note (rule D6), emitted only when at least one
+/// recalled entry is time-sensitive ([`MemoryType::needs_freshness_check`]).
+///
+/// A memory naming a function, file, or flag is a claim about the PAST, not a
+/// fact about now — without this line the model happily recommends a symbol that
+/// was deleted three releases ago.
+pub const RECALL_FRESHNESS_NOTE: &str = "Note: 'the memory says X exists' is not the same as 'X exists now'. \
+    Before recommending or acting on any function path, file, flag, or external \
+    pointer named below, verify it's current by reading the file or grepping the \
+    codebase. Project and Reference memories are time-sensitive; User and Feedback \
+    are durable.";
+
+/// Render recalled entries as the context block injected into a turn.
+///
+/// This function is the **cross-language spec** for auto-recall: every sibling
+/// core (C#, Python, TypeScript, Go) reproduces this exact text, so the same
+/// memories yield byte-identical context on all five engines. Change it here and
+/// the other four must follow — see `pearl th-ffaeae`, which exists because they
+/// had drifted into three different spellings of the header alone.
+///
+/// Returns `None` for an empty slice, so a caller injects nothing rather than a
+/// bare header.
+#[must_use]
+pub fn render_recall_block(entries: &[MemoryEntry]) -> Option<String> {
+    use std::fmt::Write;
+
+    if entries.is_empty() {
+        return None;
+    }
+    let mut buf = String::from(RECALL_HEADER);
+    buf.push('\n');
+    if entries.iter().any(|e| e.memory_type.needs_freshness_check()) {
+        buf.push_str(RECALL_FRESHNESS_NOTE);
+        buf.push('\n');
+    }
+    for entry in entries {
+        let _ = writeln!(buf, "- ({:?}, relevance={:.2}): {}", entry.memory_type, entry.relevance, entry.content);
+    }
+    Some(buf)
+}
+
 /// In-memory implementation of the `Memory` trait.
 ///
 /// Uses a `Mutex<Vec<MemoryEntry>>` for thread-safe storage.
@@ -152,20 +228,11 @@ impl Memory for InMemoryMemory {
     fn recall(&self, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
         let entries = self.entries.lock().map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
 
-        let query_words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-
-        if query_words.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut scored: Vec<(f32, MemoryEntry)> = entries
             .iter()
             .filter_map(|entry| {
-                let content_lower = entry.content.to_lowercase();
-                let matching = query_words.iter().filter(|w| content_lower.contains(w.as_str())).count();
-                if matching > 0 {
-                    #[allow(clippy::cast_precision_loss)]
-                    let score = matching as f32 / query_words.len() as f32;
+                let score = relevance_score(query, &entry.content);
+                if score > 0.0 {
                     let mut recalled = entry.clone();
                     recalled.relevance = score;
                     Some((score, recalled))
@@ -175,6 +242,8 @@ impl Memory for InMemoryMemory {
             })
             .collect();
 
+        // Best first; `sort_by` is stable, so ties keep insertion order — the
+        // sibling cores rely on that to produce the same block.
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
 
@@ -191,6 +260,64 @@ impl Memory for InMemoryMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The block is the CROSS-LANGUAGE contract (th-ffaeae). Pinned byte-for-byte
+    /// so a change here is a deliberate act that must be mirrored in the C#,
+    /// Python, TypeScript and Go cores — not an accident someone notices months
+    /// later when a conformance scenario can't be written.
+    #[test]
+    fn recall_block_is_pinned_across_languages() {
+        let mut durable = MemoryEntry::new("brent prefers execution over questions", MemoryType::User);
+        durable.relevance = 0.5;
+        let block = render_recall_block(&[durable]).expect("block");
+        assert_eq!(block, "[Recalled memories]\n- (User, relevance=0.50): brent prefers execution over questions\n");
+    }
+
+    /// A time-sensitive entry (Project/Reference) adds the verify-before-recommend
+    /// note; a durable one (User/Feedback) must NOT, or the note becomes noise the
+    /// model learns to skip.
+    #[test]
+    fn recall_block_adds_freshness_note_only_when_time_sensitive() {
+        let mut project = MemoryEntry::new("the retry lives in fetch.rs", MemoryType::Project);
+        project.relevance = 1.0;
+        let block = render_recall_block(&[project]).expect("block");
+        assert!(block.starts_with("[Recalled memories]\nNote: 'the memory says X exists'"));
+        assert!(block.ends_with("- (Project, relevance=1.00): the retry lives in fetch.rs\n"));
+
+        let mut user = MemoryEntry::new("prefers dark mode", MemoryType::User);
+        user.relevance = 1.0;
+        assert!(!render_recall_block(&[user]).expect("block").contains("Note:"));
+    }
+
+    /// Empty recall injects NOTHING — a bare header would spend context telling the
+    /// model it remembered nothing.
+    #[test]
+    fn empty_recall_renders_no_block() {
+        assert!(render_recall_block(&[]).is_none());
+    }
+
+    /// Relevance is a fraction of the QUERY's distinct tokens, so it is comparable
+    /// across entries and across languages. Two of four query tokens hit ⇒ 0.50.
+    /// Punctuation is a token separator. Scoring used to split on whitespace only,
+    /// so "do you remember my name?" scored 0 against "the user's name is Dana"
+    /// — the trailing '?' made `name?` fail a substring test — and the memory was
+    /// silently never recalled.
+    #[test]
+    fn punctuation_does_not_defeat_a_match() {
+        assert!(relevance_score("do you remember my name?", "The user's name is Dana.") > 0.0);
+        assert!((relevance_score("watchlist!", "the watchlist lives here") - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn relevance_is_a_fraction_of_query_words() {
+        let memory = InMemoryMemory::new();
+        memory
+            .store(MemoryEntry::new("the watchlist lives on smoo-hub", MemoryType::Project))
+            .expect("store");
+        let hits = memory.recall("watchlist on marvin today", 5).expect("recall");
+        assert_eq!(hits.len(), 1);
+        assert!((hits[0].relevance - 0.5).abs() < f32::EPSILON, "relevance = {}", hits[0].relevance);
+    }
 
     #[test]
     fn memory_entry_creation_and_serialization() {

@@ -83,4 +83,72 @@ public class KnowledgeMemoryTests
 
         Assert.Contains(mock.Calls[0], m => m.Text.Contains("The user's name is Brent."));
     }
+
+    // ── cross-language recall contract (th-ffaeae) ───────────────────────────
+    //
+    // The block below is reproduced byte-for-byte by the Rust reference and the Python,
+    // Go and TypeScript siblings. These tests mirror
+    // rust/smooth-operator-core/src/memory.rs so a drift shows up here, not months later
+    // when someone tries to write a shared conformance scenario.
+
+    [Fact]
+    public void RecallBlock_IsPinnedAcrossLanguages()
+    {
+        var block = MemoryRecall.RenderRecallBlock(
+            [new MemoryEntry("m1", "brent prefers execution over questions", MemoryType.User, Relevance: 0.5)]);
+        Assert.Equal("[Recalled memories]\n- (User, relevance=0.50): brent prefers execution over questions\n", block);
+    }
+
+    /// <summary>A Project/Reference memory names something in a moving codebase, so the model is
+    /// told to verify it. A User/Feedback one describes the person and does not go stale —
+    /// emitting the note there would train the model to skip it.</summary>
+    [Fact]
+    public void RecallBlock_AddsFreshnessNote_OnlyWhenTimeSensitive()
+    {
+        var block = MemoryRecall.RenderRecallBlock(
+            [new MemoryEntry("m1", "the retry lives in fetch.rs", MemoryType.Project, Relevance: 1.0)]);
+        Assert.Equal(
+            $"{MemoryRecall.RecallHeader}\n{MemoryRecall.RecallFreshnessNote}\n- (Project, relevance=1.00): the retry lives in fetch.rs\n",
+            block);
+
+        var durable = MemoryRecall.RenderRecallBlock(
+            [new MemoryEntry("m2", "prefers dark mode", MemoryType.User, Relevance: 1.0)]);
+        Assert.DoesNotContain("Note:", durable, StringComparison.Ordinal);
+    }
+
+    /// <summary>A bare header would spend context telling the model it remembered nothing.</summary>
+    [Fact]
+    public void EmptyRecall_RendersNoBlock() => Assert.Null(MemoryRecall.RenderRecallBlock([]));
+
+    /// <summary>Normalised to 0-1 so it is comparable between entries AND between languages —
+    /// a raw overlap count is neither, and it is rendered into the prompt.</summary>
+    [Fact]
+    public void Relevance_IsAFractionOfQueryTokens()
+    {
+        Assert.Equal(0.5, MemoryRecall.RelevanceScore("watchlist on marvin today", "the watchlist lives on smoo-hub"));
+        Assert.Equal(0, MemoryRecall.RelevanceScore("", "anything"));
+    }
+
+    /// <summary>Scoring used to split on whitespace only, so "do you remember my name?" scored 0
+    /// against "the user's name is Dana" — the trailing '?' made <c>name?</c> fail — and the
+    /// memory was silently never recalled. C# additionally dropped every token of length &lt;= 2,
+    /// so "my" could never contribute at all.</summary>
+    [Fact]
+    public void Punctuation_DoesNotDefeatAMatch()
+    {
+        Assert.True(MemoryRecall.RelevanceScore("do you remember my name?", "The user's name is Dana.") > 0);
+        Assert.Equal(1.0, MemoryRecall.RelevanceScore("watchlist!", "the watchlist lives here"));
+    }
+
+    [Fact]
+    public async Task Recall_PopulatesRelevanceAndType()
+    {
+        var memory = new InMemoryAgentMemory();
+        await memory.StoreAsync(new MemoryEntry("m1", "the watchlist lives on smoo-hub", MemoryType.Project));
+        var hits = await memory.RecallAsync("watchlist on marvin today", MemoryRecall.MemoryTopK);
+        Assert.Single(hits);
+        Assert.Equal(0.5, hits[0].Relevance);
+        Assert.Equal(MemoryType.Project, hits[0].Type);
+    }
 }
+
