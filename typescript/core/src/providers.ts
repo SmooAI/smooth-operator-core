@@ -59,12 +59,12 @@ export interface ProviderConfig {
 
 /** OpenRouter — an OpenAI-compatible proxy for many models. */
 export function openRouterProvider(apiKey: string): ProviderConfig {
-    return { id: 'openrouter', apiUrl: 'https://openrouter.ai/api/v1', apiKey, apiFormat: ApiFormat.OpenAiCompat, defaultModel: 'openai/gpt-4o' };
+    return { id: 'openrouter', apiUrl: 'https://openrouter.ai/api/v1', apiKey, apiFormat: ApiFormat.OpenAiCompat, defaultModel: 'openai/gpt-6-luna' };
 }
 
 /** The OpenAI direct API. */
 export function openAiProvider(apiKey: string): ProviderConfig {
-    return { id: 'openai', apiUrl: 'https://api.openai.com/v1', apiKey, apiFormat: ApiFormat.OpenAiCompat, defaultModel: 'gpt-4o' };
+    return { id: 'openai', apiUrl: 'https://api.openai.com/v1', apiKey, apiFormat: ApiFormat.OpenAiCompat, defaultModel: 'gpt-6-luna' };
 }
 
 /** The Anthropic native API. */
@@ -100,17 +100,18 @@ export function kimiCodeProvider(apiKey: string): ProviderConfig {
 
 /** LLM Gateway — a unified API for 210+ models. */
 export function llmGatewayProvider(apiKey: string): ProviderConfig {
-    return { id: 'llmgateway', apiUrl: 'https://api.llmgateway.io/v1', apiKey, apiFormat: ApiFormat.OpenAiCompat, defaultModel: 'openai/gpt-4o' };
+    return { id: 'llmgateway', apiUrl: 'https://api.llmgateway.io/v1', apiKey, apiFormat: ApiFormat.OpenAiCompat, defaultModel: 'openai/gpt-6-luna' };
 }
 
 /**
  * The hosted LiteLLM-backed gateway run by Smoo AI.
  *
  * One API key, one URL, OpenAI-compatible. The gateway handles provider
- * selection, billing, moderation and cost tracking server-side, so consumers
- * reference models by semantic aliases (`smooth-coding`, `smooth-judge`, …) that
- * the gateway maps to whichever underlying model is currently best — upgrades
- * ship server-side with no client release.
+ * selection, billing, moderation and cost tracking server-side. It serves
+ * concrete model names (`gpt-6-luna`, `gpt-6-luna-fast`, `groq-gpt-oss-120b`, …);
+ * the old semantic `smooth-*` aliases were removed and are now rejected with
+ * HTTP 400 "Invalid model name", so moving a slot to a different model is a
+ * client/preset change, not a server-side one. The default model is `gpt-6-luna`.
  *
  * `SMOOAI_GATEWAY_URL` overrides the base URL. Only an ABSENT variable takes the
  * default: a set-but-empty override yields an empty base URL, matching Rust.
@@ -122,7 +123,7 @@ export function smooaiGatewayProvider(apiKey: string): ProviderConfig {
         apiUrl: override === undefined ? 'https://llm.smoo.ai/v1' : override,
         apiKey,
         apiFormat: ApiFormat.OpenAiCompat,
-        defaultModel: 'smooth-default',
+        defaultModel: 'gpt-6-luna',
     };
 }
 
@@ -171,7 +172,7 @@ export const ALL_PRESETS: readonly PresetInfo[] = [
         label: 'LLM Gateway Low Cost',
         description: 'GLM-5 thinking, MiniMax-M2.7 coding, DeepSeek-V3.2 default — unified billing, 224 models',
     },
-    { name: 'openai', label: 'OpenAI', description: 'o3-mini thinking, GPT-4o coding — OpenAI ecosystem' },
+    { name: 'openai', label: 'OpenAI', description: 'GPT-6 Luna on every slot — OpenAI ecosystem' },
     { name: 'anthropic', label: 'Anthropic', description: 'Claude Opus thinking, Sonnet coding — highest quality' },
 ];
 
@@ -398,18 +399,19 @@ export class ProviderRegistry {
         const registry = new ProviderRegistry();
         switch (preset) {
             case Preset.SmoaiGateway:
-                // Semantic aliases the gateway's LiteLLM config maps to whichever
-                // underlying model is currently best. Changing the underlying model
-                // is a server-side deploy — no client release needed.
+                // Concrete model names the gateway serves. The legacy semantic
+                // `smooth-*` aliases were removed server-side and 400 with "Invalid
+                // model name", so moving a slot is a client/preset change here.
+                // Gateway model policy: gpt-6-luna (or -fast / -high) or a Groq alias.
                 registry.registerProvider(smooaiGatewayProvider(apiKey));
                 registry.routing = {
-                    coding: modelSlot('smooai-gateway', 'smooth-coding'),
-                    reasoning: modelSlot('smooai-gateway', 'smooth-reasoning'),
-                    reviewing: modelSlot('smooai-gateway', 'smooth-reviewing'),
-                    judge: modelSlot('smooai-gateway', 'smooth-judge'),
-                    summarize: modelSlot('smooai-gateway', 'smooth-summarize'),
-                    default: modelSlot('smooai-gateway', 'smooth-default'),
-                    fast: modelSlot('smooai-gateway', 'smooth-fast'),
+                    coding: modelSlot('smooai-gateway', 'gpt-6-luna'),
+                    reasoning: modelSlot('smooai-gateway', 'gpt-6-luna-high'),
+                    reviewing: modelSlot('smooai-gateway', 'gpt-6-luna-high'),
+                    judge: modelSlot('smooai-gateway', 'groq-gpt-oss-120b'),
+                    summarize: modelSlot('smooai-gateway', 'gpt-6-luna-fast'),
+                    default: modelSlot('smooai-gateway', 'gpt-6-luna'),
+                    fast: modelSlot('smooai-gateway', 'gpt-6-luna-fast'),
                 };
                 break;
             case Preset.OpenRouterLowCost:
@@ -441,13 +443,13 @@ export class ProviderRegistry {
             case Preset.OpenAI:
                 registry.registerProvider(openAiProvider(apiKey));
                 registry.routing = {
-                    coding: modelSlot('openai', 'gpt-4o'),
-                    reasoning: modelSlot('openai', 'o3-mini'),
-                    reviewing: modelSlot('openai', 'gpt-4o'),
-                    judge: modelSlot('openai', 'gpt-4o-mini'),
-                    summarize: modelSlot('openai', 'gpt-4o-mini'),
-                    default: modelSlot('openai', 'gpt-4o'),
-                    fast: modelSlot('openai', 'gpt-4o-mini'),
+                    coding: modelSlot('openai', 'gpt-6-luna'),
+                    reasoning: modelSlot('openai', 'gpt-6-luna'),
+                    reviewing: modelSlot('openai', 'gpt-6-luna'),
+                    judge: modelSlot('openai', 'gpt-6-luna'),
+                    summarize: modelSlot('openai', 'gpt-6-luna'),
+                    default: modelSlot('openai', 'gpt-6-luna'),
+                    fast: modelSlot('openai', 'gpt-6-luna'),
                 };
                 break;
             case Preset.Anthropic:

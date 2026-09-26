@@ -170,7 +170,7 @@
                     "apiKey": "test-key",
                     "apiUrl": "https://llm.smoo.ai/v1",
                     "maxTokens": 32768,
-                    "model": "smooth-coding",
+                    "model": "gpt-6-luna",
                     "temperature": 0.0
                 },
                 "default": {
@@ -178,7 +178,7 @@
                     "apiKey": "test-key",
                     "apiUrl": "https://llm.smoo.ai/v1",
                     "maxTokens": 32768,
-                    "model": "smooth-default",
+                    "model": "gpt-6-luna",
                     "temperature": 0.0
                 },
                 "fast": {
@@ -186,7 +186,7 @@
                     "apiKey": "test-key",
                     "apiUrl": "https://llm.smoo.ai/v1",
                     "maxTokens": 32768,
-                    "model": "smooth-fast",
+                    "model": "gpt-6-luna-fast",
                     "temperature": 0.0
                 },
                 "judge": {
@@ -194,7 +194,7 @@
                     "apiKey": "test-key",
                     "apiUrl": "https://llm.smoo.ai/v1",
                     "maxTokens": 32768,
-                    "model": "smooth-judge",
+                    "model": "groq-gpt-oss-120b",
                     "temperature": 0.0
                 },
                 "reasoning": {
@@ -202,7 +202,7 @@
                     "apiKey": "test-key",
                     "apiUrl": "https://llm.smoo.ai/v1",
                     "maxTokens": 32768,
-                    "model": "smooth-reasoning",
+                    "model": "gpt-6-luna-high",
                     "temperature": 0.0
                 },
                 "reviewing": {
@@ -210,7 +210,7 @@
                     "apiKey": "test-key",
                     "apiUrl": "https://llm.smoo.ai/v1",
                     "maxTokens": 32768,
-                    "model": "smooth-reviewing",
+                    "model": "gpt-6-luna-high",
                     "temperature": 0.0
                 },
                 "summarize": {
@@ -218,7 +218,7 @@
                     "apiKey": "test-key",
                     "apiUrl": "https://llm.smoo.ai/v1",
                     "maxTokens": 32768,
-                    "model": "smooth-summarize",
+                    "model": "gpt-6-luna-fast",
                     "temperature": 0.0
                 }
             }
@@ -365,7 +365,7 @@
                     "apiKey": "test-key",
                     "apiUrl": "https://api.openai.com/v1",
                     "maxTokens": 32768,
-                    "model": "gpt-4o",
+                    "model": "gpt-6-luna",
                     "temperature": 0.0
                 },
                 "default": {
@@ -373,7 +373,7 @@
                     "apiKey": "test-key",
                     "apiUrl": "https://api.openai.com/v1",
                     "maxTokens": 32768,
-                    "model": "gpt-4o",
+                    "model": "gpt-6-luna",
                     "temperature": 0.0
                 },
                 "fast": {
@@ -381,7 +381,7 @@
                     "apiKey": "test-key",
                     "apiUrl": "https://api.openai.com/v1",
                     "maxTokens": 32768,
-                    "model": "gpt-4o-mini",
+                    "model": "gpt-6-luna",
                     "temperature": 0.0
                 },
                 "judge": {
@@ -389,7 +389,7 @@
                     "apiKey": "test-key",
                     "apiUrl": "https://api.openai.com/v1",
                     "maxTokens": 32768,
-                    "model": "gpt-4o-mini",
+                    "model": "gpt-6-luna",
                     "temperature": 0.0
                 },
                 "reasoning": {
@@ -397,7 +397,7 @@
                     "apiKey": "test-key",
                     "apiUrl": "https://api.openai.com/v1",
                     "maxTokens": 32768,
-                    "model": "o3-mini",
+                    "model": "gpt-6-luna",
                     "temperature": 0.0
                 },
                 "reviewing": {
@@ -405,7 +405,7 @@
                     "apiKey": "test-key",
                     "apiUrl": "https://api.openai.com/v1",
                     "maxTokens": 32768,
-                    "model": "gpt-4o",
+                    "model": "gpt-6-luna",
                     "temperature": 0.0
                 },
                 "summarize": {
@@ -413,7 +413,7 @@
                     "apiKey": "test-key",
                     "apiUrl": "https://api.openai.com/v1",
                     "maxTokens": 32768,
-                    "model": "gpt-4o-mini",
+                    "model": "gpt-6-luna",
                     "temperature": 0.0
                 }
             }
@@ -489,7 +489,7 @@
             "apiFormat": "OpenAiCompat",
             "apiKey": "k",
             "apiUrl": "https://openrouter.ai/api/v1",
-            "defaultModel": "openai/gpt-4o",
+            "defaultModel": "openai/gpt-6-luna",
             "factory": "openrouter",
             "id": "openrouter"
         },
@@ -497,7 +497,7 @@
             "apiFormat": "OpenAiCompat",
             "apiKey": "k",
             "apiUrl": "https://api.openai.com/v1",
-            "defaultModel": "gpt-4o",
+            "defaultModel": "gpt-6-luna",
             "factory": "openai",
             "id": "openai"
         },
@@ -545,7 +545,7 @@
             "apiFormat": "OpenAiCompat",
             "apiKey": "k",
             "apiUrl": "https://api.llmgateway.io/v1",
-            "defaultModel": "openai/gpt-4o",
+            "defaultModel": "openai/gpt-6-luna",
             "factory": "llmgateway",
             "id": "llmgateway"
         },
@@ -553,7 +553,7 @@
             "apiFormat": "OpenAiCompat",
             "apiKey": "k",
             "apiUrl": "https://llm.smoo.ai/v1",
-            "defaultModel": "smooth-default",
+            "defaultModel": "gpt-6-luna",
             "factory": "smooaiGateway",
             "id": "smooai-gateway"
         }

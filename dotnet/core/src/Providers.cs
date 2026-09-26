@@ -182,11 +182,11 @@ public static class Providers
 {
     /// <summary>OpenRouter — an OpenAI-compatible proxy for many models.</summary>
     public static ProviderConfig OpenRouter(string apiKey) =>
-        new("openrouter", "https://openrouter.ai/api/v1", apiKey, ApiFormat.OpenAiCompat, "openai/gpt-4o");
+        new("openrouter", "https://openrouter.ai/api/v1", apiKey, ApiFormat.OpenAiCompat, "openai/gpt-6-luna");
 
     /// <summary>The OpenAI direct API.</summary>
     public static ProviderConfig OpenAI(string apiKey) =>
-        new("openai", "https://api.openai.com/v1", apiKey, ApiFormat.OpenAiCompat, "gpt-4o");
+        new("openai", "https://api.openai.com/v1", apiKey, ApiFormat.OpenAiCompat, "gpt-6-luna");
 
     /// <summary>The Anthropic native API.</summary>
     public static ProviderConfig Anthropic(string apiKey) =>
@@ -210,21 +210,23 @@ public static class Providers
 
     /// <summary>LLM Gateway — a unified API for 210+ models.</summary>
     public static ProviderConfig LlmGateway(string apiKey) =>
-        new("llmgateway", "https://api.llmgateway.io/v1", apiKey, ApiFormat.OpenAiCompat, "openai/gpt-4o");
+        new("llmgateway", "https://api.llmgateway.io/v1", apiKey, ApiFormat.OpenAiCompat, "openai/gpt-6-luna");
 
     /// <summary>
     /// The hosted LiteLLM-backed gateway run by Smoo AI.
     ///
     /// <para>One API key, one URL, OpenAI-compatible. The gateway handles provider selection,
-    /// billing, moderation and cost tracking server-side, so consumers reference models by semantic
-    /// aliases (<c>smooth-coding</c>, <c>smooth-judge</c>, …) that the gateway maps to whichever
-    /// underlying model is currently best — upgrades ship server-side with no client release.</para>
+    /// billing, moderation and cost tracking server-side. It serves concrete model names
+    /// (<c>gpt-6-luna</c>, <c>gpt-6-luna-fast</c>, <c>groq-gpt-oss-120b</c>, …); the old semantic
+    /// <c>smooth-*</c> aliases were removed and are now rejected with HTTP 400 "Invalid model name",
+    /// so moving a slot to a different model is a client/preset change, not a server-side one. The
+    /// default model is <c>gpt-6-luna</c>.</para>
     ///
     /// <para><c>SMOOAI_GATEWAY_URL</c> overrides the base URL. Only an ABSENT variable takes the
     /// default: a set-but-empty override yields an empty base URL, matching Rust.</para>
     /// </summary>
     public static ProviderConfig SmooaiGateway(string apiKey) =>
-        new("smooai-gateway", Environment.GetEnvironmentVariable("SMOOAI_GATEWAY_URL") ?? "https://llm.smoo.ai/v1", apiKey, ApiFormat.OpenAiCompat, "smooth-default");
+        new("smooai-gateway", Environment.GetEnvironmentVariable("SMOOAI_GATEWAY_URL") ?? "https://llm.smoo.ai/v1", apiKey, ApiFormat.OpenAiCompat, "gpt-6-luna");
 
     /// <summary>
     /// Every preset. The first entry is the recommended default — <c>th auth login</c> shows them in
@@ -238,7 +240,7 @@ public static class Providers
             "GLM-5.1 thinking (#1 SWE-Bench Pro), MiniMax-M2.7 coding (56% SWE-Pro, 10B params), DeepSeek-V3.2 default"),
         new("llmgateway-low-cost", "LLM Gateway Low Cost",
             "GLM-5 thinking, MiniMax-M2.7 coding, DeepSeek-V3.2 default — unified billing, 224 models"),
-        new("openai", "OpenAI", "o3-mini thinking, GPT-4o coding — OpenAI ecosystem"),
+        new("openai", "OpenAI", "GPT-6 Luna on every slot — OpenAI ecosystem"),
         new("anthropic", "Anthropic", "Claude Opus thinking, Sonnet coding — highest quality"),
     ];
 
@@ -447,17 +449,19 @@ public sealed class ProviderRegistry
         switch (preset)
         {
             case Preset.SmoaiGateway:
-                // Semantic aliases the gateway's LiteLLM config maps to whichever underlying model is
-                // currently best. Changing the underlying model is a server-side deploy.
+                // Concrete model names the gateway serves. The legacy semantic `smooth-*` aliases were
+                // removed server-side and 400 with "Invalid model name", so moving a slot is a
+                // client/preset change here. Gateway model policy: gpt-6-luna (or -fast / -high) or a
+                // Groq alias.
                 registry.RegisterProvider(Providers.SmooaiGateway(apiKey));
                 registry.Routing = new ModelRouting(
-                    Coding: new ModelSlot("smooai-gateway", "smooth-coding"),
-                    Reviewing: new ModelSlot("smooai-gateway", "smooth-reviewing"),
-                    Judge: new ModelSlot("smooai-gateway", "smooth-judge"),
-                    Summarize: new ModelSlot("smooai-gateway", "smooth-summarize"),
-                    Default: new ModelSlot("smooai-gateway", "smooth-default"),
-                    Reasoning: new ModelSlot("smooai-gateway", "smooth-reasoning"),
-                    Fast: new ModelSlot("smooai-gateway", "smooth-fast"));
+                    Coding: new ModelSlot("smooai-gateway", "gpt-6-luna"),
+                    Reviewing: new ModelSlot("smooai-gateway", "gpt-6-luna-high"),
+                    Judge: new ModelSlot("smooai-gateway", "groq-gpt-oss-120b"),
+                    Summarize: new ModelSlot("smooai-gateway", "gpt-6-luna-fast"),
+                    Default: new ModelSlot("smooai-gateway", "gpt-6-luna"),
+                    Reasoning: new ModelSlot("smooai-gateway", "gpt-6-luna-high"),
+                    Fast: new ModelSlot("smooai-gateway", "gpt-6-luna-fast"));
                 break;
             case Preset.OpenRouterLowCost:
                 // OpenRouter uses provider-prefixed model IDs.
@@ -486,13 +490,13 @@ public sealed class ProviderRegistry
             case Preset.OpenAI:
                 registry.RegisterProvider(Providers.OpenAI(apiKey));
                 registry.Routing = new ModelRouting(
-                    Coding: new ModelSlot("openai", "gpt-4o"),
-                    Reviewing: new ModelSlot("openai", "gpt-4o"),
-                    Judge: new ModelSlot("openai", "gpt-4o-mini"),
-                    Summarize: new ModelSlot("openai", "gpt-4o-mini"),
-                    Default: new ModelSlot("openai", "gpt-4o"),
-                    Reasoning: new ModelSlot("openai", "o3-mini"),
-                    Fast: new ModelSlot("openai", "gpt-4o-mini"));
+                    Coding: new ModelSlot("openai", "gpt-6-luna"),
+                    Reviewing: new ModelSlot("openai", "gpt-6-luna"),
+                    Judge: new ModelSlot("openai", "gpt-6-luna"),
+                    Summarize: new ModelSlot("openai", "gpt-6-luna"),
+                    Default: new ModelSlot("openai", "gpt-6-luna"),
+                    Reasoning: new ModelSlot("openai", "gpt-6-luna"),
+                    Fast: new ModelSlot("openai", "gpt-6-luna"));
                 break;
             case Preset.Anthropic:
                 registry.RegisterProvider(Providers.Anthropic(apiKey));

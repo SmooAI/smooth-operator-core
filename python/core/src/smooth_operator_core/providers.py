@@ -78,13 +78,13 @@ class ProviderConfig:
 def openrouter_provider(api_key: str) -> ProviderConfig:
     """OpenRouter — an OpenAI-compatible proxy for many models."""
     return ProviderConfig(
-        "openrouter", "https://openrouter.ai/api/v1", api_key, ApiFormat.OPENAI_COMPAT, "openai/gpt-4o"
+        "openrouter", "https://openrouter.ai/api/v1", api_key, ApiFormat.OPENAI_COMPAT, "openai/gpt-6-luna"
     )
 
 
 def openai_provider(api_key: str) -> ProviderConfig:
     """The OpenAI direct API."""
-    return ProviderConfig("openai", "https://api.openai.com/v1", api_key, ApiFormat.OPENAI_COMPAT, "gpt-4o")
+    return ProviderConfig("openai", "https://api.openai.com/v1", api_key, ApiFormat.OPENAI_COMPAT, "gpt-6-luna")
 
 
 def anthropic_provider(api_key: str) -> ProviderConfig:
@@ -125,7 +125,7 @@ def kimi_code_provider(api_key: str) -> ProviderConfig:
 def llmgateway_provider(api_key: str) -> ProviderConfig:
     """LLM Gateway — a unified API for 210+ models."""
     return ProviderConfig(
-        "llmgateway", "https://api.llmgateway.io/v1", api_key, ApiFormat.OPENAI_COMPAT, "openai/gpt-4o"
+        "llmgateway", "https://api.llmgateway.io/v1", api_key, ApiFormat.OPENAI_COMPAT, "openai/gpt-6-luna"
     )
 
 
@@ -133,17 +133,19 @@ def smooai_gateway_provider(api_key: str) -> ProviderConfig:
     """The hosted LiteLLM-backed gateway run by Smoo AI.
 
     One API key, one URL, OpenAI-compatible. The gateway handles provider
-    selection, billing, moderation and cost tracking server-side, so consumers
-    reference models by semantic aliases (``smooth-coding``, ``smooth-judge``, …)
-    that the gateway maps to whichever underlying model is currently best —
-    upgrades ship server-side with no client release.
+    selection, billing, moderation and cost tracking server-side. It serves
+    concrete model names (``gpt-6-luna``, ``gpt-6-luna-fast``,
+    ``groq-gpt-oss-120b``, …); the old semantic ``smooth-*`` aliases were removed
+    and are now rejected with HTTP 400 "Invalid model name", so moving a slot to
+    a different model is a client/preset change, not a server-side one. The
+    default model is ``gpt-6-luna``.
 
     ``SMOOAI_GATEWAY_URL`` overrides the base URL. Only an ABSENT variable takes
     the default: a set-but-empty override yields an empty base URL, matching Rust.
     """
     override = os.environ.get("SMOOAI_GATEWAY_URL")
     api_url = "https://llm.smoo.ai/v1" if override is None else override
-    return ProviderConfig("smooai-gateway", api_url, api_key, ApiFormat.OPENAI_COMPAT, "smooth-default")
+    return ProviderConfig("smooai-gateway", api_url, api_key, ApiFormat.OPENAI_COMPAT, "gpt-6-luna")
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +206,7 @@ ALL_PRESETS: list[PresetInfo] = [
         "LLM Gateway Low Cost",
         "GLM-5 thinking, MiniMax-M2.7 coding, DeepSeek-V3.2 default — unified billing, 224 models",
     ),
-    PresetInfo("openai", "OpenAI", "o3-mini thinking, GPT-4o coding — OpenAI ecosystem"),
+    PresetInfo("openai", "OpenAI", "GPT-6 Luna on every slot — OpenAI ecosystem"),
     PresetInfo("anthropic", "Anthropic", "Claude Opus thinking, Sonnet coding — highest quality"),
 ]
 
@@ -422,18 +424,19 @@ class ProviderRegistry:
         slot = ModelSlot
 
         if preset is Preset.SMOOAI_GATEWAY:
-            # Semantic aliases the gateway's LiteLLM config maps to whichever
-            # underlying model is currently best. Changing the underlying model is
-            # a server-side deploy — no client release needed.
+            # Concrete model names the gateway serves. The legacy semantic
+            # ``smooth-*`` aliases were removed server-side and 400 with "Invalid
+            # model name", so moving a slot is a client/preset change here.
+            # Gateway model policy: gpt-6-luna (or -fast / -high) or a Groq alias.
             registry.register_provider(smooai_gateway_provider(api_key))
             registry.routing = ModelRouting(
-                coding=slot("smooai-gateway", "smooth-coding"),
-                reasoning=slot("smooai-gateway", "smooth-reasoning"),
-                reviewing=slot("smooai-gateway", "smooth-reviewing"),
-                judge=slot("smooai-gateway", "smooth-judge"),
-                summarize=slot("smooai-gateway", "smooth-summarize"),
-                default=slot("smooai-gateway", "smooth-default"),
-                fast=slot("smooai-gateway", "smooth-fast"),
+                coding=slot("smooai-gateway", "gpt-6-luna"),
+                reasoning=slot("smooai-gateway", "gpt-6-luna-high"),
+                reviewing=slot("smooai-gateway", "gpt-6-luna-high"),
+                judge=slot("smooai-gateway", "groq-gpt-oss-120b"),
+                summarize=slot("smooai-gateway", "gpt-6-luna-fast"),
+                default=slot("smooai-gateway", "gpt-6-luna"),
+                fast=slot("smooai-gateway", "gpt-6-luna-fast"),
             )
         elif preset is Preset.OPENROUTER_LOW_COST:
             # OpenRouter uses provider-prefixed model IDs.
@@ -464,13 +467,13 @@ class ProviderRegistry:
         elif preset is Preset.OPENAI:
             registry.register_provider(openai_provider(api_key))
             registry.routing = ModelRouting(
-                coding=slot("openai", "gpt-4o"),
-                reasoning=slot("openai", "o3-mini"),
-                reviewing=slot("openai", "gpt-4o"),
-                judge=slot("openai", "gpt-4o-mini"),
-                summarize=slot("openai", "gpt-4o-mini"),
-                default=slot("openai", "gpt-4o"),
-                fast=slot("openai", "gpt-4o-mini"),
+                coding=slot("openai", "gpt-6-luna"),
+                reasoning=slot("openai", "gpt-6-luna"),
+                reviewing=slot("openai", "gpt-6-luna"),
+                judge=slot("openai", "gpt-6-luna"),
+                summarize=slot("openai", "gpt-6-luna"),
+                default=slot("openai", "gpt-6-luna"),
+                fast=slot("openai", "gpt-6-luna"),
             )
         elif preset is Preset.ANTHROPIC:
             registry.register_provider(anthropic_provider(api_key))
