@@ -462,7 +462,7 @@ dev = [
 
 [[package]]
 name = "smooai-smooth-operator-temporal"
-version = "1.13.6"
+version = "1.14.0"
 source = { editable = "." }
 dependencies = [
     { name = "smooai-smooth-operator-core" },
