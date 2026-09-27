@@ -997,6 +997,17 @@ impl LlmClient {
     fn build_openai_request(&self, messages: &[&Message], tools: &[ToolSchema], format: Option<&ResponseFormat>) -> ChatRequest {
         let mut chat_messages: Vec<ChatMessage> = messages.iter().map(|m| to_chat_message(m)).collect();
 
+        // `to_chat_message` replays `reasoning_content` on every assistant
+        // message because DeepSeek/Kimi thinking-mode upstreams 400 without
+        // it — but Groq 400s WITH it. Strip it here, in the builder both the
+        // streaming and non-streaming paths share, so prior turns AND in-turn
+        // tool iterations are covered. SMOODEV-3342.
+        if rejects_replayed_reasoning(&self.config.model) {
+            for m in &mut chat_messages {
+                m.reasoning_content = None;
+            }
+        }
+
         let mut chat_tools: Vec<ChatTool> = tools
             .iter()
             .map(|t| ChatTool {
@@ -2592,6 +2603,31 @@ pub fn canonical_tool_arguments_json(value: &serde_json::Value) -> String {
     }
 }
 
+/// Whether `model` rejects a replayed `reasoning_content` field on assistant
+/// history messages, so the OpenAI-compatible request builder must strip it.
+///
+/// The two halves pull in opposite directions, which is why this stays
+/// model-gated rather than dropping the replay everywhere:
+///
+/// - **DeepSeek / Kimi thinking-mode upstreams NEED the replay.** Without
+///   `reasoning_content` on the prior assistant turn they 400 with
+///   "reasoning_content must be passed back in the thinking mode"
+///   (pearl th-eae0f8), so [`to_chat_message`] replays it by default.
+/// - **Groq REJECTS it.** Groq's OpenAI-compat endpoint 400s on the same
+///   field: `'messages.2' : for 'role:assistant' … property
+///   'reasoning_content' is unsupported`. Behind a LiteLLM gateway that 400
+///   is swallowed by a model fallback, so every tool-using turn on
+///   `groq-gpt-oss-120b` after the first iteration was silently served by
+///   the fallback model (SMOODEV-3247, SMOODEV-3342).
+///
+/// Matches the gateway alias form (`groq-gpt-oss-120b`) and the LiteLLM
+/// provider-prefixed form (`groq/openai/gpt-oss-120b`), case-insensitively.
+#[must_use]
+pub fn rejects_replayed_reasoning(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m.starts_with("groq-") || m.starts_with("groq/")
+}
+
 /// Decide whether the configured upstream understands Anthropic-shaped
 /// `cache_control` markers. We send them when:
 ///   - the model id looks Claude-ish (`claude-`, `sonnet`, `opus`, `haiku`),
@@ -2950,6 +2986,58 @@ mod tests {
         assert_eq!(tagged["metadata"], serde_json::json!({ "k": "v" }));
         tagged.as_object_mut().unwrap().remove("metadata");
         assert_eq!(tagged, untagged, "metadata must be purely additive");
+    }
+
+    /// Serialize a user → assistant(with reasoning) → user history through
+    /// `build_openai_request` for `model` and return the assistant message.
+    fn replayed_assistant_for(model: &str) -> serde_json::Value {
+        let client = LlmClient::new(LlmConfig::openrouter("key").with_model(model));
+        let mut assistant = Message::assistant("calling the tool");
+        assistant.reasoning_content = Some("let me think".into());
+        let msgs = [Message::user("hi"), assistant, Message::user("and then?")];
+        let refs: Vec<&Message> = msgs.iter().collect();
+        let v = serde_json::to_value(client.build_openai_request(&refs, &[], None)).expect("serialize");
+        assert_eq!(v["messages"][1]["role"], "assistant", "{v}");
+        v["messages"][1].clone()
+    }
+
+    #[test]
+    fn build_openai_request_strips_replayed_reasoning_for_groq() {
+        // SMOODEV-3342: Groq 400s on `reasoning_content` on an assistant
+        // message; behind the gateway that silently fell back to another
+        // model on every tool iteration after the first.
+        for model in ["groq-gpt-oss-120b", "groq/openai/gpt-oss-120b", "GROQ-gpt-oss-20b"] {
+            let assistant = replayed_assistant_for(model);
+            assert!(
+                assistant.get("reasoning_content").is_none() && assistant.get("reasoning").is_none(),
+                "{model}: reasoning must not be replayed to Groq: {assistant}"
+            );
+            assert_eq!(assistant["content"], "calling the tool", "{model}: only reasoning is stripped");
+        }
+    }
+
+    #[test]
+    fn build_openai_request_keeps_replayed_reasoning_for_thinking_models() {
+        // th-eae0f8: DeepSeek/Kimi thinking-mode upstreams 400 WITHOUT the
+        // replay, so the strip must stay model-gated.
+        for model in ["deepseek-v4-pro", "kimi-k2-thinking", "gpt-6-luna"] {
+            let assistant = replayed_assistant_for(model);
+            assert_eq!(assistant["reasoning_content"], "let me think", "{model}: replay must be kept: {assistant}");
+        }
+    }
+
+    #[test]
+    fn rejects_replayed_reasoning_is_groq_only() {
+        assert!(rejects_replayed_reasoning("groq-gpt-oss-120b"));
+        assert!(rejects_replayed_reasoning("groq/openai/gpt-oss-120b"));
+        assert!(rejects_replayed_reasoning("  Groq-Compound  "));
+        assert!(!rejects_replayed_reasoning("deepseek-v4-pro"));
+        assert!(!rejects_replayed_reasoning("kimi-k2-thinking"));
+        assert!(!rejects_replayed_reasoning("openai/gpt-oss-120b"));
+        // Prefix, not substring: a model merely mentioning groq is not Groq.
+        assert!(!rejects_replayed_reasoning("my-groq-proxy"));
+        assert!(!rejects_replayed_reasoning("groqish"));
+        assert!(!rejects_replayed_reasoning(""));
     }
 
     #[test]
