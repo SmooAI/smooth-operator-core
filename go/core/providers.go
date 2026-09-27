@@ -73,12 +73,12 @@ func (p ProviderConfig) String() string {
 
 // OpenRouterProvider is OpenRouter — an OpenAI-compatible proxy for many models.
 func OpenRouterProvider(apiKey string) ProviderConfig {
-	return ProviderConfig{"openrouter", "https://openrouter.ai/api/v1", apiKey, APIFormatOpenAICompat, "openai/gpt-4o"}
+	return ProviderConfig{"openrouter", "https://openrouter.ai/api/v1", apiKey, APIFormatOpenAICompat, "openai/gpt-6-luna"}
 }
 
 // OpenAIProvider is the OpenAI direct API.
 func OpenAIProvider(apiKey string) ProviderConfig {
-	return ProviderConfig{"openai", "https://api.openai.com/v1", apiKey, APIFormatOpenAICompat, "gpt-4o"}
+	return ProviderConfig{"openai", "https://api.openai.com/v1", apiKey, APIFormatOpenAICompat, "gpt-6-luna"}
 }
 
 // AnthropicProvider is the Anthropic native API.
@@ -108,16 +108,17 @@ func KimiCodeProvider(apiKey string) ProviderConfig {
 
 // LlmGatewayProvider is LLM Gateway — a unified API for 210+ models.
 func LlmGatewayProvider(apiKey string) ProviderConfig {
-	return ProviderConfig{"llmgateway", "https://api.llmgateway.io/v1", apiKey, APIFormatOpenAICompat, "openai/gpt-4o"}
+	return ProviderConfig{"llmgateway", "https://api.llmgateway.io/v1", apiKey, APIFormatOpenAICompat, "openai/gpt-6-luna"}
 }
 
 // SmooaiGatewayProvider is the hosted LiteLLM-backed gateway run by Smoo AI.
 //
 // One API key, one URL, OpenAI-compatible. The gateway handles provider
-// selection, billing, moderation and cost tracking server-side, so consumers
-// reference models by semantic aliases (`smooth-coding`, `smooth-judge`, …) that
-// the gateway maps to whichever underlying model is currently best — upgrades
-// ship server-side with no client release.
+// selection, billing, moderation and cost tracking server-side. It serves
+// concrete model names (`gpt-6-luna`, `gpt-6-luna-fast`, `groq-gpt-oss-120b`, …);
+// the old semantic `smooth-*` aliases were removed and are now rejected with
+// HTTP 400 "Invalid model name", so moving a slot to a different model is a
+// client/preset change, not a server-side one. The default model is `gpt-6-luna`.
 //
 // SMOOAI_GATEWAY_URL overrides the base URL for self-hosted installs or dev.
 func SmooaiGatewayProvider(apiKey string) ProviderConfig {
@@ -127,7 +128,7 @@ func SmooaiGatewayProvider(apiKey string) ProviderConfig {
 	if !ok {
 		apiURL = "https://llm.smoo.ai/v1"
 	}
-	return ProviderConfig{"smooai-gateway", apiURL, apiKey, APIFormatOpenAICompat, "smooth-default"}
+	return ProviderConfig{"smooai-gateway", apiURL, apiKey, APIFormatOpenAICompat, "gpt-6-luna"}
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +164,7 @@ var AllPresets = []PresetInfo{
 	{"smooai-gateway", "Smoo AI Gateway (recommended)", "Hosted LiteLLM gateway run by Smoo AI — billing, moderation, governance, 100+ models. One key, one URL, no config."},
 	{"openrouter-low-cost", "OpenRouter Low Cost", "GLM-5.1 thinking (#1 SWE-Bench Pro), MiniMax-M2.7 coding (56% SWE-Pro, 10B params), DeepSeek-V3.2 default"},
 	{"llmgateway-low-cost", "LLM Gateway Low Cost", "GLM-5 thinking, MiniMax-M2.7 coding, DeepSeek-V3.2 default — unified billing, 224 models"},
-	{"openai", "OpenAI", "o3-mini thinking, GPT-4o coding — OpenAI ecosystem"},
+	{"openai", "OpenAI", "GPT-6 Luna on every slot — OpenAI ecosystem"},
 	{"anthropic", "Anthropic", "Claude Opus thinking, Sonnet coding — highest quality"},
 }
 
@@ -425,18 +426,19 @@ func RegistryFromPreset(preset Preset, apiKey string) *ProviderRegistry {
 
 	switch preset {
 	case PresetSmooaiGateway:
-		// Semantic aliases the gateway's LiteLLM config maps to whichever
-		// underlying model is currently best. Changing the underlying model is
-		// a server-side deploy — no client release needed.
+		// Concrete model names the gateway serves. The legacy semantic
+		// `smooth-*` aliases were removed server-side and 400 with "Invalid
+		// model name", so moving a slot is a client/preset change here.
+		// Gateway model policy: gpt-6-luna (or -fast / -high) or a Groq alias.
 		r.RegisterProvider(SmooaiGatewayProvider(apiKey))
 		r.Routing = ModelRouting{
-			Coding:    slot("smooai-gateway", "smooth-coding"),
-			Reasoning: ptr(slot("smooai-gateway", "smooth-reasoning")),
-			Reviewing: slot("smooai-gateway", "smooth-reviewing"),
-			Judge:     slot("smooai-gateway", "smooth-judge"),
-			Summarize: slot("smooai-gateway", "smooth-summarize"),
-			Default:   slot("smooai-gateway", "smooth-default"),
-			Fast:      ptr(slot("smooai-gateway", "smooth-fast")),
+			Coding:    slot("smooai-gateway", "gpt-6-luna"),
+			Reasoning: ptr(slot("smooai-gateway", "gpt-6-luna-high")),
+			Reviewing: slot("smooai-gateway", "gpt-6-luna-high"),
+			Judge:     slot("smooai-gateway", "groq-gpt-oss-120b"),
+			Summarize: slot("smooai-gateway", "gpt-6-luna-fast"),
+			Default:   slot("smooai-gateway", "gpt-6-luna"),
+			Fast:      ptr(slot("smooai-gateway", "gpt-6-luna-fast")),
 		}
 	case PresetOpenRouterLowCost:
 		// OpenRouter uses provider-prefixed model IDs.
@@ -465,13 +467,13 @@ func RegistryFromPreset(preset Preset, apiKey string) *ProviderRegistry {
 	case PresetOpenAI:
 		r.RegisterProvider(OpenAIProvider(apiKey))
 		r.Routing = ModelRouting{
-			Coding:    slot("openai", "gpt-4o"),
-			Reasoning: ptr(slot("openai", "o3-mini")),
-			Reviewing: slot("openai", "gpt-4o"),
-			Judge:     slot("openai", "gpt-4o-mini"),
-			Summarize: slot("openai", "gpt-4o-mini"),
-			Default:   slot("openai", "gpt-4o"),
-			Fast:      ptr(slot("openai", "gpt-4o-mini")),
+			Coding:    slot("openai", "gpt-6-luna"),
+			Reasoning: ptr(slot("openai", "gpt-6-luna")),
+			Reviewing: slot("openai", "gpt-6-luna"),
+			Judge:     slot("openai", "gpt-6-luna"),
+			Summarize: slot("openai", "gpt-6-luna"),
+			Default:   slot("openai", "gpt-6-luna"),
+			Fast:      ptr(slot("openai", "gpt-6-luna")),
 		}
 	case PresetAnthropic:
 		r.RegisterProvider(AnthropicProvider(apiKey))

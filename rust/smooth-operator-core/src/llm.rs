@@ -167,7 +167,7 @@ impl LlmConfig {
         Self {
             api_url: "https://openrouter.ai/api/v1".into(),
             api_key: api_key.into(),
-            model: "openai/gpt-4o".into(),
+            model: "openai/gpt-6-luna".into(),
             max_tokens: 32768,
             temperature: 0.0,
             retry_policy: RetryPolicy::default(),

@@ -43,7 +43,7 @@ impl Preset {
             "LLM Gateway Low Cost",
             "GLM-5 thinking, MiniMax-M2.7 coding, DeepSeek-V3.2 default — unified billing, 224 models",
         ),
-        ("openai", "OpenAI", "o3-mini thinking, GPT-4o coding — OpenAI ecosystem"),
+        ("openai", "OpenAI", "GPT-6 Luna on every slot — OpenAI ecosystem"),
         ("anthropic", "Anthropic", "Claude Opus thinking, Sonnet coding — highest quality"),
     ];
 
@@ -103,7 +103,7 @@ impl ProviderConfig {
             api_url: "https://openrouter.ai/api/v1".into(),
             api_key: api_key.into(),
             api_format: ApiFormat::OpenAiCompat,
-            default_model: "openai/gpt-4o".into(),
+            default_model: "openai/gpt-6-luna".into(),
         }
     }
 
@@ -114,7 +114,7 @@ impl ProviderConfig {
             api_url: "https://api.openai.com/v1".into(),
             api_key: api_key.into(),
             api_format: ApiFormat::OpenAiCompat,
-            default_model: "gpt-4o".into(),
+            default_model: "gpt-6-luna".into(),
         }
     }
 
@@ -170,7 +170,7 @@ impl ProviderConfig {
             api_url: "https://api.llmgateway.io/v1".into(),
             api_key: api_key.into(),
             api_format: ApiFormat::OpenAiCompat,
-            default_model: "openai/gpt-4o".into(),
+            default_model: "openai/gpt-6-luna".into(),
         }
     }
 
@@ -178,11 +178,12 @@ impl ProviderConfig {
     ///
     /// One API key, one URL, OpenAI-compatible. The gateway handles
     /// provider selection, billing, moderation, governance, and cost
-    /// tracking on the server side. Consumers reference models by
-    /// semantic aliases (`smooth-coding`, `smooth-judge`, …) that the
-    /// gateway's LiteLLM config maps to whichever underlying model is
-    /// currently best — upgrades ship server-side with no client
-    /// release needed.
+    /// tracking on the server side. The gateway serves concrete model
+    /// names (`gpt-6-luna`, `gpt-6-luna-fast`, `groq-gpt-oss-120b`, …);
+    /// the old semantic `smooth-*` aliases were removed and are now
+    /// rejected with HTTP 400 "Invalid model name". Moving a slot to a
+    /// different model is therefore a client/preset change, not a
+    /// server-side one. The default model is `gpt-6-luna`.
     ///
     /// The base URL is configurable via the `SMOOAI_GATEWAY_URL`
     /// environment variable for self-hosted installs or dev overrides.
@@ -194,7 +195,7 @@ impl ProviderConfig {
             api_url,
             api_key: api_key.into(),
             api_format: ApiFormat::OpenAiCompat,
-            default_model: "smooth-default".into(),
+            default_model: "gpt-6-luna".into(),
         }
     }
 
@@ -234,8 +235,8 @@ pub enum Activity {
     /// Small, latency-sensitive utility calls: session auto-naming,
     /// short-title generation, one-liner tool-result summaries,
     /// autocomplete. Sub-second first token, short output (<500 tok),
-    /// no tool use. Target is a Haiku-class model via
-    /// `smooth-fast`. Meaningfully cheaper than the coding slot —
+    /// no tool use. Target is a small, fast model (`gpt-6-luna-fast`
+    /// on the Smoo AI Gateway). Meaningfully cheaper than the coding slot —
     /// don't pay Sonnet-plus prices to name a session.
     Fast,
 }
@@ -390,29 +391,30 @@ impl ProviderRegistry {
 
         match preset {
             Preset::SmoaiGateway => {
-                // Smoo AI Gateway uses semantic model aliases that the
-                // server-side LiteLLM config maps to whichever underlying
-                // model is currently best for each activity. Changing the
-                // underlying model is a server-side deploy — no client
-                // release needed.
+                // The Smoo AI Gateway serves concrete model names. The
+                // legacy semantic `smooth-*` aliases (smooth-coding,
+                // smooth-judge, …) were removed from the gateway and are
+                // rejected with HTTP 400 "Invalid model name", so moving a
+                // slot to a different model is a client/preset change here.
                 //
-                // Six canonical slots + a `default` compatibility slot:
-                //   smooth-coding    → coding workhorse (also serves default)
-                //   smooth-reasoning → deep reasoning + planning
-                //   smooth-reviewing → adversarial code review
-                //   smooth-judge     → Narc + guardrail verdicts
-                //   smooth-summarize → context compaction
-                //   smooth-fast      → session titles, autocomplete
-                //   smooth-default   → on-disk alias for smooth-coding
+                // Gateway model policy: every call goes to gpt-6-luna (or
+                // its -fast / -high variants) or a Groq alias.
+                //   coding    → gpt-6-luna          (workhorse)
+                //   reasoning → gpt-6-luna-high     (deep reasoning + planning)
+                //   reviewing → gpt-6-luna-high     (adversarial code review)
+                //   judge     → groq-gpt-oss-120b   (Narc + guardrail verdicts)
+                //   summarize → gpt-6-luna-fast     (context compaction)
+                //   fast      → gpt-6-luna-fast     (session titles, autocomplete)
+                //   default   → gpt-6-luna          (compatibility slot)
                 registry.register_provider(ProviderConfig::smooai_gateway(api_key));
                 registry.routing = ModelRouting {
-                    coding: ModelSlot::new("smooai-gateway", "smooth-coding"),
-                    reasoning: Some(ModelSlot::new("smooai-gateway", "smooth-reasoning")),
-                    reviewing: ModelSlot::new("smooai-gateway", "smooth-reviewing"),
-                    judge: ModelSlot::new("smooai-gateway", "smooth-judge"),
-                    summarize: ModelSlot::new("smooai-gateway", "smooth-summarize"),
-                    default: ModelSlot::new("smooai-gateway", "smooth-default"),
-                    fast: Some(ModelSlot::new("smooai-gateway", "smooth-fast")),
+                    coding: ModelSlot::new("smooai-gateway", "gpt-6-luna"),
+                    reasoning: Some(ModelSlot::new("smooai-gateway", "gpt-6-luna-high")),
+                    reviewing: ModelSlot::new("smooai-gateway", "gpt-6-luna-high"),
+                    judge: ModelSlot::new("smooai-gateway", "groq-gpt-oss-120b"),
+                    summarize: ModelSlot::new("smooai-gateway", "gpt-6-luna-fast"),
+                    default: ModelSlot::new("smooai-gateway", "gpt-6-luna"),
+                    fast: Some(ModelSlot::new("smooai-gateway", "gpt-6-luna-fast")),
                     planning: None,
                 };
             }
@@ -450,13 +452,13 @@ impl ProviderRegistry {
             Preset::OpenAI => {
                 registry.register_provider(ProviderConfig::openai(api_key));
                 registry.routing = ModelRouting {
-                    coding: ModelSlot::new("openai", "gpt-4o"),
-                    reasoning: Some(ModelSlot::new("openai", "o3-mini")),
-                    reviewing: ModelSlot::new("openai", "gpt-4o"),
-                    judge: ModelSlot::new("openai", "gpt-4o-mini"),
-                    summarize: ModelSlot::new("openai", "gpt-4o-mini"),
-                    default: ModelSlot::new("openai", "gpt-4o"),
-                    fast: Some(ModelSlot::new("openai", "gpt-4o-mini")),
+                    coding: ModelSlot::new("openai", "gpt-6-luna"),
+                    reasoning: Some(ModelSlot::new("openai", "gpt-6-luna")),
+                    reviewing: ModelSlot::new("openai", "gpt-6-luna"),
+                    judge: ModelSlot::new("openai", "gpt-6-luna"),
+                    summarize: ModelSlot::new("openai", "gpt-6-luna"),
+                    default: ModelSlot::new("openai", "gpt-6-luna"),
+                    fast: Some(ModelSlot::new("openai", "gpt-6-luna")),
                     planning: None,
                 };
             }
@@ -798,18 +800,18 @@ mod tests {
     #[test]
     fn llm_config_for_returns_correct_model() {
         // The SmooAI gateway is opt-in via the preset — exercise that path
-        // (one provider, semantic `smooth-*` aliases) explicitly.
+        // (one provider, concrete gateway model names) explicitly.
         let registry = ProviderRegistry::from_preset(Preset::SmoaiGateway, "test-key");
 
         let config = registry.llm_config_for(Activity::Reasoning).unwrap();
-        assert_eq!(config.model, "smooth-reasoning");
+        assert_eq!(config.model, "gpt-6-luna-high");
         assert_eq!(config.api_url, ProviderConfig::smooai_gateway("x").api_url);
 
         let config = registry.llm_config_for(Activity::Coding).unwrap();
-        assert_eq!(config.model, "smooth-coding");
+        assert_eq!(config.model, "gpt-6-luna");
 
         let config = registry.llm_config_for(Activity::Judge).unwrap();
-        assert_eq!(config.model, "smooth-judge");
+        assert_eq!(config.model, "groq-gpt-oss-120b");
     }
 
     // 7. llm_config_for falls back when provider missing
@@ -836,7 +838,7 @@ mod tests {
         let registry = ProviderRegistry::from_preset(Preset::SmoaiGateway, "default-key");
 
         let config = registry.default_llm_config().unwrap();
-        assert_eq!(config.model, "smooth-default");
+        assert_eq!(config.model, "gpt-6-luna");
         assert_eq!(config.api_key, "default-key");
     }
 
@@ -884,7 +886,7 @@ mod tests {
         assert_eq!(provider.api_key, "env-test-key");
 
         let config = registry.default_llm_config().unwrap();
-        assert_eq!(config.model, "gpt-4o"); // default model for openai
+        assert_eq!(config.model, "gpt-6-luna"); // default model for openai
 
         // Restore env
         match prev_key {
@@ -1064,23 +1066,17 @@ mod tests {
         let registry = ProviderRegistry::from_preset(Preset::OpenAI, "oai-key");
 
         let reasoning = registry.llm_config_for(Activity::Reasoning).unwrap();
-        assert_eq!(reasoning.model, "o3-mini");
+        assert_eq!(reasoning.model, "gpt-6-luna");
         assert_eq!(reasoning.api_url, "https://api.openai.com/v1");
 
-        let coding = registry.llm_config_for(Activity::Coding).unwrap();
-        assert_eq!(coding.model, "gpt-4o");
-
-        let reviewing = registry.llm_config_for(Activity::Reviewing).unwrap();
-        assert_eq!(reviewing.model, "gpt-4o");
-
-        let judge = registry.llm_config_for(Activity::Judge).unwrap();
-        assert_eq!(judge.model, "gpt-4o-mini");
-
-        let summarize = registry.llm_config_for(Activity::Summarize).unwrap();
-        assert_eq!(summarize.model, "gpt-4o-mini");
+        // Every OpenAI slot runs on gpt-6-luna.
+        for activity in [Activity::Coding, Activity::Reviewing, Activity::Judge, Activity::Summarize, Activity::Fast] {
+            let config = registry.llm_config_for(activity).unwrap();
+            assert_eq!(config.model, "gpt-6-luna", "{activity:?}");
+        }
 
         let default = registry.default_llm_config().unwrap();
-        assert_eq!(default.model, "gpt-4o");
+        assert_eq!(default.model, "gpt-6-luna");
     }
 
     // Serialize tests that mutate `SMOOAI_GATEWAY_URL` — cargo test runs
@@ -1091,7 +1087,7 @@ mod tests {
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
-    // 14b. Smoo AI Gateway preset creates correct routing with semantic aliases
+    // 14b. Smoo AI Gateway preset routes every slot to a real gateway model
     #[test]
     fn smooai_gateway_preset_creates_correct_routing() {
         let _guard = smooai_gateway_env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -1105,27 +1101,44 @@ mod tests {
         let registry = ProviderRegistry::from_preset(Preset::SmoaiGateway, "smooai-key");
 
         // Every slot routes to the `smooai-gateway` provider with a
-        // semantic `smooth-*` alias. The alias → upstream model mapping
-        // lives in the gateway's LiteLLM config, not here.
+        // concrete model name the gateway serves. The legacy `smooth-*`
+        // aliases were removed server-side and now 400 with
+        // "Invalid model name", so none may appear here.
         let reasoning = registry.llm_config_for(Activity::Reasoning).unwrap();
-        assert_eq!(reasoning.model, "smooth-reasoning");
+        assert_eq!(reasoning.model, "gpt-6-luna-high");
         assert_eq!(reasoning.api_url, "https://llm.smoo.ai/v1");
         assert_eq!(reasoning.api_key, "smooai-key");
 
         let coding = registry.llm_config_for(Activity::Coding).unwrap();
-        assert_eq!(coding.model, "smooth-coding");
+        assert_eq!(coding.model, "gpt-6-luna");
 
         let reviewing = registry.llm_config_for(Activity::Reviewing).unwrap();
-        assert_eq!(reviewing.model, "smooth-reviewing");
+        assert_eq!(reviewing.model, "gpt-6-luna-high");
 
         let judge = registry.llm_config_for(Activity::Judge).unwrap();
-        assert_eq!(judge.model, "smooth-judge");
+        assert_eq!(judge.model, "groq-gpt-oss-120b");
 
         let summarize = registry.llm_config_for(Activity::Summarize).unwrap();
-        assert_eq!(summarize.model, "smooth-summarize");
+        assert_eq!(summarize.model, "gpt-6-luna-fast");
+
+        let fast = registry.llm_config_for(Activity::Fast).unwrap();
+        assert_eq!(fast.model, "gpt-6-luna-fast");
 
         let default = registry.default_llm_config().unwrap();
-        assert_eq!(default.model, "smooth-default");
+        assert_eq!(default.model, "gpt-6-luna");
+
+        for activity in [
+            Activity::Coding,
+            Activity::Reasoning,
+            Activity::Reviewing,
+            Activity::Judge,
+            Activity::Summarize,
+            Activity::Fast,
+        ] {
+            let model = registry.llm_config_for(activity).unwrap().model;
+            assert!(!model.starts_with("smooth-"), "{activity:?} routes to removed gateway alias {model}");
+        }
+        assert_eq!(ProviderConfig::smooai_gateway("k").default_model, "gpt-6-luna");
 
         // Restore any prior override.
         if let Some(v) = prior {

@@ -228,7 +228,7 @@ def test_from_env_reads_provider_and_model(monkeypatch):
     registry = ProviderRegistry.from_env()
     assert registry is not None
     assert registry.get_provider("openai").api_key == "env-test-key"
-    assert registry.default_llm_config().model == "gpt-4o"
+    assert registry.default_llm_config().model == "gpt-6-luna"
 
     monkeypatch.setenv("SMOOTH_MODEL", "gpt-4o-mini")
     assert ProviderRegistry.from_env().default_llm_config().model == "gpt-4o-mini"
@@ -271,7 +271,7 @@ def test_client_for_refuses_a_non_openai_dialect():
     Anthropic-dialect provider must be refused, not spoken to in OpenAI's format."""
     client, config = ProviderRegistry.from_preset(Preset.OPENAI, "k").client_for(Activity.CODING)
     assert hasattr(client.chat.completions, "create")
-    assert config.model == "gpt-4o"
+    assert config.model == "gpt-6-luna"
 
     with pytest.raises(ValueError, match="cannot speak"):
         ProviderRegistry.from_preset(Preset.ANTHROPIC, "k").client_for(Activity.CODING)

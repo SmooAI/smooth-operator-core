@@ -431,7 +431,7 @@ func TestRegistryFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("default config: %v", err)
 	}
-	if config.Model != "gpt-4o" {
+	if config.Model != "gpt-6-luna" {
 		t.Errorf("model should default to the provider's default model, got %q", config.Model)
 	}
 
@@ -498,7 +498,7 @@ func TestClientForRejectsNonOpenAIFormat(t *testing.T) {
 	if client == nil {
 		t.Fatal("client should not be nil")
 	}
-	if config.Model != "gpt-4o" {
+	if config.Model != "gpt-6-luna" {
 		t.Errorf("resolved config should accompany the client, got %+v", config)
 	}
 

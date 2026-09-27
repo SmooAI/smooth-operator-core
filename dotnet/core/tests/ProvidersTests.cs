@@ -381,7 +381,7 @@ public class ProvidersTests : IDisposable
             var registry = ProviderRegistry.FromEnv();
             Assert.NotNull(registry);
             Assert.Equal("env-test-key", registry!.GetProvider("openai")?.ApiKey);
-            Assert.Equal("gpt-4o", registry.DefaultLlmConfig().Model);
+            Assert.Equal("gpt-6-luna", registry.DefaultLlmConfig().Model);
 
             Environment.SetEnvironmentVariable("SMOOTH_MODEL", "gpt-4o-mini");
             Assert.Equal("gpt-4o-mini", ProviderRegistry.FromEnv()!.DefaultLlmConfig().Model);
@@ -461,7 +461,7 @@ public class ProvidersTests : IDisposable
         var (client, config) = ProviderRegistry.FromPreset(Preset.OpenAI, "k").ClientFor(Activity.Coding);
         using (client)
         {
-            Assert.Equal("gpt-4o", config.Model);
+            Assert.Equal("gpt-6-luna", config.Model);
         }
 
         var ex = Assert.Throws<InvalidOperationException>(() => ProviderRegistry.FromPreset(Preset.Anthropic, "k").ClientFor(Activity.Coding));

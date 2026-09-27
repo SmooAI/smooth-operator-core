@@ -260,7 +260,7 @@ describe('provider routing — registry behaviour', () => {
         try {
             const registry = ProviderRegistry.fromEnv()!;
             expect(registry.getProvider('openai')?.apiKey).toBe('env-test-key');
-            expect(registry.defaultLlmConfig().model).toBe('gpt-4o');
+            expect(registry.defaultLlmConfig().model).toBe('gpt-6-luna');
 
             process.env.SMOOTH_MODEL = 'gpt-4o-mini';
             expect(ProviderRegistry.fromEnv()!.defaultLlmConfig().model).toBe('gpt-4o-mini');
@@ -307,7 +307,7 @@ describe('provider routing — registry behaviour', () => {
     it('builds a client for an OpenAI-compatible route and refuses an Anthropic one', () => {
         const { client, config } = ProviderRegistry.fromPreset(Preset.OpenAI, 'k').clientFor(Activity.Coding);
         expect(client.chat.completions.create).toBeTypeOf('function');
-        expect(config.model).toBe('gpt-4o');
+        expect(config.model).toBe('gpt-6-luna');
 
         expect(() => ProviderRegistry.fromPreset(Preset.Anthropic, 'k').clientFor(Activity.Coding)).toThrow(/cannot speak/);
     });
