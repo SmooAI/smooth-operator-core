@@ -1,5 +1,12 @@
 # @smooai/smooth-operator-temporal
 
+## 1.14.2
+
+### Patch Changes
+
+- Updated dependencies [67fac83]
+  - @smooai/smooth-operator-core@1.14.2
+
 ## 1.14.1
 
 ### Patch Changes
