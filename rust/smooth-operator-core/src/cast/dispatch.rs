@@ -387,6 +387,13 @@ impl Tool for DispatchSubagentTool {
         // parallel batch run it alongside another write.
         false
     }
+
+    fn timeout(&self) -> Option<std::time::Duration> {
+        // A sidekick runs a whole agent loop (and may wait on human
+        // confirmations inside it); its own tool calls carry their own
+        // deadlines, so the dispatch itself is unbounded.
+        Some(crate::tool::NO_TOOL_TIMEOUT)
+    }
 }
 
 #[cfg(test)]

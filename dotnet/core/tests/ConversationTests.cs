@@ -92,4 +92,54 @@ public class ConversationTests
         Assert.False(result.Compacted);
         Assert.Equal(3, messages.Count);
     }
+
+    [Fact]
+    public void Compactor_SlidingWindow_DropsToolCallWithItsResults()
+    {
+        // SMOODEV-3704: an assistant message with parallel tool calls followed by its
+        // results. Dropping the call one message at a time left the results as orphans.
+        var filler = new string('x', 200);
+        var call = new ChatMessage(ChatRole.Assistant, [
+            new FunctionCallContent("p1", "lookup"),
+            new FunctionCallContent("p2", "lookup"),
+            new FunctionCallContent("p3", "lookup"),
+        ]);
+        var messages = new List<ChatMessage>
+        {
+            new(ChatRole.System, "sys"),
+            call,
+            new(ChatRole.Tool, [new FunctionResultContent("p1", filler)]),
+            new(ChatRole.Tool, [new FunctionResultContent("p2", filler)]),
+            new(ChatRole.Tool, [new FunctionResultContent("p3", filler)]),
+            new(ChatRole.User, "next question"),
+        };
+
+        var result = Compactor.Compact(messages, CompactionStrategy.SlidingWindow, maxTokens: 10);
+
+        Assert.Equal(4, result.MessagesRemoved);
+        Assert.Equal(2, messages.Count);
+        Assert.DoesNotContain(messages, m => m.Role == ChatRole.Tool);
+        Assert.Contains("next question", messages[^1].Text);
+    }
+
+    [Fact]
+    public void Compactor_SlidingWindow_KeepsGroupThatEndsTheConversation()
+    {
+        // Mid tool loop the conversation ends on tool results; dropping their call
+        // would orphan them, so compaction stops (over budget) instead.
+        var filler = new string('x', 200);
+        var messages = new List<ChatMessage>
+        {
+            new(ChatRole.System, "sys"),
+            new(ChatRole.User, "question " + filler),
+            new(ChatRole.Assistant, [new FunctionCallContent("p1", "lookup")]),
+            new(ChatRole.Tool, [new FunctionResultContent("p1", filler)]),
+        };
+
+        Compactor.Compact(messages, CompactionStrategy.SlidingWindow, maxTokens: 10);
+
+        Assert.Equal(3, messages.Count);
+        Assert.Equal(ChatRole.Assistant, messages[1].Role);
+        Assert.Equal(ChatRole.Tool, messages[2].Role);
+    }
 }

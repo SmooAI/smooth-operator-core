@@ -727,6 +727,22 @@ impl Tool for DelegationTool {
 
         Ok(last_assistant)
     }
+
+    fn timeout(&self) -> Option<std::time::Duration> {
+        // A sub-agent runs a whole agent loop whose tools carry their own
+        // deadlines; bounding the delegation would cut it off mid-task.
+        Some(crate::tool::NO_TOOL_TIMEOUT)
+    }
+}
+
+/// Repair the history before it's sent: a tool result without its call (or
+/// a call without its result) makes the provider 400 and kills the turn
+/// (SMOODEV-3704). A no-op on a well-formed history.
+fn repair_tool_pairs(conversation: &mut Conversation) {
+    let repaired = conversation.sanitize_tool_pairs();
+    if repaired > 0 {
+        tracing::warn!(repaired, "repaired unpaired tool calls/results before LLM call");
+    }
 }
 
 /// An AI agent that runs an observe → think → act loop.
@@ -1028,6 +1044,8 @@ impl Agent {
                 );
             }
 
+            repair_tool_pairs(&mut conversation);
+
             // Observe: get context window
             let context = conversation.context_window();
             // SEP `context` hook may replace the whole message array before the
@@ -1254,6 +1272,7 @@ impl Agent {
                 );
             }
 
+            repair_tool_pairs(&mut conversation);
             let context = conversation.context_window();
             // SEP `context` hook may replace the whole message array before the
             // LLM sees it; `None` keeps the borrowed, zero-copy path (unhooked).

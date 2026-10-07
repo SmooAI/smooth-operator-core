@@ -444,7 +444,7 @@ wheels = [
 
 [[package]]
 name = "smooai-smooth-operator-core"
-version = "1.13.6"
+version = "1.14.1"
 source = { editable = "../core" }
 dependencies = [
     { name = "openai" },

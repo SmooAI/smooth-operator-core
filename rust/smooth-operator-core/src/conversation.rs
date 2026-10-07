@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use chrono::{DateTime, Utc};
@@ -369,6 +370,12 @@ impl Conversation {
     }
 
     /// Get messages within the context window, always keeping the system prompt.
+    ///
+    /// Trimming walks newest → oldest, so the budget can fall between an
+    /// assistant message carrying `tool_calls` and its (newer) results. The
+    /// window is therefore passed through [`well_formed_tool_pairs`] last: a
+    /// tool result whose assistant call was trimmed would 400 the request
+    /// ("No tool call found for function call output", SMOODEV-3704).
     pub fn context_window(&self) -> Vec<&Message> {
         let mut result = Vec::new();
         let mut total_tokens = 0;
@@ -394,7 +401,7 @@ impl Conversation {
         recent.reverse();
         result.extend(recent);
 
-        result
+        well_formed_tool_pairs(result)
     }
 
     /// Total estimated tokens in the full conversation.
@@ -466,6 +473,9 @@ impl Conversation {
                 }
             }
         }
+        // Every strategy drops or rewrites messages by position, so whatever
+        // it did, never leave a tool result without its call (or vice versa).
+        self.sanitize_tool_pairs();
 
         let tokens_after = self.total_tokens();
         let messages_after = self.messages.len();
@@ -492,6 +502,72 @@ impl Conversation {
         }
     }
 
+    /// Move a compaction `boundary` (index of the first kept message) back so
+    /// it never splits an assistant message from its tool results.
+    ///
+    /// A plain `len - keep_recent` cut can land inside a group of parallel
+    /// tool calls: the assistant message falls in the compacted zone while
+    /// some of its results are kept, leaving orphan results that the provider
+    /// rejects with a 400 (SMOODEV-3704). Pulling the boundary back to the
+    /// group's assistant keeps the whole group verbatim. Repeats until stable,
+    /// because the newly kept span can itself hold results of an older call.
+    fn align_to_tool_group(&self, mut boundary: usize) -> usize {
+        loop {
+            let kept_ids: HashSet<&str> = self.messages[boundary..]
+                .iter()
+                .filter(|m| m.role == Role::Tool)
+                .filter_map(|m| m.tool_call_id.as_deref())
+                .collect();
+            let group_start = self.messages[..boundary]
+                .iter()
+                .position(|m| m.role == Role::Assistant && m.tool_calls.iter().any(|tc| kept_ids.contains(tc.id.as_str())));
+            match group_start {
+                Some(start) => boundary = start,
+                None => return boundary,
+            }
+        }
+    }
+
+    /// Repair the stored history so every tool result answers a call made by
+    /// an earlier assistant message, and every assistant tool call has a
+    /// result. Orphan and duplicate results are dropped; unanswered calls are
+    /// stripped from their assistant message, and an assistant message left
+    /// with no content and no calls is dropped. Returns how many messages
+    /// were removed or rewritten (0 for a well-formed history).
+    ///
+    /// Run by [`Self::compact`] and by the agent loop before each LLM call so
+    /// a history broken by any path (compaction, an interrupted turn, a
+    /// checkpoint from an older engine) can't 400 the request.
+    pub fn sanitize_tool_pairs(&mut self) -> usize {
+        let keep = tool_pair_keep_mask(&self.messages);
+        let answered: HashSet<String> = self
+            .messages
+            .iter()
+            .zip(&keep)
+            .filter(|(m, k)| **k && m.role == Role::Tool)
+            .filter_map(|(m, _)| m.tool_call_id.clone())
+            .collect();
+
+        let mut changed = 0;
+        let mut out = Vec::with_capacity(self.messages.len());
+        for (mut msg, keep) in std::mem::take(&mut self.messages).into_iter().zip(keep) {
+            if !keep {
+                changed += 1;
+                continue;
+            }
+            if msg.role == Role::Assistant && msg.tool_calls.iter().any(|tc| !answered.contains(&tc.id)) {
+                changed += 1;
+                msg.tool_calls.retain(|tc| answered.contains(&tc.id));
+                if msg.tool_calls.is_empty() && msg.content.is_empty() {
+                    continue;
+                }
+            }
+            out.push(msg);
+        }
+        self.messages = out;
+        changed
+    }
+
     /// Replace old tool call + tool result pairs with compact one-liners.
     /// Messages within `keep_recent` of the end are preserved.
     fn compact_snip_tool_results(&mut self, keep_recent: usize) {
@@ -499,7 +575,7 @@ impl Conversation {
         if len <= keep_recent {
             return;
         }
-        let boundary = len - keep_recent;
+        let boundary = self.align_to_tool_group(len - keep_recent);
 
         // Collect tool_call_ids from Tool-role messages in the snip zone
         let tool_result_ids: std::collections::HashSet<String> = self.messages[..boundary]
@@ -563,7 +639,7 @@ impl Conversation {
         if len <= keep_recent {
             return;
         }
-        let boundary = len - keep_recent;
+        let boundary = self.align_to_tool_group(len - keep_recent);
 
         // Keep system messages + inject summary + keep recent
         let mut new_messages: Vec<Message> = Vec::new();
@@ -585,6 +661,72 @@ impl Conversation {
 
         self.messages = new_messages;
     }
+}
+
+/// Which messages of `messages` survive tool-pair repair: a tool result is
+/// kept only when an earlier message in the list announced its call id and
+/// no earlier result already answered it. Tool results without an id (legacy
+/// callers) pass through untouched. Shared by [`Conversation::sanitize_tool_pairs`]
+/// and [`well_formed_tool_pairs`].
+fn tool_pair_keep_mask<M: std::borrow::Borrow<Message>>(messages: &[M]) -> Vec<bool> {
+    let mut announced: HashSet<&str> = HashSet::new();
+    let mut answered: HashSet<&str> = HashSet::new();
+    messages
+        .iter()
+        .map(|m| {
+            let m = m.borrow();
+            if m.role == Role::Assistant {
+                announced.extend(m.tool_calls.iter().map(|tc| tc.id.as_str()));
+            }
+            match (&m.role, m.tool_call_id.as_deref()) {
+                (Role::Tool, Some(id)) => announced.contains(id) && answered.insert(id),
+                _ => true,
+            }
+        })
+        .collect()
+}
+
+/// Final pass over an outgoing (borrowed) message list: drop tool results
+/// whose call isn't in the list, then drop assistant messages that still
+/// carry a call with no result. A borrowed list can't have individual calls
+/// stripped, so an unanswered assistant message is dropped whole; the agent
+/// loop runs [`Conversation::sanitize_tool_pairs`] first, which strips them
+/// properly, so this only bites on a window trimmed mid-group.
+#[must_use]
+pub fn well_formed_tool_pairs(messages: Vec<&Message>) -> Vec<&Message> {
+    let keep = tool_pair_keep_mask(&messages);
+    let kept: Vec<&Message> = messages.into_iter().zip(keep).filter_map(|(m, k)| k.then_some(m)).collect();
+    let answered: HashSet<&str> = kept
+        .iter()
+        .copied()
+        .filter(|m| m.role == Role::Tool)
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    let unanswered: HashSet<&str> = kept
+        .iter()
+        .copied()
+        .filter(|m| m.role == Role::Assistant)
+        .flat_map(|m| m.tool_calls.iter().map(|tc| tc.id.as_str()))
+        .filter(|id| !answered.contains(id))
+        .collect();
+    if unanswered.is_empty() {
+        return kept;
+    }
+    // Dropping an assistant message orphans its other (answered) results,
+    // so those go too.
+    let dropped_ids: HashSet<&str> = kept
+        .iter()
+        .copied()
+        .filter(|m| m.role == Role::Assistant && m.tool_calls.iter().any(|tc| unanswered.contains(tc.id.as_str())))
+        .flat_map(|m| m.tool_calls.iter().map(|tc| tc.id.as_str()))
+        .collect();
+    kept.into_iter()
+        .filter(|m| match m.role {
+            Role::Assistant => !m.tool_calls.iter().any(|tc| dropped_ids.contains(tc.id.as_str())),
+            Role::Tool => !m.tool_call_id.as_deref().is_some_and(|id| dropped_ids.contains(id)),
+            _ => true,
+        })
+        .collect()
 }
 
 /// Convert conversation messages for a different LLM provider.
@@ -1210,5 +1352,169 @@ mod tests {
         // Result is converted
         assert_eq!(result.messages[0].content, "<thinking>thoughts</thinking>visible");
         assert_eq!(result.messages[1].tool_call_id, None);
+    }
+
+    // ── Tool-pair integrity (SMOODEV-3704) ──────────────────────────
+
+    fn call(id: &str) -> crate::tool::ToolCall {
+        crate::tool::ToolCall {
+            id: id.into(),
+            name: "lookup".into(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    /// Assert every tool result answers a call from an earlier assistant
+    /// message and every call has a later result — the invariant the
+    /// OpenAI/Anthropic APIs enforce with a 400.
+    fn assert_well_formed<'a>(messages: impl IntoIterator<Item = &'a Message>) {
+        let messages: Vec<&Message> = messages.into_iter().collect();
+        let mut announced = HashSet::new();
+        for m in &messages {
+            if m.role == Role::Assistant {
+                announced.extend(m.tool_calls.iter().map(|tc| tc.id.clone()));
+            }
+            if m.role == Role::Tool {
+                let id = m.tool_call_id.clone().expect("tool result id");
+                assert!(announced.contains(&id), "orphan tool result {id}");
+            }
+        }
+        for (i, m) in messages.iter().enumerate() {
+            for tc in &m.tool_calls {
+                assert!(
+                    messages[i + 1..]
+                        .iter()
+                        .any(|r| r.role == Role::Tool && r.tool_call_id.as_deref() == Some(tc.id.as_str())),
+                    "unanswered tool call {}",
+                    tc.id
+                );
+            }
+        }
+    }
+
+    /// The incident shape: one assistant message with three parallel calls,
+    /// and `keep_recent` lands after the first result. Before the fix the
+    /// assistant message was snipped and results 2-3 were kept as orphans.
+    #[test]
+    fn snip_keeps_parallel_tool_group_that_straddles_keep_recent() {
+        let mut conv = Conversation::new(100_000).with_system_prompt("Sys");
+        for i in 0..6 {
+            conv.push(Message::user(format!("u{i}")));
+            conv.push(Message::assistant(format!("a{i}")));
+        }
+        conv.push(assistant_with_tool_calls("checking", vec![call("p1"), call("p2"), call("p3")]));
+        conv.push(Message::tool_result("p1", "one"));
+        conv.push(Message::tool_result("p2", "two"));
+        conv.push(Message::tool_result("p3", "three"));
+        for i in 0..8 {
+            conv.push(Message::user(format!("later{i}")));
+        }
+        // 1 sys + 12 + 1 + 3 + 8 = 25; keep_recent 10 cuts between p1 and p2.
+        assert_eq!(conv.messages[25 - 10].tool_call_id.as_deref(), Some("p2"));
+
+        conv.compact(&CompactionStrategy::SnipToolResults { keep_recent: 10 }, None);
+
+        assert_well_formed(&conv.messages);
+        // The whole group survives verbatim rather than being half-snipped.
+        let asst = conv.messages.iter().find(|m| !m.tool_calls.is_empty()).expect("group kept");
+        assert_eq!(asst.tool_calls.len(), 3);
+        for id in ["p1", "p2", "p3"] {
+            assert!(conv.messages.iter().any(|m| m.tool_call_id.as_deref() == Some(id)), "{id} kept");
+        }
+        assert_well_formed(conv.context_window());
+    }
+
+    #[test]
+    fn summarize_keeps_parallel_tool_group_that_straddles_keep_recent() {
+        let mut conv = Conversation::new(100_000).with_system_prompt("Sys");
+        conv.push(Message::user("go"));
+        conv.push(assistant_with_tool_calls("", vec![call("p1"), call("p2"), call("p3")]));
+        conv.push(Message::tool_result("p1", "one"));
+        conv.push(Message::tool_result("p2", "two"));
+        conv.push(Message::tool_result("p3", "three"));
+        conv.push(Message::assistant("done"));
+
+        conv.compact(&CompactionStrategy::Summarize { keep_recent: 3 }, Some("earlier stuff"));
+
+        assert_well_formed(&conv.messages);
+        assert!(conv.messages.iter().any(|m| m.tool_calls.len() == 3));
+    }
+
+    #[test]
+    fn sliding_window_never_leaves_orphan_results() {
+        let mut conv = Conversation::new(200).with_system_prompt("Sys");
+        conv.push(assistant_with_tool_calls("", vec![call("p1"), call("p2"), call("p3")]));
+        for id in ["p1", "p2", "p3"] {
+            conv.push(Message::tool_result(id, "x".repeat(120)));
+        }
+        conv.push(Message::assistant("y".repeat(200)));
+
+        conv.compact(&CompactionStrategy::SlidingWindow, None);
+
+        assert_well_formed(&conv.messages);
+    }
+
+    /// `context_window` trims oldest-first; when the budget runs out in the
+    /// middle of a tool group the results whose call was trimmed must go too.
+    #[test]
+    fn context_window_trims_through_tool_group_without_orphans() {
+        // Each result ~26 tokens; budget fits the final reply + two results
+        // but not the assistant message that made the calls.
+        let mut conv = Conversation::new(80).with_system_prompt("S");
+        conv.push(Message::user("go"));
+        conv.push(assistant_with_tool_calls(&"c".repeat(100), vec![call("p1"), call("p2"), call("p3")]));
+        for id in ["p1", "p2", "p3"] {
+            conv.push(Message::tool_result(id, "r".repeat(100)));
+        }
+        conv.push(Message::assistant("done"));
+
+        let window = conv.context_window();
+
+        assert!(window.iter().all(|m| m.role != Role::Tool), "trimmed call's results dropped: {window:?}");
+        assert_eq!(window.last().map(|m| m.content.as_str()), Some("done"));
+        assert_well_formed(window);
+    }
+
+    #[test]
+    fn context_window_keeps_group_when_it_fits() {
+        let mut conv = Conversation::new(100_000).with_system_prompt("S");
+        conv.push(Message::user("go"));
+        conv.push(assistant_with_tool_calls("", vec![call("p1"), call("p2")]));
+        conv.push(Message::tool_result("p1", "one"));
+        conv.push(Message::tool_result("p2", "two"));
+        let window = conv.context_window();
+        assert_eq!(window.len(), conv.len());
+        assert_well_formed(window);
+    }
+
+    #[test]
+    fn sanitize_strips_unanswered_calls_and_orphan_results() {
+        let mut conv = Conversation::new(100_000).with_system_prompt("S");
+        conv.push(Message::tool_result("ghost", "orphan from an old compaction"));
+        conv.push(Message::user("go"));
+        conv.push(assistant_with_tool_calls("let me look", vec![call("a"), call("b")]));
+        conv.push(Message::tool_result("a", "answered"));
+        conv.push(Message::tool_result("a", "duplicate"));
+        // "b" never answered (turn interrupted)
+        conv.push(assistant_with_tool_calls("", vec![call("c")]));
+
+        let changed = conv.sanitize_tool_pairs();
+
+        assert_eq!(changed, 4, "ghost result, duplicate result, stripped b, dropped empty assistant");
+        assert_well_formed(&conv.messages);
+        let asst = conv.messages.iter().find(|m| m.role == Role::Assistant).expect("assistant kept");
+        assert_eq!(asst.content, "let me look");
+        assert_eq!(asst.tool_calls.iter().map(|tc| tc.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(conv.sanitize_tool_pairs(), 0, "idempotent");
+    }
+
+    #[test]
+    fn well_formed_drops_unanswered_assistant_and_its_answered_siblings() {
+        let user = Message::user("go");
+        let asst = assistant_with_tool_calls("", vec![call("a"), call("b")]);
+        let a = Message::tool_result("a", "answered");
+        let out = well_formed_tool_pairs(vec![&user, &asst, &a]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, Role::User);
     }
 }
