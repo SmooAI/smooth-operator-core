@@ -42,7 +42,8 @@ internal static class Compactor
     /// <summary>
     /// Compact <paramref name="messages"/> in place to fit <paramref name="maxTokens"/> under the
     /// given <paramref name="strategy"/>. Preserves the leading system message (if any) and the
-    /// final message (the live user turn). Returns what it did.
+    /// final message (the live user turn), and drops an assistant tool call only together
+    /// with its tool results. Returns what it did.
     /// </summary>
     public static CompactionResult Compact(List<ChatMessage> messages, CompactionStrategy strategy, int maxTokens)
     {
@@ -57,10 +58,25 @@ internal static class Compactor
         var firstDroppable = hasSystem ? 1 : 0;
         var removed = 0;
 
-        while (EstimateTokens(messages) > maxTokens && (messages.Count - firstDroppable) > 1)
+        while (EstimateTokens(messages) > maxTokens)
         {
-            messages.RemoveAt(firstDroppable);
-            removed++;
+            // Drop the oldest message together with the tool results that follow it, so a
+            // tool result never outlives the assistant tool call it answers — the provider
+            // 400s on an orphan ("No tool call found for function call output", SMOODEV-3704).
+            var span = 1;
+            while (firstDroppable + span < messages.Count && messages[firstDroppable + span].Role == ChatRole.Tool)
+            {
+                span++;
+            }
+
+            // Never drop the final message (the live turn).
+            if (messages.Count - firstDroppable - span < 1)
+            {
+                break;
+            }
+
+            messages.RemoveRange(firstDroppable, span);
+            removed += span;
         }
 
         return new CompactionResult(removed, before, EstimateTokens(messages));

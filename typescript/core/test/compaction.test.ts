@@ -47,4 +47,28 @@ describe('compaction', () => {
         expect(nonSystem.length).toBeGreaterThan(0);
         expect(nonSystem[0].role).not.toBe('tool');
     });
+
+    it('drops every result of a parallel tool group whose call was trimmed (SMOODEV-3704)', () => {
+        const big = 'token '.repeat(300);
+        const msgs: Message[] = [
+            msg('system', 'sys'),
+            msg('user', 'q'),
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: ['p1', 'p2', 'p3'].map((id) => ({ id, function: { name: 't', arguments: '{}' } })),
+            },
+            { role: 'tool', tool_call_id: 'p1', content: `result ${big}` },
+            { role: 'tool', tool_call_id: 'p2', content: 'two' },
+            { role: 'tool', tool_call_id: 'p3', content: 'three' },
+            msg('assistant', 'final answer'),
+        ];
+        // The budget fits p2, p3 and the reply but not p1, so the cut lands inside the group.
+        const out = compact(msgs, 50);
+        const announced = new Set(out.flatMap((m) => ((m.tool_calls as Array<{ id: string }> | undefined) ?? []).map((tc) => tc.id)));
+        for (const m of out.filter((m) => m.role === 'tool')) {
+            expect(announced.has(m.tool_call_id as string)).toBe(true);
+        }
+        expect(out.at(-1)?.content).toBe('final answer');
+    });
 });

@@ -58,3 +58,25 @@ def test_never_starts_window_on_orphan_tool_message():
     non_system = [m for m in out if m["role"] != "system"]
     assert non_system, "expected at least one non-system message kept"
     assert non_system[0]["role"] != "tool"
+
+
+def test_drops_every_result_of_a_trimmed_parallel_tool_group():
+    # SMOODEV-3704: the cut lands inside a group of parallel tool results.
+    big = "token " * 300
+    msgs = [
+        _msg("system", "sys"),
+        _msg("user", "q"),
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": i, "function": {"name": "t", "arguments": "{}"}} for i in ("p1", "p2", "p3")],
+        },
+        {"role": "tool", "tool_call_id": "p1", "content": "result " + big},
+        {"role": "tool", "tool_call_id": "p2", "content": "two"},
+        {"role": "tool", "tool_call_id": "p3", "content": "three"},
+        _msg("assistant", "final answer"),
+    ]
+    out = compact(msgs, 50)
+    announced = {tc["id"] for m in out for tc in m.get("tool_calls", [])}
+    assert all(m["tool_call_id"] in announced for m in out if m["role"] == "tool")
+    assert out[-1]["content"] == "final answer"

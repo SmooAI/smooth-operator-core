@@ -86,3 +86,31 @@ func TestCompactNeverStartsOnOrphanTool(t *testing.T) {
 		t.Fatalf("kept window must not start on an orphan tool message")
 	}
 }
+
+// SMOODEV-3704: the cut lands inside a group of parallel tool results; every
+// result whose call was trimmed must go with it.
+func TestCompactDropsTrimmedParallelToolGroup(t *testing.T) {
+	big := strings.Repeat("token ", 300)
+	ms := []ChatMessage{
+		msg("system", "sys"),
+		msg("user", "q"),
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "p1", Name: "t", Arguments: "{}"}, {ID: "p2", Name: "t", Arguments: "{}"}, {ID: "p3", Name: "t", Arguments: "{}"}}},
+		{Role: "tool", ToolCallID: "p1", Content: "result " + big},
+		{Role: "tool", ToolCallID: "p2", Content: "two"},
+		{Role: "tool", ToolCallID: "p3", Content: "three"},
+		msg("assistant", "final answer"),
+	}
+	out := compact(ms, 50)
+	announced := map[string]bool{}
+	for _, m := range out {
+		for _, tc := range m.ToolCalls {
+			announced[tc.ID] = true
+		}
+		if m.Role == "tool" && !announced[m.ToolCallID] {
+			t.Fatalf("orphan tool result %s in compacted window", m.ToolCallID)
+		}
+	}
+	if out[len(out)-1].Content != "final answer" {
+		t.Fatalf("expected the final reply kept, got %+v", out[len(out)-1])
+	}
+}

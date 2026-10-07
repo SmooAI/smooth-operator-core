@@ -89,10 +89,10 @@ async fn main() -> anyhow::Result<()> {
 The full parity surface — every engine in the [polyglot set](https://github.com/SmooAI/smooth-operator-core/blob/main/docs/Polyglot-Engines.md) ships it, and this crate defines it:
 
 - **Agentic tool-calling loop** — observe→think→act with iteration caps and a typed `AgentEvent` stream.
-- **Typed tools + guardrails** — `Tool` trait + `ToolRegistry`, with pre/post hooks for surveillance, secret detection, and prompt-injection guards.
+- **Typed tools + guardrails** — `Tool` trait + `ToolRegistry`, with pre/post hooks for surveillance, secret detection, and prompt-injection guards. Each call runs under a deadline (120s by default; per-tool override via `Tool::timeout` / `ToolRegistry::set_tool_timeout`) that excludes time spent awaiting human confirmation.
 - **Knowledge / RAG + vectors** — `KnowledgeBase` trait grounds each turn in retrieved documents.
 - **Memory** — long-term entries recalled into context each turn.
-- **Compaction** — a sliding-window token budget keeps the prompt under a ceiling.
+- **Compaction** — a sliding-window token budget keeps the prompt under a ceiling. Compaction and the context window never split an assistant tool call from its results, so the provider never sees an orphan tool result.
 - **Cost / budget** — per-model `ModelPricing`, `CostBudget`, `CostTracker` with hard enforcement.
 - **Checkpointing** — `CheckpointStore`: in-memory, SQLite (`sqlite` feature), or Postgres (`postgres` feature) for resume.
 - **Rerank** — rerank retrieved hits before injection (lexical reranker built in).

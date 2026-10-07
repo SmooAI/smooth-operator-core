@@ -84,6 +84,18 @@ pub trait ToolHook: Send + Sync {
     }
 }
 
+/// Default deadline for one tool execution via [`ToolRegistry::execute`] (the
+/// agent's sequential path). A hung tool — a stuck HTTP call, an MCP server
+/// that never answers — otherwise stalls the whole turn forever (SMOODEV-3704).
+/// Override per registry with [`ToolRegistry::with_tool_timeout`], per tool
+/// with [`Tool::timeout`] or [`ToolRegistry::set_tool_timeout`].
+pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A deadline that never fires. Return it from [`Tool::timeout`] (or pass it
+/// to [`ToolRegistry::set_tool_timeout`]) for a tool that legitimately runs
+/// unbounded, such as a sub-agent whose own tools carry their own deadlines.
+pub const NO_TOOL_TIMEOUT: Duration = Duration::MAX;
+
 /// A tool that can be called by the agent.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -100,6 +112,15 @@ pub trait Tool: Send + Sync {
     /// Defaults to `false`.
     fn is_read_only(&self) -> bool {
         false
+    }
+
+    /// Deadline for one execution of this tool. `None` (the default) uses
+    /// the registry's. The deadline covers `execute` only — hooks, including
+    /// a human confirmation awaited in [`ToolHook::pre_call`], don't count
+    /// against it. On expiry the call resolves to an error result, so the
+    /// turn continues and the model sees the timeout.
+    fn timeout(&self) -> Option<Duration> {
+        None
     }
 }
 
@@ -119,6 +140,10 @@ impl Tool for Box<dyn Tool> {
 
     fn is_read_only(&self) -> bool {
         (**self).is_read_only()
+    }
+
+    fn timeout(&self) -> Option<Duration> {
+        (**self).timeout()
     }
 }
 
@@ -168,6 +193,11 @@ pub struct ToolRegistry {
     promoted: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     hooks: Vec<Arc<dyn ToolHook>>,
     parallel_config: ParallelExecutionConfig,
+    /// Deadline for a call on the sequential path ([`Self::execute`]).
+    tool_timeout: Duration,
+    /// Per-tool deadlines set by the host; win over [`Tool::timeout`] and
+    /// both path defaults.
+    timeout_overrides: Arc<HashMap<String, Duration>>,
 }
 
 impl ToolRegistry {
@@ -178,12 +208,31 @@ impl ToolRegistry {
             promoted: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             hooks: vec![],
             parallel_config: ParallelExecutionConfig::default(),
+            tool_timeout: DEFAULT_TOOL_TIMEOUT,
+            timeout_overrides: Arc::new(HashMap::new()),
         }
     }
 
     pub fn with_parallel_config(mut self, config: ParallelExecutionConfig) -> Self {
         self.parallel_config = config;
         self
+    }
+
+    /// Set the default deadline for a call on the sequential path
+    /// ([`Self::execute`]); [`DEFAULT_TOOL_TIMEOUT`] when unset. The parallel
+    /// path keeps [`ParallelExecutionConfig::timeout_per_tool`].
+    #[must_use]
+    pub fn with_tool_timeout(mut self, timeout: Duration) -> Self {
+        self.tool_timeout = timeout;
+        self
+    }
+
+    /// Give one tool its own deadline on both paths, overriding the tool's
+    /// [`Tool::timeout`] and the registry defaults. Lets a host lengthen (or,
+    /// with [`NO_TOOL_TIMEOUT`], remove) the deadline of a tool it doesn't
+    /// own, e.g. a long-running shell or MCP tool.
+    pub fn set_tool_timeout(&mut self, name: impl Into<String>, timeout: Duration) {
+        Arc::make_mut(&mut self.timeout_overrides).insert(name.into(), timeout);
     }
 
     pub fn register(&mut self, tool: impl Tool + 'static) {
@@ -342,7 +391,8 @@ impl ToolRegistry {
     ///
     /// # Errors
     /// Returns error if a pre-hook blocks the call, the tool is not found,
-    /// or the tool execution fails.
+    /// or the tool execution fails or outlives its deadline (see
+    /// [`Self::with_tool_timeout`]).
     pub async fn execute(&self, call: &ToolCall) -> ToolResult {
         // Normalize args. Some small models (Gemini Flash family
         // notably) emit a literal `""` empty-string when calling a
@@ -355,59 +405,17 @@ impl ToolRegistry {
         if needs_norm {
             call.arguments = serde_json::Value::Object(serde_json::Map::new());
         }
-        let call = &call;
-
-        // Run pre-hooks
-        for hook in &self.hooks {
-            if let Err(e) = hook.pre_call(call).await {
-                return ToolResult {
-                    tool_call_id: call.id.clone(),
-                    content: format!("blocked by hook: {e}"),
-                    is_error: true,
-                    details: None,
-                };
-            }
-        }
-
-        // Find and execute tool. `tool_by_name` resolves both eager
-        // and promoted-deferred tools (pearl th-cfa1fb).
-        let mut result = match self.tool_by_name(&call.name) {
-            Some(tool) => match tool.execute(call.arguments.clone()).await {
-                Ok(content) => ToolResult {
-                    tool_call_id: call.id.clone(),
-                    content,
-                    is_error: false,
-                    details: None,
-                },
-                Err(e) => ToolResult {
-                    tool_call_id: call.id.clone(),
-                    content: format!("error: {e}"),
-                    is_error: true,
-                    details: None,
-                },
-            },
-            None => ToolResult {
-                tool_call_id: call.id.clone(),
-                content: format!("unknown tool: {}", call.name),
-                is_error: true,
-                details: None,
-            },
-        };
-
-        // Run post-hooks. They may redact `result` in place (mutable seam).
-        // A hook's `Err` is logged, not surfaced — the (possibly redacted)
-        // result still reaches the caller.
-        for hook in &self.hooks {
-            if let Err(e) = hook.post_call(call, &mut result).await {
-                tracing::warn!(error = %e, tool = %call.name, "post-hook failed");
-            }
-        }
-
-        result
+        Self::run_call(self.tool_by_name(&call.name), &self.hooks, &call, self.tool_timeout, &self.timeout_overrides).await
     }
 
     /// Execute a single tool call with hooks, used internally.
-    async fn execute_single(tools: &HashMap<String, Arc<dyn Tool>>, hooks: &[Arc<dyn ToolHook>], call: &ToolCall) -> ToolResult {
+    async fn execute_single(
+        tools: &HashMap<String, Arc<dyn Tool>>,
+        hooks: &[Arc<dyn ToolHook>],
+        call: &ToolCall,
+        default_timeout: Duration,
+        overrides: &HashMap<String, Duration>,
+    ) -> ToolResult {
         // Mirror the empty-args normalization in `execute` — same
         // small-model bug (Gemini Flash etc. send `""` instead of
         // `{}` for no-param tools), same fix.
@@ -416,8 +424,21 @@ impl ToolRegistry {
         if needs_norm {
             call.arguments = serde_json::Value::Object(serde_json::Map::new());
         }
-        let call = &call;
+        Self::run_call(tools.get(&call.name).cloned(), hooks, &call, default_timeout, overrides).await
+    }
 
+    /// Run one (already normalized) call: pre-hooks, the tool under its
+    /// deadline, post-hooks. Shared by the sequential and parallel paths.
+    ///
+    /// The deadline wraps `tool.execute` alone, so time spent in a pre-hook
+    /// waiting on a human confirmation never counts against it.
+    async fn run_call(
+        tool: Option<Arc<dyn Tool>>,
+        hooks: &[Arc<dyn ToolHook>],
+        call: &ToolCall,
+        default_timeout: Duration,
+        overrides: &HashMap<String, Duration>,
+    ) -> ToolResult {
         // Run pre-hooks
         for hook in hooks {
             if let Err(e) = hook.pre_call(call).await {
@@ -430,22 +451,33 @@ impl ToolRegistry {
             }
         }
 
-        // Find and execute tool
-        let mut result = match tools.get(&call.name) {
-            Some(tool) => match tool.execute(call.arguments.clone()).await {
-                Ok(content) => ToolResult {
-                    tool_call_id: call.id.clone(),
-                    content,
-                    is_error: false,
-                    details: None,
-                },
-                Err(e) => ToolResult {
-                    tool_call_id: call.id.clone(),
-                    content: format!("error: {e}"),
-                    is_error: true,
-                    details: None,
-                },
-            },
+        let mut result = match tool {
+            Some(tool) => {
+                let deadline = overrides.get(&call.name).copied().or_else(|| tool.timeout()).unwrap_or(default_timeout);
+                match tokio::time::timeout(deadline, tool.execute(call.arguments.clone())).await {
+                    Ok(Ok(content)) => ToolResult {
+                        tool_call_id: call.id.clone(),
+                        content,
+                        is_error: false,
+                        details: None,
+                    },
+                    Ok(Err(e)) => ToolResult {
+                        tool_call_id: call.id.clone(),
+                        content: format!("error: {e}"),
+                        is_error: true,
+                        details: None,
+                    },
+                    Err(_elapsed) => {
+                        tracing::warn!(tool = %call.name, timeout_secs = deadline.as_secs(), "tool execution timed out");
+                        ToolResult {
+                            tool_call_id: call.id.clone(),
+                            content: format!("error: tool execution timed out after {}s", deadline.as_secs()),
+                            is_error: true,
+                            details: None,
+                        }
+                    }
+                }
+            }
             None => ToolResult {
                 tool_call_id: call.id.clone(),
                 content: format!("unknown tool: {}", call.name),
@@ -455,6 +487,8 @@ impl ToolRegistry {
         };
 
         // Run post-hooks. They may redact `result` in place (mutable seam).
+        // A hook's `Err` is logged, not surfaced — the (possibly redacted)
+        // result still reaches the caller.
         for hook in hooks {
             if let Err(e) = hook.post_call(call, &mut result).await {
                 tracing::warn!(error = %e, tool = %call.name, "post-hook failed");
@@ -522,6 +556,7 @@ impl ToolRegistry {
             let timeout = self.parallel_config.timeout_per_tool;
             let tools = &snapshot;
             let hooks = &self.hooks;
+            let overrides = &self.timeout_overrides;
 
             let mut join_set = tokio::task::JoinSet::new();
             for &index in &parallel_indices {
@@ -529,6 +564,7 @@ impl ToolRegistry {
                 let semaphore = Arc::clone(&semaphore);
                 let tools = tools.clone();
                 let hooks: Vec<Arc<dyn ToolHook>> = hooks.clone();
+                let overrides = Arc::clone(overrides);
 
                 join_set.spawn(async move {
                     let Ok(_permit) = semaphore.acquire().await else {
@@ -543,14 +579,7 @@ impl ToolRegistry {
                         );
                     };
 
-                    let result = tokio::time::timeout(timeout, Self::execute_single(&tools, &hooks, &call)).await;
-
-                    let result = result.unwrap_or_else(|_| ToolResult {
-                        tool_call_id: call.id.clone(),
-                        content: "error: tool execution timed out".to_string(),
-                        is_error: true,
-                        details: None,
-                    });
+                    let result = Self::execute_single(&tools, &hooks, &call, timeout, &overrides).await;
 
                     (index, result)
                 });
@@ -567,16 +596,7 @@ impl ToolRegistry {
         for &index in &sequential_indices {
             let call = &calls[index];
             let timeout = self.parallel_config.timeout_per_tool;
-
-            let result = tokio::time::timeout(timeout, Self::execute_single(&snapshot, &self.hooks, call)).await;
-
-            let result = result.unwrap_or_else(|_| ToolResult {
-                tool_call_id: call.id.clone(),
-                content: "error: tool execution timed out".to_string(),
-                is_error: true,
-                details: None,
-            });
-
+            let result = Self::execute_single(&snapshot, &self.hooks, call, timeout, &self.timeout_overrides).await;
             results[index] = Some(result);
         }
 
@@ -614,6 +634,8 @@ impl ToolRegistry {
             promoted: self.promoted.clone(),
             hooks: vec![],
             parallel_config: self.parallel_config.clone(),
+            tool_timeout: self.tool_timeout,
+            timeout_overrides: Arc::clone(&self.timeout_overrides),
         }
     }
 }
@@ -1507,5 +1529,108 @@ mod tests {
         assert!(err.unwrap_err().to_string().contains("first hook"));
         // Only first hook ran
         assert_eq!(CALL_ORDER.load(Ordering::SeqCst), 1);
+    }
+
+    // ── Per-tool deadlines on the sequential path (SMOODEV-3704) ────
+
+    fn slow(name: &str, secs: u64) -> SlowTool {
+        SlowTool {
+            name: name.into(),
+            delay: std::time::Duration::from_secs(secs),
+        }
+    }
+
+    fn slow_call(name: &str) -> ToolCall {
+        ToolCall {
+            id: format!("call-{name}"),
+            name: name.into(),
+            arguments: serde_json::json!({"text": "ok"}),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sequential_execute_times_out_at_default_deadline() {
+        let mut registry = ToolRegistry::new();
+        registry.register(slow("hang", 10_000));
+        let result = registry.execute(&slow_call("hang")).await;
+        assert!(result.is_error);
+        assert_eq!(result.tool_call_id, "call-hang");
+        assert!(result.content.contains("timed out after 120s"), "content: {}", result.content);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sequential_execute_honors_registry_deadline() {
+        let mut registry = ToolRegistry::new().with_tool_timeout(std::time::Duration::from_secs(1));
+        registry.register(slow("slow", 2));
+        registry.register(slow("quick", 0));
+        assert!(registry.execute(&slow_call("slow")).await.is_error);
+        let quick = registry.execute(&slow_call("quick")).await;
+        assert!(!quick.is_error, "{}", quick.content);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn host_override_beats_registry_default() {
+        let mut registry = ToolRegistry::new().with_tool_timeout(std::time::Duration::from_secs(1));
+        registry.register(slow("build", 5));
+        registry.set_tool_timeout("build", std::time::Duration::from_secs(10));
+        let result = registry.execute(&slow_call("build")).await;
+        assert!(!result.is_error, "{}", result.content);
+        // Overrides survive clone_tools (each workflow phase takes a clone).
+        assert!(!registry.clone_tools().execute(&slow_call("build")).await.is_error);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_can_opt_out_of_deadline() {
+        struct Unbounded;
+        #[async_trait]
+        impl Tool for Unbounded {
+            fn schema(&self) -> ToolSchema {
+                ToolSchema {
+                    name: "subagent".into(),
+                    description: "runs long".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+            async fn execute(&self, _arguments: serde_json::Value) -> anyhow::Result<String> {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                Ok("finished".into())
+            }
+            fn timeout(&self) -> Option<std::time::Duration> {
+                Some(NO_TOOL_TIMEOUT)
+            }
+        }
+        let mut registry = ToolRegistry::new();
+        registry.register(Unbounded);
+        let result = registry.execute(&slow_call("subagent")).await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, "finished");
+    }
+
+    /// A human taking minutes to answer a confirmation prompt (awaited in a
+    /// pre-hook) must not burn the tool's deadline, on either path.
+    #[tokio::test(start_paused = true)]
+    async fn confirmation_wait_does_not_count_against_deadline() {
+        struct SlowApproval;
+        #[async_trait]
+        impl ToolHook for SlowApproval {
+            async fn pre_call(&self, _call: &ToolCall) -> anyhow::Result<()> {
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                Ok(())
+            }
+        }
+        let config = ParallelExecutionConfig {
+            max_concurrency: 2,
+            timeout_per_tool: std::time::Duration::from_secs(5),
+        };
+        let mut registry = ToolRegistry::new()
+            .with_tool_timeout(std::time::Duration::from_secs(5))
+            .with_parallel_config(config);
+        registry.register(slow("needs_ok", 1));
+        registry.add_hook(SlowApproval);
+
+        let sequential = registry.execute(&slow_call("needs_ok")).await;
+        assert!(!sequential.is_error, "{}", sequential.content);
+        let parallel = registry.execute_parallel(&[slow_call("needs_ok")]).await;
+        assert!(!parallel[0].is_error, "{}", parallel[0].content);
     }
 }

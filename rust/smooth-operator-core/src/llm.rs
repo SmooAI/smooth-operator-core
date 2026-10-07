@@ -829,6 +829,31 @@ fn sanitize_tool_name(name: &str) -> String {
     }
 }
 
+/// Idle pooled connections are dropped after this long. Gateways and load
+/// balancers silently close idle keep-alive sockets (often at 60s); reusing one
+/// fails the next request with "connection closed before message completed"
+/// (SMOODEV-3705). Expiring them first means a long tool call or a quiet
+/// session doesn't hand the next LLM request a dead socket.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whether a failed `send()` is a transient transport error worth retrying.
+/// Safe to retry: no response bytes have been read yet (pearl th-3b30b0).
+fn is_transient_send_error(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect() || e.is_request()
+}
+
+/// Render a `send()` error with its full source chain — reqwest's top-level
+/// message ("error sending request") hides the actual cause.
+fn send_error_chain(e: &reqwest::Error) -> String {
+    let mut chain = vec![format!("{e}")];
+    let mut source: &dyn std::error::Error = e;
+    while let Some(s) = source.source() {
+        chain.push(format!("{s}"));
+        source = s;
+    }
+    chain.join(" → ")
+}
+
 /// Calculate exponential backoff duration for a given retry attempt.
 fn calculate_backoff(attempt: u32, policy: &RetryPolicy) -> Duration {
     let exp_ms = policy.base_delay_ms.saturating_mul(1u64 << attempt);
@@ -900,7 +925,8 @@ impl LlmClient {
         // and per-iteration wall clock (600s in agent.rs) provide tighter guards.
         let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(600))
-            .connect_timeout(std::time::Duration::from_secs(30));
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT);
 
         // Kimi Code API requires a recognized coding agent User-Agent for
         // subscription authentication. Without this, the API returns 403
@@ -1059,7 +1085,23 @@ impl LlmClient {
         let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 0..=policy.max_retries {
-            let resp = self.client.post(&url).bearer_auth(&self.config.api_key).json(&request).send().await?;
+            // Transient transport failures retry like retryable statuses —
+            // the streaming path always has; this one used to `?` them and
+            // kill the turn (SMOODEV-3705).
+            let resp = match self.client.post(&url).bearer_auth(&self.config.api_key).json(&request).send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let chain = send_error_chain(&e);
+                    last_error = Some(anyhow::anyhow!("HTTP request failed: {chain}"));
+                    if !is_transient_send_error(&e) || attempt == policy.max_retries {
+                        break;
+                    }
+                    let delay = calculate_backoff(attempt, policy);
+                    tracing::warn!(attempt = attempt + 1, max_retries = policy.max_retries, backoff_ms = delay.as_millis(), error = %chain, "chat send failed transient — retrying");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
 
             let status = resp.status();
             let rate_limit_info = parse_rate_limit_headers(resp.headers());
@@ -1270,16 +1312,8 @@ impl LlmClient {
                         tokio::time::sleep(delay).await;
                     }
                     Err(e) => {
-                        let is_transient = e.is_timeout() || e.is_connect() || e.is_request();
-                        let chain = {
-                            let mut chain = vec![format!("{e}")];
-                            let mut source: &dyn std::error::Error = &e;
-                            while let Some(s) = source.source() {
-                                chain.push(format!("{s}"));
-                                source = s;
-                            }
-                            chain.join(" → ")
-                        };
+                        let is_transient = is_transient_send_error(&e);
+                        let chain = send_error_chain(&e);
                         last_err = Some(anyhow::anyhow!("HTTP request failed: {chain}"));
                         if !is_transient || attempt == policy.max_retries {
                             break;
@@ -1450,7 +1484,21 @@ impl LlmClient {
                 .header("content-type", "application/json")
                 .json(&request)
                 .send()
-                .await?;
+                .await;
+            let resp = match resp {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let chain = send_error_chain(&e);
+                    last_error = Some(anyhow::anyhow!("HTTP request failed: {chain}"));
+                    if !is_transient_send_error(&e) || attempt == policy.max_retries {
+                        break;
+                    }
+                    let delay = calculate_backoff(attempt, policy);
+                    tracing::warn!(attempt = attempt + 1, max_retries = policy.max_retries, backoff_ms = delay.as_millis(), error = %chain, "anthropic chat send failed transient — retrying");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
 
             let status = resp.status();
             let rate_limit_info = parse_rate_limit_headers(resp.headers());
@@ -3950,6 +3998,56 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             "expected a retry after the 503, saw {} request(s)",
             hits.load(Ordering::SeqCst)
         );
+    }
+
+    /// SMOODEV-3705: the non-streaming `chat` used to `?` a transport error,
+    /// so a pooled socket the gateway had closed killed the turn. It now
+    /// retries like `chat_stream`. First connection is dropped mid-request.
+    #[tokio::test]
+    async fn chat_retries_dropped_connection_then_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU32::new(0));
+        let hits2 = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let n = hits2.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                if n == 0 {
+                    // Close without answering: "connection closed before message completed".
+                    drop(sock);
+                    continue;
+                }
+                let body = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let mut config = LlmConfig::openrouter("test-key");
+        config.api_url = format!("http://{addr}");
+        config.model = "test-model".into();
+        config.retry_policy = RetryPolicy {
+            base_delay_ms: 1,
+            max_delay_ms: 5,
+            ..RetryPolicy::default()
+        };
+        let client = LlmClient::new(config);
+
+        let user = Message::user("hello");
+        let resp = client.chat(&[&user], &[]).await.expect("chat should recover after the dropped connection");
+        assert_eq!(resp.content, "hi");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     /// Serve an SSE stream with `extra_headers` injected into the 200 response
