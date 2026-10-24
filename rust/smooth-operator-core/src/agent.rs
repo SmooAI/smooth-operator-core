@@ -1120,7 +1120,8 @@ impl Agent {
             }
 
             // Record cost and check budget
-            if self.record_cost_and_check_budget(&response) {
+            let list_price = self.gateway_list_price_for(&response).await;
+            if self.record_cost_and_check_budget(&response, list_price.as_ref()) {
                 return Ok(conversation);
             }
 
@@ -1413,7 +1414,8 @@ impl Agent {
             }
 
             // Record cost and check budget
-            if self.record_cost_and_check_budget(&response) {
+            let list_price = self.gateway_list_price_for(&response).await;
+            if self.record_cost_and_check_budget(&response, list_price.as_ref()) {
                 return Ok(conversation);
             }
 
@@ -1539,13 +1541,6 @@ impl Agent {
         }
     }
 
-    /// Record cost for an LLM response and check budget. Returns `true` if budget was exceeded.
-    ///
-    /// Prefers the gateway's authoritative cost when present
-    /// (LiteLLM's `x-litellm-response-cost` header). Falls back to
-    /// the local `ModelPricing` table otherwise — which is only
-    /// accurate for direct provider access; aliased routes through
-    /// `smooth-coding` et al. won't price correctly locally.
     /// Build the terminal [`AgentEvent::Completed`] from the run's cost tracker.
     ///
     /// One builder for both the sync and streaming loops so their terminal
@@ -1565,13 +1560,37 @@ impl Agent {
         }
     }
 
-    fn record_cost_and_check_budget(&self, response: &crate::llm::LlmResponse) -> bool {
+    /// The gateway's list price for this agent's model, looked up only when
+    /// `response` carried no gateway cost (every streamed call on llm.smoo.ai).
+    /// Skipped for an injected [`LlmProvider`]: `config.llm` does not describe
+    /// where that provider sends its calls. Pearl th-c420bf.
+    async fn gateway_list_price_for(&self, response: &crate::llm::LlmResponse) -> Option<ModelPricing> {
+        if response.gateway_cost_usd.is_some() || self.llm_provider.is_some() {
+            return None;
+        }
+        let llm = &self.config.llm;
+        crate::cost::gateway_list_price(&llm.api_url, &llm.api_key, &llm.model).await
+    }
+
+    /// Record cost for an LLM response and check budget. Returns `true` if budget was exceeded.
+    ///
+    /// Cost sources, best first:
+    /// 1. the gateway's reported cost for this call (`gateway_cost_usd`);
+    /// 2. `list_price`, the gateway's published price for the model
+    ///    ([`Self::gateway_list_price_for`]) times the real token counts;
+    /// 3. the local `ModelPricing` table, which knows a handful of models and
+    ///    prices everything else at the free tier.
+    ///
+    /// 2 and 3 taint `cost_estimated`: neither is a figure the gateway billed.
+    fn record_cost_and_check_budget(&self, response: &crate::llm::LlmResponse, list_price: Option<&ModelPricing>) -> bool {
         let model = &self.config.llm.model;
 
         {
             let mut tracker = self.cost_tracker.lock().expect("lock cost_tracker");
             if let Some(cost) = response.gateway_cost_usd {
                 tracker.record_with_cost(model, &response.usage, cost);
+            } else if let Some(pricing) = list_price {
+                tracker.record(model, &response.usage, pricing);
             } else {
                 // `record` taints `cost_estimated` — local pricing can't price
                 // aliased routes and returns the free tier for anything it
@@ -2293,6 +2312,127 @@ mod tests {
         let json = serde_json::to_string(&event).expect("serialize");
         assert!(json.contains("LlmResponse"));
         assert!(json.contains("\"iteration\":3"));
+    }
+
+    /// A fake LiteLLM: `GET …/model/info` serves `model_info`, anything else
+    /// gets one streamed completion carrying `usage_json` as its final chunk.
+    /// Counts `/model/info` hits.
+    async fn fake_gateway(model_info: &'static str, usage_json: &'static str) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let info_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&info_hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let counter = Arc::clone(&counter);
+                tokio::spawn(async move {
+                    // Read the whole request (headers + content-length body) so
+                    // closing the socket never races the client's write.
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        let Ok(n) = sock.read(&mut buf).await else { return };
+                        if n == 0 {
+                            break;
+                        }
+                        req.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&req);
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let len = text[..end]
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if req.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req);
+                    let (ctype, body) = if text.starts_with("GET /model/info") {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        ("application/json", model_info.to_string())
+                    } else {
+                        (
+                            "text/event-stream",
+                            format!(
+                                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"hi\"}},\"finish_reason\":\"stop\"}}]}}\n\ndata: {{\"choices\":[],\"usage\":{usage_json}}}\n\ndata: [DONE]\n\n"
+                            ),
+                        )
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {ctype}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (format!("http://{addr}/v1"), info_hits)
+    }
+
+    /// Run one streamed turn against `url` as `gpt-6-luna` and return the
+    /// terminal `Completed` event's (cost, prompt, completion, cost_estimated).
+    async fn streamed_turn_usage(url: String) -> (f64, u64, u64, bool) {
+        let mut llm = LlmConfig::openrouter("k").with_model("gpt-6-luna");
+        llm.api_url = url;
+        let agent = Agent::new(AgentConfig::new("t", "sys", llm), ToolRegistry::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.run_with_channel("hello", tx).await.expect("turn");
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::Completed {
+                cost_usd,
+                prompt_tokens,
+                completion_tokens,
+                cost_estimated,
+                ..
+            } = event
+            {
+                return (cost_usd, prompt_tokens, completion_tokens, cost_estimated);
+            }
+        }
+        panic!("no Completed event");
+    }
+
+    const LUNA_INFO: &str = r#"{"data":[{"model_name":"gpt-6-luna","model_info":{"input_cost_per_token":0.000000115,"output_cost_per_token":0.000000575}}]}"#;
+
+    /// The bug in pearl th-c420bf: a streamed turn on llm.smoo.ai carries real
+    /// usage but no cost, and the local table prices `gpt-6-luna` at the free
+    /// tier, so every turn recorded `cost_usd = 0`. The real tokens must be
+    /// priced at the gateway's own list price instead.
+    #[tokio::test]
+    async fn streamed_turn_without_gateway_cost_is_priced_at_the_gateway_list_price() {
+        let (url, info_hits) = fake_gateway(LUNA_INFO, r#"{"prompt_tokens":1000,"completion_tokens":1000,"total_tokens":2000}"#).await;
+        let (cost, prompt, completion, estimated) = streamed_turn_usage(url).await;
+
+        assert_eq!((prompt, completion), (1000, 1000), "real usage from the final chunk, not a chars/4 estimate");
+        assert!((cost - 0.000_69).abs() < 1e-12, "1k in @ $0.115/M + 1k out @ $0.575/M, got {cost}");
+        assert!(estimated, "a list-price cost is computed here, not billed by the gateway");
+        assert_eq!(info_hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// When the final usage chunk carries the gateway's own `cost`, that is the
+    /// figure, it is authoritative, and the price book is never fetched.
+    #[tokio::test]
+    async fn streamed_turn_prefers_the_cost_on_the_usage_chunk() {
+        let (url, info_hits) = fake_gateway(
+            LUNA_INFO,
+            r#"{"prompt_tokens":1000,"completion_tokens":1000,"total_tokens":2000,"cost":0.0123}"#,
+        )
+        .await;
+        let (cost, prompt, _, estimated) = streamed_turn_usage(url).await;
+
+        assert_eq!(prompt, 1000);
+        assert!((cost - 0.0123).abs() < 1e-12, "got {cost}");
+        assert!(!estimated, "a gateway-reported cost is authoritative");
+        assert_eq!(info_hits.load(Ordering::SeqCst), 0, "no price-book fetch when the gateway priced the call");
     }
 
     #[test]
