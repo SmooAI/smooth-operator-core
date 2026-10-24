@@ -354,6 +354,30 @@ impl AgentConfig {
     }
 }
 
+/// How many times one LLM call is re-asked after its stream breaks in transit.
+pub const MAX_STREAM_RETRIES: u32 = 2;
+
+/// Whether a failed streamed LLM call should be re-asked.
+///
+/// Only a transport break ([`crate::llm::StreamInterrupted`]) qualifies, and
+/// only while re-asking is invisible and side-effect free:
+/// - the response had not completed (`Done` not seen) — an error after a whole
+///   response is not a lost response, and re-asking would bill a second one;
+/// - no answer text reached the consumer — a server streaming the reply
+///   verbatim would otherwise show the broken attempt's text twice;
+/// - fewer than [`MAX_STREAM_RETRIES`] retries so far.
+///
+/// Tool calls are never dispatched and nothing is pushed to the conversation
+/// until a response completes, so a retry never repeats an action.
+fn should_retry_stream(err: &anyhow::Error, retries_so_far: u32, answer_streamed: bool, response_complete: bool) -> bool {
+    retries_so_far < MAX_STREAM_RETRIES && !answer_streamed && !response_complete && crate::llm::StreamInterrupted::is(err)
+}
+
+/// Backoff before retry number `attempt` (1-based): 500ms, then 1s.
+fn stream_retry_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(500u64 << attempt.saturating_sub(1).min(4))
+}
+
 /// Events emitted during agent execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -524,6 +548,18 @@ pub enum AgentEvent {
         content: String,
     },
     StreamingComplete,
+    /// The LLM stream broke in transit (a [`crate::llm::StreamInterrupted`])
+    /// before the response completed and before any answer text was emitted,
+    /// so the agent is re-asking the same request. Reasoning already streamed
+    /// for the broken attempt is superseded by the retry's.
+    LlmStreamRetry {
+        iteration: u32,
+        /// 1-based retry number.
+        attempt: u32,
+        max_retries: u32,
+        /// The interruption, with its full source chain.
+        error: String,
+    },
     DelegationStarted {
         parent_id: String,
         child_id: String,
@@ -1330,75 +1366,115 @@ impl Agent {
                 }
             };
 
-            // Forward token deltas through the channel while accumulating
-            let (accumulator_tx, accumulator_rx) = tokio::sync::mpsc::channel::<anyhow::Result<StreamEvent>>(256);
+            // A stream that breaks in transit before the response completes is
+            // re-asked (bounded, with backoff) — see `should_retry_stream`.
+            let mut stream_retries: u32 = 0;
+            let response = loop {
+                let mut answer_streamed = false;
+                let mut response_complete = false;
+                // Forward token deltas through the channel while accumulating
+                let (accumulator_tx, accumulator_rx) = tokio::sync::mpsc::channel::<anyhow::Result<StreamEvent>>(256);
 
-            // Hard per-iteration wall clock — if a single LLM turn takes longer than
-            // this, abort and move on. Guards against provider streams that go into
-            // TCP CLOSE_WAIT without producing EOF (observed on some OpenAI-compat
-            // proxies). Applies to BOTH the tap loop and accumulator.
-            const ITERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-            // Per-item idle timeout inside the tap loop — same guard, shorter scope.
-            // Reasoning models (MiniMax-M1, DeepSeek R1) can pause 60-120s between
-            // chunks during deep thinking. 120s idle is generous but safe.
-            const ITEM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+                // Hard per-iteration wall clock — if a single LLM turn takes longer than
+                // this, abort and move on. Guards against provider streams that go into
+                // TCP CLOSE_WAIT without producing EOF (observed on some OpenAI-compat
+                // proxies). Applies to BOTH the tap loop and accumulator.
+                const ITERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+                // Per-item idle timeout inside the tap loop — same guard, shorter scope.
+                // Reasoning models (MiniMax-M1, DeepSeek R1) can pause 60-120s between
+                // chunks during deep thinking. 120s idle is generous but safe.
+                const ITEM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-            let tap_tx = tx.clone();
-            let tap_loop = async {
-                loop {
-                    let event_result = match tokio::time::timeout(ITEM_IDLE_TIMEOUT, stream.next()).await {
-                        Ok(Some(r)) => r,
-                        Ok(None) => break, // stream ended cleanly
-                        Err(_) => {
-                            // Idle timeout — surface as an error so accumulator fails fast.
-                            let _ = accumulator_tx
-                                .send(Err(anyhow::anyhow!("LLM stream idle timeout: no event for {ITEM_IDLE_TIMEOUT:?}")))
-                                .await;
-                            return;
+                let tap_tx = tx.clone();
+                let tap_loop = async {
+                    loop {
+                        let event_result = match tokio::time::timeout(ITEM_IDLE_TIMEOUT, stream.next()).await {
+                            Ok(Some(r)) => r,
+                            Ok(None) => break, // stream ended cleanly
+                            Err(_) => {
+                                // Idle timeout — surface as an error so accumulator fails fast.
+                                let _ = accumulator_tx
+                                    .send(Err(anyhow::anyhow!("LLM stream idle timeout: no event for {ITEM_IDLE_TIMEOUT:?}")))
+                                    .await;
+                                return;
+                            }
+                        };
+                        match &event_result {
+                            Ok(StreamEvent::Delta { content }) => {
+                                answer_streamed = true;
+                                let _ = tap_tx.send(AgentEvent::TokenDelta { content: content.clone() });
+                            }
+                            Ok(StreamEvent::Reasoning { content }) => {
+                                // Surface reasoning on its OWN event so consumers can show it
+                                // as live "thinking" without it bleeding into the answer
+                                // (Kimi K2.5, DeepSeek R1, gpt-oss/harmony, etc.). The
+                                // accumulator still drops reasoning from the final response
+                                // content, so the answer stays clean either way.
+                                let _ = tap_tx.send(AgentEvent::ReasoningDelta { content: content.clone() });
+                            }
+                            Ok(StreamEvent::Done { .. }) => {
+                                response_complete = true;
+                                let _ = tap_tx.send(AgentEvent::StreamingComplete);
+                            }
+                            _ => {}
                         }
-                    };
-                    match &event_result {
-                        Ok(StreamEvent::Delta { content }) => {
-                            let _ = tap_tx.send(AgentEvent::TokenDelta { content: content.clone() });
+                        if accumulator_tx.send(event_result).await.is_err() {
+                            break;
                         }
-                        Ok(StreamEvent::Reasoning { content }) => {
-                            // Surface reasoning on its OWN event so consumers can show it
-                            // as live "thinking" without it bleeding into the answer
-                            // (Kimi K2.5, DeepSeek R1, gpt-oss/harmony, etc.). The
-                            // accumulator still drops reasoning from the final response
-                            // content, so the answer stays clean either way.
-                            let _ = tap_tx.send(AgentEvent::ReasoningDelta { content: content.clone() });
-                        }
-                        Ok(StreamEvent::Done { .. }) => {
-                            let _ = tap_tx.send(AgentEvent::StreamingComplete);
-                        }
-                        _ => {}
                     }
-                    if accumulator_tx.send(event_result).await.is_err() {
-                        break;
+                    drop(accumulator_tx);
+                };
+
+                let rx_stream = tokio_stream::wrappers::ReceiverStream::new(accumulator_rx);
+                let accumulate_fut = accumulate_stream_events(Box::pin(rx_stream));
+
+                // Run tap and accumulate concurrently, under a hard wall-clock cap.
+                let (_, accumulated) = match tokio::time::timeout(ITERATION_TIMEOUT, async {
+                    let (_, acc) = tokio::join!(tap_loop, accumulate_fut);
+                    acc
+                })
+                .await
+                {
+                    Ok(result) => ((), result),
+                    Err(_) => {
+                        return Err(anyhow::anyhow!(
+                            "LLM iteration timeout: no completion within {ITERATION_TIMEOUT:?} on iteration {iteration}"
+                        ));
                     }
+                };
+                match accumulated {
+                    Ok(response) => break response,
+                    Err(e) if should_retry_stream(&e, stream_retries, answer_streamed, response_complete) => {
+                        stream_retries += 1;
+                        let delay = stream_retry_backoff(stream_retries);
+                        tracing::warn!(
+                            iteration,
+                            attempt = stream_retries,
+                            max_retries = MAX_STREAM_RETRIES,
+                            delay_ms = delay.as_millis(),
+                            error = %format!("{e:#}"),
+                            "LLM stream interrupted before the response completed — re-asking"
+                        );
+                        let _ = tx.send(AgentEvent::LlmStreamRetry {
+                            iteration,
+                            attempt: stream_retries,
+                            max_retries: MAX_STREAM_RETRIES,
+                            error: format!("{e:#}"),
+                        });
+                        tokio::time::sleep(delay).await;
+                        // Same request as the broken attempt: the conversation is
+                        // untouched (nothing is pushed until a response completes),
+                        // and a SEP context rewrite is reused rather than re-run.
+                        let retry_context = conversation.context_window();
+                        let retry_refs: Vec<&Message> = match &context_rewrite {
+                            Some(msgs) => msgs.iter().collect(),
+                            None => retry_context,
+                        };
+                        stream = llm.chat_stream(&retry_refs, &tool_schemas).await?;
+                    }
+                    Err(e) => return Err(e),
                 }
-                drop(accumulator_tx);
             };
-
-            let rx_stream = tokio_stream::wrappers::ReceiverStream::new(accumulator_rx);
-            let accumulate_fut = accumulate_stream_events(Box::pin(rx_stream));
-
-            // Run tap and accumulate concurrently, under a hard wall-clock cap.
-            let (_, accumulated) = match tokio::time::timeout(ITERATION_TIMEOUT, async {
-                let (_, acc) = tokio::join!(tap_loop, accumulate_fut);
-                acc
-            })
-            .await
-            {
-                Ok(result) => ((), result?),
-                Err(_) => {
-                    return Err(anyhow::anyhow!(
-                        "LLM iteration timeout: no completion within {ITERATION_TIMEOUT:?} on iteration {iteration}"
-                    ));
-                }
-            };
-            let response = accumulated;
 
             let content_preview = response.content.chars().take(100).collect::<String>();
             let _ = tx.send(AgentEvent::LlmResponse {
@@ -2085,6 +2161,166 @@ mod tests {
         assert_eq!(convo.last_assistant_content(), Some("The answer is 42."));
         // And the ephemeral preamble was emitted from the parallel fast model.
         assert_eq!(recv_preamble(rx).await, Some("Let me look into that.".to_string()));
+    }
+
+    /// Drain every event already sent on `rx`.
+    fn drain_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn retry_attempts(events: &[AgentEvent]) -> Vec<u32> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::LlmStreamRetry { attempt, .. } => Some(*attempt),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The bench failure this exists for: gpt-6-luna's stream broke with
+    /// "error decoding response body" mid-reasoning and the whole turn died.
+    /// Nothing had been answered or acted on, so the agent re-asks.
+    #[tokio::test(start_paused = true)]
+    async fn stream_interrupted_before_any_answer_is_re_asked() {
+        use crate::llm_provider::MockLlmClient;
+
+        let mock = MockLlmClient::new();
+        mock.push_stream_interrupted(
+            vec![StreamEvent::Reasoning {
+                content: "thinking about it".into(),
+            }],
+            "stream read error: error decoding response body → connection reset",
+        );
+        mock.push_stream(vec![
+            StreamEvent::Delta { content: "all good".into() },
+            StreamEvent::Done { finish_reason: "stop".into() },
+        ]);
+        let agent = Agent::new(test_config(), ToolRegistry::new()).with_llm_provider(Arc::new(mock.clone()));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let convo = agent.run_with_channel("hello", tx).await.expect("the retry completes the turn");
+
+        assert_eq!(convo.last_assistant_content(), Some("all good"));
+        assert_eq!(mock.call_count(), 2, "one broken attempt, one retry");
+        let events = drain_events(&mut rx);
+        assert_eq!(retry_attempts(&events), vec![1]);
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::LlmStreamRetry { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .expect("retry event");
+        assert!(error.contains("connection reset"), "the full chain reaches the event: {error}");
+        // The retried request is the same request: same messages, nothing added.
+        let calls = mock.calls();
+        assert_eq!(calls[0].messages.len(), calls[1].messages.len());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_retries_are_bounded() {
+        use crate::llm_provider::MockLlmClient;
+
+        let mock = MockLlmClient::new();
+        for _ in 0..=MAX_STREAM_RETRIES {
+            mock.push_stream_interrupted(vec![], "stream read error: error decoding response body");
+        }
+        mock.push_stream(vec![
+            StreamEvent::Delta {
+                content: "never reached".into(),
+            },
+            StreamEvent::Done { finish_reason: "stop".into() },
+        ]);
+        let agent = Agent::new(test_config(), ToolRegistry::new()).with_llm_provider(Arc::new(mock.clone()));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let err = agent.run_with_channel("hello", tx).await.expect_err("gives up after the cap");
+
+        assert!(crate::llm::StreamInterrupted::is(&err), "the last interruption surfaces: {err:#}");
+        assert_eq!(mock.call_count(), 1 + MAX_STREAM_RETRIES as usize);
+        assert_eq!(retry_attempts(&drain_events(&mut rx)), (1..=MAX_STREAM_RETRIES).collect::<Vec<_>>());
+    }
+
+    /// A break AFTER the response completed is not a lost response: re-asking
+    /// would bill a second one and could produce different tool calls. It
+    /// surfaces as before, and the completed tool call is not dispatched.
+    #[tokio::test(start_paused = true)]
+    async fn stream_error_after_a_complete_response_is_not_retried() {
+        use crate::llm_provider::MockLlmClient;
+
+        let mock = MockLlmClient::new();
+        mock.push_stream_interrupted(
+            vec![
+                StreamEvent::ToolCallStart {
+                    index: 0,
+                    id: "call_1".into(),
+                    name: "write_file".into(),
+                },
+                StreamEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    arguments_chunk: "{}".into(),
+                },
+                StreamEvent::Done {
+                    finish_reason: "tool_calls".into(),
+                },
+            ],
+            "stream read error: error decoding response body",
+        );
+        mock.push_stream(vec![StreamEvent::Done { finish_reason: "stop".into() }]);
+        let agent = Agent::new(test_config(), ToolRegistry::new()).with_llm_provider(Arc::new(mock.clone()));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        assert!(agent.run_with_channel("hello", tx).await.is_err());
+
+        assert_eq!(mock.call_count(), 1, "no second request after a completed response");
+        let events = drain_events(&mut rx);
+        assert!(retry_attempts(&events).is_empty());
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::ToolCallStart { .. })), "no tool was dispatched");
+    }
+
+    /// Once answer text has reached the consumer, a retry would show it twice.
+    #[tokio::test(start_paused = true)]
+    async fn stream_interrupted_after_answer_text_is_not_retried() {
+        use crate::llm_provider::MockLlmClient;
+
+        let mock = MockLlmClient::new();
+        mock.push_stream_interrupted(
+            vec![StreamEvent::Delta {
+                content: "The answer is".into(),
+            }],
+            "stream read error: error decoding response body",
+        );
+        mock.push_stream(vec![StreamEvent::Done { finish_reason: "stop".into() }]);
+        let agent = Agent::new(test_config(), ToolRegistry::new()).with_llm_provider(Arc::new(mock.clone()));
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        assert!(agent.run_with_channel("hello", tx).await.is_err());
+        assert_eq!(mock.call_count(), 1);
+    }
+
+    #[test]
+    fn only_a_transport_break_is_retryable() {
+        let broken: anyhow::Error = crate::llm::StreamInterrupted { detail: "x".into() }.into();
+        assert!(should_retry_stream(&broken, 0, false, false));
+        // Context added on the way up keeps it recognisable.
+        let wrapped = broken.context("agent turn failed");
+        assert!(should_retry_stream(&wrapped, 1, false, false));
+        assert!(!should_retry_stream(&wrapped, MAX_STREAM_RETRIES, false, false), "cap");
+        assert!(!should_retry_stream(&wrapped, 0, true, false), "answer already streamed");
+        assert!(!should_retry_stream(&wrapped, 0, false, true), "response already complete");
+        // Anything else — a malformed event, a refusal — is not re-asked.
+        assert!(!should_retry_stream(&anyhow::anyhow!("stream read error: looks similar"), 0, false, false));
+    }
+
+    #[test]
+    fn stream_retry_backoff_doubles() {
+        assert_eq!(stream_retry_backoff(1), std::time::Duration::from_millis(500));
+        assert_eq!(stream_retry_backoff(2), std::time::Duration::from_secs(1));
     }
 
     #[tokio::test]

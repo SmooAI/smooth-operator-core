@@ -45,7 +45,7 @@ pub use executor::{AgentExecutor, InProcessExecutor};
 pub use extension::{ExtensionHost, ExtensionLlmProvider, ExtensionManifest, ExtensionTool, FoldedHook, HookType, HostDelegate, ProviderRegistration};
 pub use human::{human_channel, ConfirmationHook, HumanChannelPair, HumanRequest, HumanResponse};
 pub use knowledge::{Document, DocumentType, InMemoryKnowledge, KnowledgeBase, KnowledgeResult};
-pub use llm::{accumulate_stream_events, LlmClient, LlmConfig, LlmResponse, ResponseFormat, StreamEvent};
+pub use llm::{accumulate_stream_events, LlmClient, LlmConfig, LlmResponse, ResponseFormat, StreamEvent, StreamInterrupted};
 pub use memory::{InMemoryMemory, Memory, MemoryEntry, MemoryType};
 pub use narc::{NarcHook, Severity};
 // `permission::PermissionHook` is the dangerous-command classifier gate for
