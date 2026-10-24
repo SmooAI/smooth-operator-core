@@ -12,6 +12,56 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::conversation::{Message, Role};
 use crate::tool::{ToolCall, ToolSchema};
 
+/// A streamed LLM response whose body broke AFTER the request was accepted:
+/// the connection reset, a proxy cut the stream, or the chunked body arrived
+/// truncated (reqwest reports all of these as "error decoding response body").
+///
+/// It is its own type, not a string, so the agent loop can tell "the stream
+/// broke in transit" (worth re-asking) from "the request was refused" or "the
+/// model said something malformed" (not worth it) without matching message
+/// text. Its `Display` is the full source chain, so the log says which of the
+/// transport failures it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamInterrupted {
+    /// Human-readable cause, including the error's source chain.
+    pub detail: String,
+}
+
+impl StreamInterrupted {
+    /// Wrap a body read error, keeping its whole `source()` chain.
+    #[must_use]
+    pub fn from_read_error(prefix: &str, err: &dyn std::error::Error) -> Self {
+        Self {
+            detail: format!("{prefix}: {}", error_chain(err)),
+        }
+    }
+
+    /// Whether `err` is (or wraps) a [`StreamInterrupted`].
+    #[must_use]
+    pub fn is(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<Self>().is_some()
+    }
+}
+
+impl std::fmt::Display for StreamInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for StreamInterrupted {}
+
+/// `err` and each of its `source()`s, joined with ` → `.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut chain = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(s) = source {
+        chain.push(s.to_string());
+        source = s.source();
+    }
+    chain.join(" → ")
+}
+
 /// Policy controlling retry behavior for transient LLM API errors.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
@@ -1404,7 +1454,7 @@ impl LlmClient {
                 let chunk: Bytes = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = tx.send(Err(anyhow::anyhow!("stream read error: {e}"))).await;
+                        let _ = tx.send(Err(StreamInterrupted::from_read_error("stream read error", &e).into())).await;
                         return;
                     }
                 };
@@ -1793,7 +1843,7 @@ impl LlmClient {
                 let chunk: Bytes = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = tx.send(Err(anyhow::anyhow!("Anthropic stream read error: {e}"))).await;
+                        let _ = tx.send(Err(StreamInterrupted::from_read_error("Anthropic stream read error", &e).into())).await;
                         return;
                     }
                 };
@@ -3712,6 +3762,30 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         assert!(parse_sse_line(": comment").is_empty());
         assert!(parse_sse_line("event: chunk").is_empty());
         assert!(parse_sse_line("not a data line").is_empty());
+    }
+
+    #[derive(Debug)]
+    struct Outer(std::io::Error);
+    impl std::fmt::Display for Outer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("error decoding response body")
+        }
+    }
+    impl std::error::Error for Outer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    /// The bench log said only "error decoding response body"; the cause
+    /// underneath (reset, truncation, timeout) is what makes it diagnosable.
+    #[test]
+    fn stream_interrupted_keeps_the_source_chain() {
+        let e = Outer(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset by peer"));
+        let s = StreamInterrupted::from_read_error("stream read error", &e);
+        assert_eq!(s.to_string(), "stream read error: error decoding response body → connection reset by peer");
+        assert!(StreamInterrupted::is(&anyhow::Error::new(s)));
+        assert!(!StreamInterrupted::is(&anyhow::anyhow!("stream read error: x")));
     }
 
     #[tokio::test]
