@@ -150,6 +150,8 @@ enum ChatOutcome {
 enum StreamOutcome {
     Events(Vec<StreamEvent>),
     SetupError(String),
+    /// These events, then a [`crate::llm::StreamInterrupted`] carrying the detail.
+    Interrupted(Vec<StreamEvent>, String),
 }
 
 #[derive(Default)]
@@ -236,6 +238,14 @@ impl MockLlmClient {
         self
     }
 
+    /// Queue a stream for the next `chat_stream` call that yields `events` and
+    /// then breaks in transit with a [`crate::llm::StreamInterrupted`] — the
+    /// shape of a connection reset or truncated body mid-response.
+    pub fn push_stream_interrupted(&self, events: Vec<StreamEvent>, detail: impl Into<String>) -> &Self {
+        self.lock().streams.push_back(StreamOutcome::Interrupted(events, detail.into()));
+        self
+    }
+
     /// Every request the mock has received so far, in order.
     #[must_use]
     pub fn calls(&self) -> Vec<RecordedCall> {
@@ -297,6 +307,10 @@ impl LlmProvider for MockLlmClient {
         match outcome {
             Some(StreamOutcome::Events(events)) => Ok(stream::iter(events.into_iter().map(Ok)).boxed()),
             Some(StreamOutcome::SetupError(e)) => Err(anyhow::anyhow!(e)),
+            Some(StreamOutcome::Interrupted(events, detail)) => {
+                let broken: anyhow::Error = crate::llm::StreamInterrupted { detail }.into();
+                Ok(stream::iter(events.into_iter().map(Ok).chain(std::iter::once(Err(broken)))).boxed())
+            }
             // Empty script: a single Done event so consumers terminate cleanly.
             None => Ok(stream::iter(vec![Ok(StreamEvent::Done { finish_reason: "stop".into() })]).boxed()),
         }

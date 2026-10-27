@@ -6,7 +6,12 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::llm::Usage;
 
@@ -270,10 +275,163 @@ impl ModelPricing {
     }
 }
 
+/// How long a fetched gateway price book is trusted before it is refetched.
+const PRICE_BOOK_TTL: Duration = Duration::from_secs(60 * 60);
+/// How long a FAILED fetch is remembered, so a gateway without `/model/info`
+/// (OpenAI, OpenRouter) costs one request per window rather than one per call.
+const PRICE_BOOK_FAILURE_TTL: Duration = Duration::from_secs(5 * 60);
+/// A turn waits on this fetch at most once per TTL, so keep it short.
+const PRICE_BOOK_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct CachedPriceBook {
+    fetched_at: Instant,
+    /// `None` = the fetch failed; remembered for [`PRICE_BOOK_FAILURE_TTL`].
+    book: Option<Arc<BTreeMap<String, ModelPricing>>>,
+}
+
+fn price_book_cache() -> &'static Mutex<HashMap<u64, CachedPriceBook>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, CachedPriceBook>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cache key for one gateway + credential. The key is hashed so the cache
+/// never holds a second copy of the secret; different keys can see different
+/// model lists, so they cache separately.
+fn price_book_key(api_url: &str, api_key: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    api_url.hash(&mut h);
+    api_key.hash(&mut h);
+    h.finish()
+}
+
+/// The gateway's own published list price for `model`, from LiteLLM's
+/// `/model/info` (`input_cost_per_token` / `output_cost_per_token`).
+///
+/// This is the fallback when a call carried no gateway cost, which is every
+/// streamed call on llm.smoo.ai: its cost headers are flushed before the
+/// completion is priced and read 0. It beats [`ModelPricing::for_model`],
+/// which knows a handful of models and prices everything else (`gpt-6-luna`,
+/// every `smooth-*` alias) at the free tier, so every turn recorded $0.
+/// Multiplying REAL tokens by the gateway's own price is what LiteLLM itself
+/// bills, short of cache hits. Pearl th-c420bf.
+///
+/// The price book is fetched once per gateway + key and cached process-wide
+/// for an hour (a failure for five minutes). Returns `None` when the gateway
+/// has no `/model/info`, the fetch fails, or the model is unpriced there.
+pub async fn gateway_list_price(api_url: &str, api_key: &str, model: &str) -> Option<ModelPricing> {
+    let key = price_book_key(api_url, api_key);
+    let cached = {
+        let cache = price_book_cache().lock().ok()?;
+        cache.get(&key).and_then(|c| {
+            let ttl = if c.book.is_some() { PRICE_BOOK_TTL } else { PRICE_BOOK_FAILURE_TTL };
+            (c.fetched_at.elapsed() < ttl).then(|| c.book.clone())
+        })
+    };
+    let book = match cached {
+        Some(book) => book,
+        None => {
+            let book = match crate::resolution::fetch_model_pricing(api_url, api_key, PRICE_BOOK_FETCH_TIMEOUT).await {
+                Ok(book) => Some(Arc::new(book)),
+                Err(e) => {
+                    tracing::debug!(error = %e, "gateway price book unavailable; falling back to local ModelPricing");
+                    None
+                }
+            };
+            if let Ok(mut cache) = price_book_cache().lock() {
+                cache.insert(
+                    key,
+                    CachedPriceBook {
+                        fetched_at: Instant::now(),
+                        book: book.clone(),
+                    },
+                );
+            }
+            book
+        }
+    };
+    book?.get(model).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::llm::Usage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Serve `status` + `body` for every request on a fresh port, counting
+    /// hits. Returns the OpenAI-compat base URL (`…/v1`) and the counter.
+    async fn model_info_server(status: &'static str, body: &'static str) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}/v1"), hits)
+    }
+
+    const MODEL_INFO: &str = r#"{"data":[
+        {"model_name":"gpt-6-luna","model_info":{"input_cost_per_token":0.000000115,"output_cost_per_token":0.000000575}},
+        {"model_name":"unpriced","model_info":{"input_cost_per_token":0.0,"output_cost_per_token":0.0}}
+    ]}"#;
+
+    /// The fallback that fixes `cost_usd = 0`: a model the local table prices
+    /// at the free tier gets the gateway's own list price. Pearl th-c420bf.
+    #[tokio::test]
+    async fn gateway_list_price_reads_the_gateway_price_book() {
+        let (url, _) = model_info_server("200 OK", MODEL_INFO).await;
+        assert_eq!(ModelPricing::for_model("gpt-6-luna").prompt_per_mtok, 0.0, "the local table cannot price it");
+
+        let p = gateway_list_price(&url, "k", "gpt-6-luna").await.expect("priced by the gateway");
+        assert!((p.prompt_per_mtok - 0.115).abs() < 1e-9);
+        assert!((p.completion_per_mtok - 0.575).abs() < 1e-9);
+        // 1,000 in + 1,000 out at $0.115/M + $0.575/M.
+        assert!((p.calculate(1000, 1000) - 0.000_69).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn gateway_list_price_is_none_for_unpriced_or_unknown_models() {
+        let (url, _) = model_info_server("200 OK", MODEL_INFO).await;
+        assert!(gateway_list_price(&url, "k", "unpriced").await.is_none(), "0/0 is unpriced, not free");
+        assert!(gateway_list_price(&url, "k", "nope").await.is_none());
+    }
+
+    /// One fetch per gateway + key per TTL, not one per LLM call.
+    #[tokio::test]
+    async fn gateway_list_price_caches_the_price_book() {
+        let (url, hits) = model_info_server("200 OK", MODEL_INFO).await;
+        for _ in 0..3 {
+            assert!(gateway_list_price(&url, "k", "gpt-6-luna").await.is_some());
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // A different key may see a different model list, so it fetches its own.
+        assert!(gateway_list_price(&url, "other-key", "gpt-6-luna").await.is_some());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// A gateway without `/model/info` (OpenAI, OpenRouter) yields `None`, and
+    /// the failure is remembered so it isn't retried on every call.
+    #[tokio::test]
+    async fn gateway_list_price_remembers_a_failed_fetch() {
+        let (url, hits) = model_info_server("404 Not Found", r#"{"error":"not found"}"#).await;
+        assert!(gateway_list_price(&url, "k", "gpt-6-luna").await.is_none());
+        assert!(gateway_list_price(&url, "k", "gpt-6-luna").await.is_none());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
 
     /// Cost provenance: only a gateway-reported figure leaves the total
     /// authoritative. The local `ModelPricing` path taints it, because that

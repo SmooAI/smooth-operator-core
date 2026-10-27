@@ -25,6 +25,8 @@ use std::collections::BTreeMap;
 use anyhow::{anyhow, Context};
 use serde::Deserialize;
 
+use crate::cost::ModelPricing;
+
 /// One routing entry returned by `/model/info`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedModel {
@@ -49,8 +51,23 @@ pub struct ResolvedModel {
 /// the provider's API key is missing or rejected by the gateway;
 /// either way the caller can't see the mapping.
 pub async fn fetch_model_info(api_url: &str, api_key: &str) -> anyhow::Result<BTreeMap<String, ResolvedModel>> {
+    let body = fetch_model_info_body(api_url, api_key, std::time::Duration::from_secs(10)).await?;
+    parse_model_info(&body)
+}
+
+/// Fetch the gateway's published per-token prices, keyed by the model name
+/// callers send (the gateway's `model_name`).
+///
+/// # Errors
+/// Propagates HTTP, timeout, and JSON-parse failures, like [`fetch_model_info`].
+pub async fn fetch_model_pricing(api_url: &str, api_key: &str, timeout: std::time::Duration) -> anyhow::Result<BTreeMap<String, ModelPricing>> {
+    let body = fetch_model_info_body(api_url, api_key, timeout).await?;
+    parse_model_pricing(&body)
+}
+
+async fn fetch_model_info_body(api_url: &str, api_key: &str, timeout: std::time::Duration) -> anyhow::Result<String> {
     let url = build_model_info_url(api_url);
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?;
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
     let resp = client.get(&url).bearer_auth(api_key).send().await.with_context(|| format!("GET {url}"))?;
 
     if !resp.status().is_success() {
@@ -58,8 +75,7 @@ pub async fn fetch_model_info(api_url: &str, api_key: &str) -> anyhow::Result<BT
         let body = resp.text().await.unwrap_or_default();
         return Err(anyhow!("GET {url} returned {status}: {body}"));
     }
-    let body = resp.text().await?;
-    parse_model_info(&body)
+    Ok(resp.text().await?)
 }
 
 /// Build the `/model/info` URL from a provider's OpenAI-compat
@@ -96,6 +112,10 @@ struct LiteLlmParams {
 struct ModelInfoField {
     #[serde(default)]
     id: Option<String>,
+    #[serde(default)]
+    input_cost_per_token: Option<f64>,
+    #[serde(default)]
+    output_cost_per_token: Option<f64>,
 }
 
 /// Parse a `/model/info` response body into the alias map. Split out
@@ -120,9 +140,69 @@ pub fn parse_model_info(body: &str) -> anyhow::Result<BTreeMap<String, ResolvedM
     Ok(out)
 }
 
+/// Parse a `/model/info` response body into per-model list prices.
+///
+/// Only rows with a positive price on at least one side are kept. A model
+/// priced 0/0 (or not at all) is UNPRICED, not free: returning it would lock
+/// in a $0 cost that reads as measured. Pearl th-c420bf.
+///
+/// # Errors
+/// Returns an error when the body isn't valid JSON or lacks the `data` array.
+pub fn parse_model_pricing(body: &str) -> anyhow::Result<BTreeMap<String, ModelPricing>> {
+    let doc: ModelInfoDoc = serde_json::from_str(body).context("parsing /model/info response")?;
+    let mut out = BTreeMap::new();
+    for entry in doc.data {
+        let input = entry.model_info.input_cost_per_token.filter(|c| c.is_finite() && *c >= 0.0).unwrap_or(0.0);
+        let output = entry.model_info.output_cost_per_token.filter(|c| c.is_finite() && *c >= 0.0).unwrap_or(0.0);
+        if input > 0.0 || output > 0.0 {
+            out.insert(
+                entry.model_name,
+                ModelPricing {
+                    prompt_per_mtok: input * 1_000_000.0,
+                    completion_per_mtok: output * 1_000_000.0,
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_pricing_converts_per_token_to_per_mtok() {
+        let body = r#"{"data":[
+            {"model_name":"gpt-6-luna","model_info":{"input_cost_per_token":0.000000115,"output_cost_per_token":0.000000575}}
+        ]}"#;
+        let prices = parse_model_pricing(body).expect("parse");
+        let p = prices.get("gpt-6-luna").expect("priced");
+        assert!((p.prompt_per_mtok - 0.115).abs() < 1e-9);
+        assert!((p.completion_per_mtok - 0.575).abs() < 1e-9);
+    }
+
+    /// 0/0, nulls and a missing `model_info` are all UNPRICED and must be
+    /// absent, never a free price that reads as a measured $0.
+    #[test]
+    fn parse_pricing_skips_unpriced_rows() {
+        let body = r#"{"data":[
+            {"model_name":"zero","model_info":{"input_cost_per_token":0.0,"output_cost_per_token":0.0}},
+            {"model_name":"nulls","model_info":{"input_cost_per_token":null,"output_cost_per_token":null}},
+            {"model_name":"negative","model_info":{"input_cost_per_token":-1.0,"output_cost_per_token":-1.0}},
+            {"model_name":"no-info"},
+            {"model_name":"output-only","model_info":{"output_cost_per_token":0.000002}}
+        ]}"#;
+        let prices = parse_model_pricing(body).expect("parse");
+        let keys: Vec<_> = prices.keys().cloned().collect();
+        assert_eq!(keys, vec!["output-only"]);
+        assert!((prices["output-only"].prompt_per_mtok).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_pricing_rejects_invalid_json() {
+        assert!(parse_model_pricing("not json").is_err());
+    }
 
     #[test]
     fn build_url_strips_v1_suffix() {

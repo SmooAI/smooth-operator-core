@@ -12,6 +12,56 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::conversation::{Message, Role};
 use crate::tool::{ToolCall, ToolSchema};
 
+/// A streamed LLM response whose body broke AFTER the request was accepted:
+/// the connection reset, a proxy cut the stream, or the chunked body arrived
+/// truncated (reqwest reports all of these as "error decoding response body").
+///
+/// It is its own type, not a string, so the agent loop can tell "the stream
+/// broke in transit" (worth re-asking) from "the request was refused" or "the
+/// model said something malformed" (not worth it) without matching message
+/// text. Its `Display` is the full source chain, so the log says which of the
+/// transport failures it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamInterrupted {
+    /// Human-readable cause, including the error's source chain.
+    pub detail: String,
+}
+
+impl StreamInterrupted {
+    /// Wrap a body read error, keeping its whole `source()` chain.
+    #[must_use]
+    pub fn from_read_error(prefix: &str, err: &dyn std::error::Error) -> Self {
+        Self {
+            detail: format!("{prefix}: {}", error_chain(err)),
+        }
+    }
+
+    /// Whether `err` is (or wraps) a [`StreamInterrupted`].
+    #[must_use]
+    pub fn is(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<Self>().is_some()
+    }
+}
+
+impl std::fmt::Display for StreamInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for StreamInterrupted {}
+
+/// `err` and each of its `source()`s, joined with ` → `.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut chain = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(s) = source {
+        chain.push(s.to_string());
+        source = s.source();
+    }
+    chain.join(" → ")
+}
+
 /// Policy controlling retry behavior for transient LLM API errors.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
@@ -619,6 +669,23 @@ struct ChatUsage {
     /// Pearl th-litellm-caching-client.
     #[serde(default)]
     prompt_tokens_details: Option<PromptTokensDetails>,
+    /// The gateway's own price for this call, in USD, when it puts one on the
+    /// usage object. LiteLLM does this on the final stream chunk when
+    /// `include_cost_in_streaming_usage` is on, and OpenRouter always does.
+    /// On a stream this is the only per-call cost that can be real: the cost
+    /// HEADERS are flushed before the completion is priced and read 0.
+    /// Pearl th-c420bf.
+    #[serde(default)]
+    cost: Option<f64>,
+}
+
+impl ChatUsage {
+    /// The body-reported cost, when it is a usable positive number. Zero maps
+    /// to `None` for the same reason as [`parse_gateway_cost`]: an unpriced
+    /// route reports 0, and locking that in would hide the list-price fallback.
+    fn reported_cost(&self) -> Option<f64> {
+        self.cost.filter(|c| c.is_finite() && *c > 0.0)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1107,8 +1174,12 @@ impl LlmClient {
             let rate_limit_info = parse_rate_limit_headers(resp.headers());
 
             if status.is_success() {
-                let gateway_cost_usd = parse_gateway_cost(resp.headers());
+                let header_cost_usd = parse_gateway_cost(resp.headers());
                 let chat_resp: ChatResponse = resp.json().await?;
+                // The header wins when it carries a figure (it is the
+                // margin-bearing one); the usage object's `cost` covers
+                // gateways that only report it in the body. Pearl th-c420bf.
+                let gateway_cost_usd = header_cost_usd.or_else(|| chat_resp.usage.as_ref().and_then(ChatUsage::reported_cost));
                 let resolved_model = chat_resp.model.clone().filter(|s| !s.is_empty());
                 let choice = chat_resp.choices.into_iter().next().ok_or_else(|| anyhow::anyhow!("no choices in response"))?;
 
@@ -1383,7 +1454,7 @@ impl LlmClient {
                 let chunk: Bytes = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = tx.send(Err(anyhow::anyhow!("stream read error: {e}"))).await;
+                        let _ = tx.send(Err(StreamInterrupted::from_read_error("stream read error", &e).into())).await;
                         return;
                     }
                 };
@@ -1772,7 +1843,7 @@ impl LlmClient {
                 let chunk: Bytes = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = tx.send(Err(anyhow::anyhow!("Anthropic stream read error: {e}"))).await;
+                        let _ = tx.send(Err(StreamInterrupted::from_read_error("Anthropic stream read error", &e).into())).await;
                         return;
                     }
                 };
@@ -2338,6 +2409,12 @@ fn parse_sse_line(line: &str) -> Vec<anyhow::Result<StreamEvent>> {
             total_tokens: usage.total_tokens,
             cached_tokens: usage.prompt_tokens_details.as_ref().map_or(0, |d| d.cached_tokens),
         })));
+        // The usage chunk is sent after the completion is priced, so its cost
+        // supersedes any header figure (the accumulator keeps the last `Cost`).
+        // Pearl th-c420bf.
+        if let Some(usd) = usage.reported_cost() {
+            events.push(Ok(StreamEvent::Cost { usd }));
+        }
     }
 
     events
@@ -3687,6 +3764,30 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         assert!(parse_sse_line("not a data line").is_empty());
     }
 
+    #[derive(Debug)]
+    struct Outer(std::io::Error);
+    impl std::fmt::Display for Outer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("error decoding response body")
+        }
+    }
+    impl std::error::Error for Outer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    /// The bench log said only "error decoding response body"; the cause
+    /// underneath (reset, truncation, timeout) is what makes it diagnosable.
+    #[test]
+    fn stream_interrupted_keeps_the_source_chain() {
+        let e = Outer(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset by peer"));
+        let s = StreamInterrupted::from_read_error("stream read error", &e);
+        assert_eq!(s.to_string(), "stream read error: error decoding response body → connection reset by peer");
+        assert!(StreamInterrupted::is(&anyhow::Error::new(s)));
+        assert!(!StreamInterrupted::is(&anyhow::anyhow!("stream read error: x")));
+    }
+
     #[tokio::test]
     async fn accumulate_stream_events_collects_deltas() {
         let events = vec![
@@ -4230,6 +4331,110 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         assert!(response.usage_estimated, "fabricated usage MUST be flagged");
         assert_eq!(response.usage.prompt_tokens, 0, "the streaming path never estimates prompt tokens");
         assert_eq!(response.usage.completion_tokens, 2, "8 chars / 4 = the estimate that looked plausible in prod");
+    }
+
+    /// LiteLLM's final stream chunk has EMPTY `choices` and carries the usage
+    /// (and, with `include_cost_in_streaming_usage`, the call's `cost`). Both
+    /// must survive the parse: the cost headers on a stream read 0, so this is
+    /// the only real per-call cost a stream can have. Pearl th-c420bf.
+    #[test]
+    fn openai_sse_final_usage_chunk_emits_usage_and_cost() {
+        let chunk = r#"data: {"id":"chatcmpl-1","choices":[],"usage":{"prompt_tokens":73,"completion_tokens":8,"total_tokens":81,"cost":0.000042}}"#;
+        let events: Vec<StreamEvent> = parse_sse_line(chunk).into_iter().map(Result::unwrap).collect();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::Usage(Usage {
+                prompt_tokens: 73,
+                completion_tokens: 8,
+                ..
+            })
+        )));
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::Cost { usd } if (*usd - 0.000042).abs() < 1e-12)));
+    }
+
+    /// A zero or absent body cost is "unpriced", never a measured $0.
+    #[test]
+    fn openai_sse_usage_chunk_without_positive_cost_emits_no_cost() {
+        for chunk in [
+            r#"data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"cost":0.0}}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"cost":null}}"#,
+        ] {
+            let events: Vec<StreamEvent> = parse_sse_line(chunk).into_iter().map(Result::unwrap).collect();
+            assert!(!events.iter().any(|e| matches!(e, StreamEvent::Cost { .. })), "{chunk}");
+            assert!(events.iter().any(|e| matches!(e, StreamEvent::Usage(_))), "{chunk}");
+        }
+    }
+
+    /// End to end over a mocked SSE stream: real usage from the empty-choices
+    /// chunk replaces the chars/4 estimate, and its cost supersedes the 0 the
+    /// headers carried at flush time (mapped to `None`).
+    #[tokio::test]
+    async fn chat_stream_takes_usage_and_cost_from_the_final_chunk() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+            let body = concat!(
+                "data: {\"id\":\"chatcmpl-9\",\"choices\":[{\"delta\":{\"content\":\"a long enough answer\"}}]}\n\n",
+                "data: {\"id\":\"chatcmpl-9\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"id\":\"chatcmpl-9\",\"choices\":[],\"usage\":{\"prompt_tokens\":493,\"completion_tokens\":5,\"total_tokens\":498,\"cost\":0.00031}}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\nx-litellm-response-cost: 0.0\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+
+        let mut config = LlmConfig::openrouter("test-key");
+        config.api_url = format!("http://{addr}");
+        config.model = "test-model".into();
+        let client = LlmClient::new(config);
+        let user = Message::user("hello");
+        let stream = client.chat_stream(&[&user], &[]).await.expect("chat_stream");
+        let response = accumulate_stream_events(stream).await.expect("accumulate");
+
+        assert!(!response.usage_estimated, "real usage arrived, so nothing is estimated");
+        assert_eq!(response.usage.prompt_tokens, 493);
+        assert_eq!(response.usage.completion_tokens, 5);
+        assert_eq!(response.gateway_cost_usd, Some(0.00031));
+        assert_eq!(response.finish_reason, "stop");
+    }
+
+    /// Non-streaming: a body `usage.cost` is used when no cost header came.
+    #[tokio::test]
+    async fn chat_reads_cost_from_the_usage_body_when_no_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+            let body = r#"{"id":"chatcmpl-2","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cost":0.0009}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+
+        let mut config = LlmConfig::openrouter("test-key");
+        config.api_url = format!("http://{addr}");
+        let client = LlmClient::new(config);
+        let user = Message::user("hello");
+        let response = client.chat(&[&user], &[]).await.expect("chat");
+        assert_eq!(response.gateway_cost_usd, Some(0.0009));
+        assert_eq!(response.usage.prompt_tokens, 10);
     }
 
     /// The SSE chunk parser lifts `id` off the wire like it does `model`.
